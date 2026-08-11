@@ -1,2 +1,2 @@
-# Milestone 1 uses only the Python standard library.
-
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
