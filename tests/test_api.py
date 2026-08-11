@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
+
+from pydantic import ValidationError
 
 from app import main
 from app.database import connect_database, initialize_database
@@ -20,12 +23,26 @@ class MessageApiTests(unittest.TestCase):
         self.addCleanup(self.temporary_directory.cleanup)
         self.database_path = Path(self.temporary_directory.name) / "helios.db"
         initialize_database(self.database_path)
+        self.original_database_path = main.app.state.database_path
+        self.original_client_factory = main.app.state.openai_client_factory
+        self.original_dotenv_path = main.app.state.dotenv_path
+        main.app.state.database_path = self.database_path
+        main.app.state.openai_client_factory = self._provider_must_not_run
+        main.app.state.dotenv_path = Path(self.temporary_directory.name) / "missing.env"
+        self.addCleanup(self._restore_app_state)
+
+    def _restore_app_state(self) -> None:
+        main.app.state.database_path = self.original_database_path
+        main.app.state.openai_client_factory = self.original_client_factory
+        main.app.state.dotenv_path = self.original_dotenv_path
+
+    @staticmethod
+    def _provider_must_not_run(api_key: str):
+        del api_key
+        raise AssertionError("The provider must not be constructed")
 
     def test_whitespace_only_message_is_ignored(self) -> None:
-        def connect_test_database():
-            return connect_database(self.database_path)
-
-        with patch("app.main.connect_database", side_effect=connect_test_database):
+        with patch.dict("os.environ", {}, clear=True):
             response = asyncio.run(
                 main.post_message(main.MessageRequest(message_text=" \t\r\n "))
             )
@@ -40,6 +57,62 @@ class MessageApiTests(unittest.TestCase):
             self.assertEqual(
                 connection.execute("SELECT count(*) FROM messages").fetchone()[0],
                 0,
+            )
+
+    def test_request_model_forbids_authorship_even_when_blank(self) -> None:
+        with self.assertRaises(ValidationError):
+            main.MessageRequest.model_validate(
+                {"message_text": " \t\n", "participant_key": "helios"}
+            )
+
+        with closing(connect_database(self.database_path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM turns").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM api_events").fetchone()[0], 0)
+
+    def test_browser_sends_exact_text_without_authorship(self) -> None:
+        javascript = (Path(__file__).parents[1] / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("const messageText = input.value;", javascript)
+        self.assertIn("if (!messageText.trim()) return;", javascript)
+        self.assertIn("message_text: messageText", javascript)
+        self.assertNotIn("participant_key:", javascript)
+        self.assertIn("Helios is responding...", javascript)
+
+    def test_post_acceptance_error_response_contains_canonical_ids(self) -> None:
+        class FailingResponses:
+            async def create(self, **request):
+                del request
+                raise RuntimeError("simulated provider failure")
+
+        class FailingClient:
+            responses = FailingResponses()
+
+            async def close(self):
+                return None
+
+        main.app.state.openai_client_factory = lambda api_key: FailingClient()
+        environment = {
+            "OPENAI_API_KEY": "test-only-key",
+            "HELIOS_OPENAI_MODEL": "gpt-5.6-luna",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            response = asyncio.run(
+                main.post_message(main.MessageRequest(message_text="Accepted Peter text"))
+            )
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(payload["error"], "provider_failure")
+        self.assertIsInstance(payload["turn_id"], int)
+        self.assertIsInstance(payload["peter_message_id"], int)
+        with closing(connect_database(self.database_path)) as connection:
+            self.assertEqual(connection.execute("SELECT status FROM turns").fetchone()[0], "failed")
+            self.assertEqual(
+                connection.execute("SELECT message_text FROM messages").fetchone()[0],
+                "Accepted Peter text",
             )
 
     def test_cli_ignores_whitespace_only_message(self) -> None:

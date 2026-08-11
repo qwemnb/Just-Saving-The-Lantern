@@ -1,7 +1,5 @@
 const API_BASE = '/api';
 
-let currentParticipant = 'peter';
-
 async function loadMessages() {
     try {
         const response = await fetch(`${API_BASE}/messages`);
@@ -57,6 +55,7 @@ function showSystemMessage(text) {
     messageDiv.appendChild(contentDiv);
     messagesContainer.appendChild(messageDiv);
     scrollToBottom();
+    return messageDiv;
 }
 
 function formatTime(timestamp) {
@@ -70,28 +69,30 @@ function scrollToBottom() {
 }
 
 async function sendMessage(messageText) {
+    const response = await fetch(`${API_BASE}/messages`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            message_text: messageText
+        })
+    });
+
+    let result = {};
     try {
-        const response = await fetch(`${API_BASE}/messages`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                message_text: messageText,
-                participant_key: currentParticipant
-            })
-        });
-        
-        if (!response.ok) throw new Error('Failed to send message');
-        
-        const result = await response.json();
-        await loadMessages(); // Reload all messages to show the new one
-        return result;
+        result = await response.json();
     } catch (error) {
-        console.error('Error sending message:', error);
-        showSystemMessage('Failed to send message. Please try again.');
+        // Keep the stable fallback below if an intermediary returns non-JSON.
+    }
+
+    if (!response.ok) {
+        const error = new Error(result.message || 'Failed to send message.');
+        error.postAccepted = Boolean(result.turn_id && result.peter_message_id);
         throw error;
     }
+
+    return result;
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -113,17 +114,26 @@ document.addEventListener('DOMContentLoaded', () => {
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
         
-        const messageText = input.value.trim();
-        if (!messageText) return;
+        const messageText = input.value;
+        if (!messageText.trim()) return;
         
         sendButton.disabled = true;
         input.disabled = true;
+        const pendingMessage = showSystemMessage('Helios is responding...');
         
         try {
             await sendMessage(messageText);
             input.value = '';
+            await loadMessages();
         } catch (error) {
-            // Error already handled in sendMessage
+            console.error('Error sending message:', error);
+            if (error.postAccepted) {
+                input.value = '';
+                await loadMessages();
+            } else {
+                pendingMessage.remove();
+            }
+            showSystemMessage(error.message || 'Failed to send message. Please try again.');
         } finally {
             input.disabled = false;
             updateSendButtonState();

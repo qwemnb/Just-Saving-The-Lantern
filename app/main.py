@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 from .database import (
@@ -21,31 +21,36 @@ from .database import (
     is_blank_message,
     store_message,
 )
+from .models import MessageRequest
+from .openai_client import create_openai_client
+from .room_service import TurnServiceError, run_helios_turn
 
 # FastAPI application
 app = FastAPI(title="Helios Room")
+app.state.database_path = DEFAULT_DATABASE_PATH
+app.state.openai_client_factory = create_openai_client
+app.state.dotenv_path = None
 
 # Mount static files
 static_dir = Path(__file__).parent.parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
-class MessageRequest(BaseModel):
-    message_text: str
-    participant_key: str = "peter"
-
-
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """Serve the main chat interface."""
     index_path = static_dir / "index.html"
-    return HTMLResponse(index_path.read_text())
+    return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
 
 @app.get("/api/messages")
 async def get_messages():
     """Retrieve all messages from the room."""
-    connection = connect_database()
+    return await asyncio.to_thread(_load_messages, app.state.database_path)
+
+
+def _load_messages(database_path: Path | str) -> list[dict[str, object]]:
+    connection = connect_database(database_path)
     try:
         rows = connection.execute(
             """
@@ -62,7 +67,7 @@ async def get_messages():
             """
         ).fetchall()
         
-        messages = [
+        return [
             {
                 "id": row["id"],
                 "message_text": row["message_text"],
@@ -72,62 +77,25 @@ async def get_messages():
             }
             for row in rows
         ]
-        return messages
     finally:
         connection.close()
 
 
 @app.post("/api/messages")
 async def post_message(request: MessageRequest):
-    """Store a new message in the room."""
-    if is_blank_message(request.message_text):
-        return {"ignored": True, "reason": "empty_message"}
-
-    connection = connect_database()
+    """Run one browser-authored Peter/Helios turn."""
     try:
-        connection.execute("BEGIN IMMEDIATE")
-
-        # Get room and participant IDs
-        room_row = connection.execute(
-            "SELECT id FROM rooms WHERE room_key = ?",
-            ("main",),
-        ).fetchone()
-        if not room_row:
-            raise RuntimeError("Room 'main' not found")
-        room_id = room_row["id"]
-
-        participant_row = connection.execute(
-            "SELECT id FROM participants WHERE participant_key = ?",
-            (request.participant_key,),
-        ).fetchone()
-        if not participant_row:
-            raise RuntimeError(f"Participant '{request.participant_key}' not found")
-        participant_id = participant_row["id"]
-
-        # Create a turn and store the message
-        turn_id = create_turn(connection, room_id, participant_id)
-        message_id = store_message(
-            connection,
-            room_id=room_id,
-            participant_id=participant_id,
-            message_text=request.message_text,
-            turn_id=turn_id,
+        return await run_helios_turn(
+            request.message_text,
+            database_path=app.state.database_path,
+            client_factory=app.state.openai_client_factory,
+            dotenv_path=app.state.dotenv_path,
         )
-
-        connection.commit()
-
-        return {
-            "turn_id": turn_id,
-            "message_id": message_id,
-            "room_id": room_id,
-            "participant_id": participant_id,
-            "message": request.message_text,
-        }
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    except TurnServiceError as error:
+        return JSONResponse(
+            status_code=error.status_code,
+            content=error.as_payload(),
+        )
 
 
 def main() -> None:
