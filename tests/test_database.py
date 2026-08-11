@@ -6,7 +6,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from app.database import connect_database, initialize_database
+from app.database import connect_database, initialize_database, store_message
 
 
 class DatabaseInitializationTests(unittest.TestCase):
@@ -90,6 +90,32 @@ class DatabaseInitializationTests(unittest.TestCase):
                     """,
                     (999_999, 999_999),
                 )
+
+    def test_store_message_rejects_whitespace_only_text(self) -> None:
+        initialize_database(self.database_path)
+
+        with closing(connect_database(self.database_path)) as connection:
+            room_id = connection.execute(
+                "SELECT id FROM rooms WHERE room_key = ?",
+                ("main",),
+            ).fetchone()[0]
+            peter_id = connection.execute(
+                "SELECT id FROM participants WHERE participant_key = ?",
+                ("peter",),
+            ).fetchone()[0]
+
+            with self.assertRaisesRegex(ValueError, "non-whitespace"):
+                store_message(
+                    connection,
+                    room_id=room_id,
+                    participant_id=peter_id,
+                    message_text=" \t\r\n ",
+                )
+
+            self.assertEqual(
+                connection.execute("SELECT count(*) FROM messages").fetchone()[0],
+                0,
+            )
 
 
 if __name__ == "__main__":

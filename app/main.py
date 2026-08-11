@@ -18,6 +18,7 @@ from .database import (
     connect_database,
     create_turn,
     initialize_database,
+    is_blank_message,
     store_message,
 )
 
@@ -79,7 +80,7 @@ async def get_messages():
 @app.post("/api/messages")
 async def post_message(request: MessageRequest):
     """Store a new message in the room."""
-    if not request.message_text.strip():
+    if is_blank_message(request.message_text):
         return {"ignored": True, "reason": "empty_message"}
 
     connection = connect_database()
@@ -163,8 +164,12 @@ def main() -> None:
         print(json.dumps(asdict(report), indent=2))
 
     elif arguments.command == "store-message":
-        if not arguments.message:
+        if arguments.message is None:
             parser.error("--message is required for store-message command")
+
+        if is_blank_message(arguments.message):
+            print(json.dumps({"ignored": True, "reason": "empty_message"}, indent=2))
+            return
 
         connection = connect_database(database_path=arguments.database)
         try:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -29,6 +32,33 @@ class MessageApiTests(unittest.TestCase):
 
         self.assertEqual(
             response,
+            {"ignored": True, "reason": "empty_message"},
+        )
+
+        with closing(connect_database(self.database_path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM turns").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT count(*) FROM messages").fetchone()[0],
+                0,
+            )
+
+    def test_cli_ignores_whitespace_only_message(self) -> None:
+        arguments = [
+            "helios-room",
+            "store-message",
+            "--database",
+            str(self.database_path),
+            "--message",
+            "\t\r\n",
+        ]
+
+        with patch.object(sys, "argv", arguments), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as output:
+            main.main()
+
+        self.assertEqual(
+            json.loads(output.getvalue()),
             {"ignored": True, "reason": "empty_message"},
         )
 

@@ -16,7 +16,8 @@ The project currently provides:
 - a minimal browser chat interface for viewing and sending Peter messages
 - database and blank-message regression tests
 
-Whitespace-only messages are ignored by the API, and the browser keeps the
+Whitespace-only messages are ignored by the API and command-line entry point.
+The storage helper also rejects them defensively, and the browser keeps the
 Send button disabled until the input contains non-whitespace text.
 
 OpenAI calls, Helios responses, raw API event recording, slash commands, and

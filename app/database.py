@@ -359,6 +359,12 @@ def allocate_next_room_sequence_no(
     return row[0]
 
 
+def is_blank_message(message_text: str) -> bool:
+    """Return whether a message contains no non-whitespace text."""
+
+    return not message_text.strip()
+
+
 def store_message(
     connection: sqlite3.Connection,
     room_id: int,
@@ -378,6 +384,9 @@ def store_message(
     This function does not manage transactions - the caller should wrap
     calls in an appropriate transaction.
     """
+    if is_blank_message(message_text):
+        raise ValueError("message_text must contain non-whitespace text")
+
     room_sequence_no = allocate_next_room_sequence_no(connection, room_id)
 
     turn_sequence_no = None
