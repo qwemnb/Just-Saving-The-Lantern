@@ -97,6 +97,14 @@ async function sendMessage(messageText) {
 document.addEventListener('DOMContentLoaded', () => {
     const form = document.getElementById('message-form');
     const input = document.getElementById('message-input');
+    const sendButton = form.querySelector('.send-button');
+
+    function updateSendButtonState() {
+        sendButton.disabled = input.disabled || input.value.trim().length === 0;
+    }
+
+    input.addEventListener('input', updateSendButtonState);
+    updateSendButtonState();
     
     // Load initial messages
     loadMessages();
@@ -108,7 +116,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const messageText = input.value.trim();
         if (!messageText) return;
         
-        const sendButton = form.querySelector('.send-button');
         sendButton.disabled = true;
         input.disabled = true;
         
@@ -118,8 +125,8 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (error) {
             // Error already handled in sendMessage
         } finally {
-            sendButton.disabled = false;
             input.disabled = false;
+            updateSendButtonState();
             input.focus();
         }
     });

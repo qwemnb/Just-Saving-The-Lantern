@@ -79,6 +79,9 @@ async def get_messages():
 @app.post("/api/messages")
 async def post_message(request: MessageRequest):
     """Store a new message in the room."""
+    if not request.message_text.strip():
+        return {"ignored": True, "reason": "empty_message"}
+
     connection = connect_database()
     try:
         connection.execute("BEGIN IMMEDIATE")
