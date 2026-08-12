@@ -342,6 +342,53 @@ test('trace rendering handles empty/open data and future recorded memory generic
 });
 
 
+test('recorded inherited memory is rendered literally in its dedicated section', () => {
+    const doc = makeDocument();
+    const hostile = '<img src=x onerror=alert(91)>\n  exact inherited text  ';
+    const retrieval = {
+        retriever_version: 'seed-fts-topic-v1',
+        query_terms: ['glass', 'orchard'],
+        result_limit: 5,
+        text_budget_chars: 8000,
+        selected: [{
+            rank: 1,
+            seed_memory_id: 7,
+            stable_id: '<svg onload=alert(92)>',
+            seed_batch_id: 2,
+            source_content_sha256: 'a'.repeat(64),
+            source_label: 'Synthetic',
+            source_locator: 'Fictional locator',
+            memory_text_sha256: 'b'.repeat(64),
+            exact_topic_match: true,
+            topic_match_weight_sum: 1,
+            fts_bm25: -1,
+            importance: 0.8,
+            confidence: 1
+        }],
+        omitted_for_budget: 0
+    };
+    renderTrace(minimalTrace({
+        inherited_memory: {
+            state: 'recorded',
+            unavailable_reason: null,
+            retrieval,
+            context: {
+                kind: 'inherited_seed_memory_context',
+                records: [{ memory_text: hostile }]
+            }
+        },
+        recorded_request: { request: {}, local_context: { memory_retrieval: retrieval } }
+    }), doc);
+    const text = allText(doc.getElementById('trace-body'));
+    assert.match(text, /Inherited memory/);
+    assert.match(text, /seed-fts-topic-v1/);
+    assert.match(text, /<img src=x onerror=alert\(91\)>/);
+    assert.match(text, /<svg onload=alert\(92\)>/);
+    assert.equal(doc.created.some(element => ['IMG', 'SVG', 'SCRIPT'].includes(element.tagName)), false);
+    assert.equal(doc.created.some(element => element.className.includes('<svg')), false);
+});
+
+
 test('static dialog declares modal semantics and a visible labelled close control', () => {
     const html = fs.readFileSync(path.join(__dirname, '..', 'static', 'index.html'), 'utf8');
     assert.match(html, /role="dialog"/);

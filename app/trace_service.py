@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
@@ -10,6 +13,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .database import EXPECTED_SCHEMA_MIGRATION
+from .seed_memory import (
+    INHERITED_MEMORY_HEADER,
+    INHERITED_MEMORY_PROVENANCE,
+    RESULT_LIMIT,
+    RETRIEVER_VERSION,
+    TEXT_BUDGET_CHARS,
+    build_fts_query,
+    tokenize_memory_query,
+)
 
 
 ROOM_KEY = "main"
@@ -89,7 +101,15 @@ def load_trace(database_path: Path | str, turn_id: int | None = None) -> dict[st
         return _load_snapshot(connection, turn_id)
     except TraceServiceError:
         raise
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exception:
+    except (
+        json.JSONDecodeError,
+        OverflowError,
+        RecursionError,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+        TypeError,
+    ) as exception:
         raise _data_invalid() from exception
     except sqlite3.Error as exception:
         raise _database_unavailable() from exception
@@ -152,6 +172,11 @@ def _load_snapshot(
     recorded_request = (
         _build_recorded_request(request_events[0]) if request_events else None
     )
+    inherited_memory = _build_inherited_memory(
+        recorded_request,
+        messages,
+        request_events[0] if request_events else None,
+    )
     provider_outcome = (
         _build_provider_outcome(
             terminal_events[0],
@@ -189,6 +214,7 @@ def _load_snapshot(
         "messages": messages,
         "configurations": configurations,
         "recorded_request": recorded_request,
+        "inherited_memory": inherited_memory,
         "provider_outcome": provider_outcome,
         "api_events": projected_events,
     }
@@ -724,6 +750,272 @@ def _requested_model(recorded_request: dict[str, Any] | None) -> str | None:
     request = recorded_request.get("request")
     model = request.get("model") if isinstance(request, dict) else None
     return model if isinstance(model, str) else None
+
+
+def _build_inherited_memory(
+    recorded_request: dict[str, Any] | None,
+    messages: list[dict[str, Any]],
+    request_event: dict[str, Any] | None,
+) -> dict[str, Any]:
+    not_recorded = {
+        "state": "not_recorded",
+        "unavailable_reason": None,
+        "retrieval": None,
+        "context": None,
+    }
+    if recorded_request is None:
+        return not_recorded
+    if recorded_request["is_redacted"]:
+        return {
+            "state": "unavailable",
+            "unavailable_reason": "request_redacted",
+            "retrieval": None,
+            "context": None,
+        }
+
+    request = recorded_request.get("request")
+    omissions = recorded_request.get("omitted_json_pointers", [])
+    input_omitted = any(
+        pointer == "/request/input" or pointer.startswith("/request/input/")
+        for pointer in omissions
+    )
+    if input_omitted:
+        return {
+            "state": "unavailable",
+            "unavailable_reason": "request_input_unavailable",
+            "retrieval": None,
+            "context": None,
+        }
+
+    local_context = recorded_request.get("local_context")
+    if not isinstance(local_context, dict) or "memory_retrieval" not in local_context:
+        return not_recorded
+    retrieval = local_context["memory_retrieval"]
+    if not isinstance(retrieval, dict):
+        raise _data_invalid()
+
+    if not isinstance(request, dict) or "input" not in request:
+        raise _data_invalid()
+    provider_input = request["input"]
+    if not isinstance(provider_input, list) or not provider_input:
+        raise _data_invalid()
+
+    selected = _validate_memory_retrieval(retrieval)
+    trigger_id = retrieval["query_source_message_id"]
+    triggering = [message for message in messages if message["id"] == trigger_id]
+    if (
+        request_event is None
+        or request_event["participant_key"].casefold() != "helios"
+        or retrieval["owner_participant_id"] != request_event["participant_id"]
+        or trigger_id != request_event["related_message_id"]
+        or len(triggering) != 1
+        or triggering[0]["participant_key"].casefold() != "peter"
+        or tokenize_memory_query(triggering[0]["message_text"])
+        != retrieval["query_terms"]
+        or provider_input[-1]
+        != {"role": "user", "content": triggering[0]["message_text"]}
+    ):
+        raise _data_invalid()
+
+    context: dict[str, Any] | None = None
+    context_position = len(provider_input) - 2
+    context_item = provider_input[context_position] if context_position >= 0 else None
+    context_content = (
+        context_item.get("content")
+        if isinstance(context_item, dict)
+        else None
+    )
+    if selected:
+        if (
+            context_position < 0
+            or not isinstance(context_item, dict)
+            or context_item.get("role") != "user"
+            or not isinstance(context_content, str)
+            or not context_content.startswith(INHERITED_MEMORY_HEADER)
+        ):
+            raise _data_invalid()
+        encoded_context = context_content[len(INHERITED_MEMORY_HEADER) :]
+        try:
+            context = json.loads(encoded_context)
+        except (json.JSONDecodeError, TypeError) as exception:
+            raise _data_invalid() from exception
+        if _canonical_json(context) != encoded_context:
+            raise _data_invalid()
+        _validate_inherited_context(context, selected, retrieval)
+    elif isinstance(context_content, str) and context_content.startswith(
+        INHERITED_MEMORY_HEADER
+    ):
+        raise _data_invalid()
+
+    return {
+        "state": "recorded",
+        "unavailable_reason": None,
+        "retrieval": retrieval,
+        "context": context,
+    }
+
+
+def _validate_memory_retrieval(retrieval: dict[str, Any]) -> list[dict[str, Any]]:
+    if (
+        retrieval.get("retriever_version") != RETRIEVER_VERSION
+        or not _positive_int(retrieval.get("owner_participant_id"))
+        or not _positive_int(retrieval.get("query_source_message_id"))
+        or retrieval.get("result_limit") != RESULT_LIMIT
+        or retrieval.get("text_budget_chars") != TEXT_BUDGET_CHARS
+        or not _nonnegative_int(retrieval.get("omitted_for_budget"))
+    ):
+        raise _data_invalid()
+    query_terms = retrieval.get("query_terms")
+    fts_query = retrieval.get("fts_query")
+    selected = retrieval.get("selected")
+    if (
+        not isinstance(query_terms, list)
+        or any(not isinstance(term, str) for term in query_terms)
+        or len(query_terms) > 24
+        or (fts_query is not None and not isinstance(fts_query, str))
+        or build_fts_query(query_terms) != fts_query
+        or not isinstance(selected, list)
+        or len(selected) > RESULT_LIMIT
+        or (not query_terms and selected)
+    ):
+        raise _data_invalid()
+
+    seen_ids: set[int] = set()
+    seen_stable_ids: set[str] = set()
+    for index, record in enumerate(selected, start=1):
+        if not isinstance(record, dict):
+            raise _data_invalid()
+        memory_id = record.get("seed_memory_id")
+        stable_id = record.get("stable_id")
+        if (
+            record.get("rank") != index
+            or not _positive_int(memory_id)
+            or not isinstance(stable_id, str)
+            or not stable_id.strip()
+            or memory_id in seen_ids
+            or stable_id in seen_stable_ids
+            or not _positive_int(record.get("seed_batch_id"))
+            or not _lower_sha256(record.get("source_content_sha256"))
+            or not isinstance(record.get("source_label"), str)
+            or not record["source_label"].strip()
+            or not isinstance(record.get("source_locator"), str)
+            or not record["source_locator"].strip()
+            or not _lower_sha256(record.get("memory_text_sha256"))
+            or type(record.get("exact_topic_match")) is not bool
+            or not _finite_number(record.get("topic_match_weight_sum"), minimum=0.0)
+            or (
+                not record.get("exact_topic_match")
+                and record.get("topic_match_weight_sum") != 0.0
+            )
+            or (
+                record.get("fts_bm25") is not None
+                and not _finite_number(record.get("fts_bm25"))
+            )
+            or (
+                not record.get("exact_topic_match")
+                and record.get("fts_bm25") is None
+            )
+            or not _finite_number(record.get("importance"), minimum=0.0, maximum=1.0)
+            or not _finite_number(record.get("confidence"), minimum=0.0, maximum=1.0)
+        ):
+            raise _data_invalid()
+        seen_ids.add(memory_id)
+        seen_stable_ids.add(stable_id)
+    if selected != sorted(selected, key=_recorded_memory_sort_key):
+        raise _data_invalid()
+    return selected
+
+
+def _recorded_memory_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
+    score = record["fts_bm25"]
+    return (
+        -int(record["exact_topic_match"]),
+        -float(record["topic_match_weight_sum"]),
+        score is None,
+        float(score) if score is not None else 0.0,
+        -float(record["importance"]),
+        -float(record["confidence"]),
+        record["seed_memory_id"],
+    )
+
+
+def _validate_inherited_context(
+    context: Any,
+    selected: list[dict[str, Any]],
+    retrieval: dict[str, Any],
+) -> None:
+    if (
+        not isinstance(context, dict)
+        or set(context) != {"kind", "provenance_notice", "retriever_version", "records"}
+        or context.get("kind") != "inherited_seed_memory_context"
+        or context.get("provenance_notice") != INHERITED_MEMORY_PROVENANCE
+        or context.get("retriever_version") != retrieval["retriever_version"]
+        or not isinstance(context.get("records"), list)
+        or len(context["records"]) != len(selected)
+    ):
+        raise _data_invalid()
+    total_chars = 0
+    for audit, record in zip(selected, context["records"]):
+        if (
+            not isinstance(record, dict)
+            or set(record) != {
+                "seed_memory_id",
+                "stable_id",
+                "source_label",
+                "memory_text",
+            }
+            or record.get("seed_memory_id") != audit["seed_memory_id"]
+            or record.get("stable_id") != audit["stable_id"]
+            or record.get("source_label") != audit["source_label"]
+            or not isinstance(record.get("memory_text"), str)
+            or hashlib.sha256(record["memory_text"].encode("utf-8")).hexdigest()
+            != audit["memory_text_sha256"]
+        ):
+            raise _data_invalid()
+        total_chars += len(record["memory_text"])
+    if total_chars > retrieval["text_budget_chars"]:
+        raise _data_invalid()
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _positive_int(value: Any) -> bool:
+    return type(value) is int and value > 0
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _lower_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _finite_number(
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(converted)
+        and (minimum is None or converted >= minimum)
+        and (maximum is None or converted <= maximum)
+    )
 
 
 def _build_provider_outcome(

@@ -237,8 +237,35 @@ function renderTrace(trace, doc = document) {
         eventsSection.appendChild(details);
     });
 
-    const memorySection = createSection(doc, body, 'Memory context');
+    const inheritedSection = createSection(doc, body, 'Inherited memory');
+    const inherited = trace.inherited_memory;
     const localContext = trace.recorded_request && trace.recorded_request.local_context;
+    if (!inherited) {
+        appendText(doc, inheritedSection, 'State', 'not_recorded');
+        appendText(
+            doc,
+            inheritedSection,
+            'Memory',
+            localContext && Object.prototype.hasOwnProperty.call(localContext, 'memory_retrieval')
+                ? 'A recorded local memory audit is available below.'
+                : NO_MEMORY_RETRIEVAL
+        );
+    } else {
+        appendText(doc, inheritedSection, 'State', inherited.state);
+        appendText(doc, inheritedSection, 'Unavailable reason', inherited.unavailable_reason);
+        if (inherited.retrieval !== null && inherited.retrieval !== undefined) {
+            appendText(doc, inheritedSection, 'Recorded retrieval policy and selection', '');
+            appendPre(doc, inheritedSection, inherited.retrieval);
+        }
+        if (inherited.context !== null && inherited.context !== undefined) {
+            appendText(doc, inheritedSection, 'Exact supplied inherited context', '');
+            appendPre(doc, inheritedSection, inherited.context);
+        } else if (inherited.state === 'recorded') {
+            appendText(doc, inheritedSection, 'Context', 'No inherited records were selected.');
+        }
+    }
+
+    const memorySection = createSection(doc, body, 'Recorded local memory audit');
     if (localContext && Object.prototype.hasOwnProperty.call(localContext, 'memory_retrieval')) {
         appendPre(doc, memorySection, localContext.memory_retrieval);
     } else {

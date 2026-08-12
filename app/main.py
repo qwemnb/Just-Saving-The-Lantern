@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import re
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from .database import (
 from .models import MessageRequest
 from .openai_client import create_openai_client
 from .room_service import TurnServiceError, run_helios_turn
+from .seed_memory import SeedMemoryError, import_seed_memories, load_seed_manifest
 from .trace_service import TraceServiceError, load_trace
 
 
@@ -168,8 +170,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Helios Room")
     parser.add_argument(
         "command",
-        choices=("init-db", "store-message", "serve"),
-        help="Initialize database, store a test message, or start the web server.",
+        choices=("init-db", "store-message", "import-seed-memories", "serve"),
+        help=(
+            "Initialize the database, store a test message, import validated seed "
+            "memories, or start the web server."
+        ),
     )
     parser.add_argument(
         "--database",
@@ -179,6 +184,10 @@ def main() -> None:
     parser.add_argument(
         "--message",
         help="Message text to store (for store-message command).",
+    )
+    parser.add_argument(
+        "--file",
+        help="UTF-8 JSON manifest path (for import-seed-memories command).",
     )
     parser.add_argument(
         "--host",
@@ -259,6 +268,17 @@ def main() -> None:
             raise
         finally:
             connection.close()
+
+    elif arguments.command == "import-seed-memories":
+        if arguments.file is None:
+            parser.error("--file is required for import-seed-memories command")
+        try:
+            manifest = load_seed_manifest(arguments.file)
+            report = import_seed_memories(arguments.database, manifest)
+        except SeedMemoryError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            raise SystemExit(1) from None
+        print(json.dumps(report, indent=2, ensure_ascii=False))
 
     elif arguments.command == "serve":
         app.state.database_path = Path(arguments.database).expanduser().resolve()

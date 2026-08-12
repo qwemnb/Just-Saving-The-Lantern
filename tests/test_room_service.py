@@ -230,7 +230,7 @@ class RoomServiceTests(unittest.TestCase):
         self.assertIs(provider_request["store"], False)
         self.assertEqual(
             provider_request["reasoning"],
-            {"effort": "low", "context": "current_turn"},
+            {"effort": "medium", "context": "current_turn"},
         )
         self.assertEqual(provider_request["max_output_tokens"], 2048)
         self.assertEqual(provider_request["tools"], [])
@@ -292,7 +292,11 @@ class RoomServiceTests(unittest.TestCase):
         self.assertEqual(set(request_event), {"request", "local_context"})
         self.assertEqual(request_event["request"], provider_request)
         self.assertEqual(
-            request_event["local_context"],
+            {
+                key: value
+                for key, value in request_event["local_context"].items()
+                if key != "memory_retrieval"
+            },
             {
                 "provider": "openai",
                 "operation": "responses.create",
@@ -300,6 +304,20 @@ class RoomServiceTests(unittest.TestCase):
                 "room_sequence_boundary": 1,
                 "timeout_seconds": 120,
                 "max_retries": 0,
+            },
+        )
+        self.assertEqual(
+            request_event["local_context"]["memory_retrieval"],
+            {
+                "retriever_version": "seed-fts-topic-v1",
+                "owner_participant_id": events[0]["participant_id"],
+                "query_source_message_id": messages[0]["id"],
+                "query_terms": ["hello", "helios"],
+                "fts_query": '"hello helios" OR "hello" OR "helios"',
+                "result_limit": 5,
+                "text_budget_chars": 8000,
+                "selected": [],
+                "omitted_for_budget": 0,
             },
         )
         self.assertEqual(
@@ -794,7 +812,7 @@ class RoomServiceTests(unittest.TestCase):
                     SYSTEM_INSTRUCTIONS,
                     """
                     {
-                      "reasoning": {"context": "current_turn", "effort": "low"},
+                      "reasoning": {"context": "current_turn", "effort": "medium"},
                       "max_output_tokens": 2048,
                       "store": false
                     }
@@ -842,7 +860,7 @@ class RoomServiceTests(unittest.TestCase):
                 model="gpt-5.6-luna",
                 instructions=SYSTEM_INSTRUCTIONS,
                 settings=json.loads(
-                    '{"reasoning":{"context":"current_turn","effort":"low"},'
+                    '{"reasoning":{"context":"current_turn","effort":"medium"},'
                     '"max_output_tokens":2048,"store":false}'
                 ),
                 tools=[],

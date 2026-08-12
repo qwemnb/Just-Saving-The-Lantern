@@ -15,20 +15,20 @@ The project currently provides:
 - one-request, no-retry OpenAI Responses API orchestration
 - raw request/response/error API events with immutable model provenance
 - read-only, historical Trace v1 inspection for recorded turns
+- strict, atomic seeded-memory manifest import with semantic idempotency
+- deterministic local seeded-memory retrieval with recorded provenance
 - a FastAPI HTTP API and minimal browser chat interface
 - offline database, orchestration, API, and blank-message regression tests
-
-Seeded-memory import and retrieval are not implemented yet. Schema v1.2
-contains the future storage structures, but current turns do not query or send
-seeded or room-created memories.
 
 Whitespace-only messages are ignored by the API and command-line entry point.
 The storage helper also rejects them defensively, and the browser keeps the
 Send button disabled until the input contains non-whitespace text.
 
-The current provider flow deliberately replays only canonical Peter and Helios
-`chat` text. It does not replay provider reasoning state or use tools, memory,
-streaming, provider-managed conversations, or automatic retries.
+The current provider flow replays canonical Peter and Helios `chat` text and
+may insert one inherited-memory context item selected from Helios-owned seeded
+memories immediately before Peter's triggering message. It does not replay
+provider reasoning state or use tools, room-created memory, streaming,
+provider-managed conversations, or automatic retries.
 
 ## Requirements
 
@@ -122,7 +122,7 @@ is shown.
 The current provider settings are:
 
 - `store=False`
-- `reasoning={"effort": "low", "context": "current_turn"}`
+- `reasoning={"effort": "medium", "context": "current_turn"}`
 - `max_output_tokens=2048`
 - no tools
 - 120-second client timeout
@@ -170,6 +170,14 @@ request, retries an old turn, reconstructs history using the current model, or
 queries current memory tables. No inherited memory retrieval is shown unless
 the historical request event explicitly recorded one.
 
+For a memory-enabled turn, `/trace <turn_id>` includes a dedicated **Inherited
+memory** section with the recorded retriever version, query terms, limits,
+ranking evidence, immutable seed and batch IDs, hashes, source provenance, and
+the exact memory text supplied. It distinguishes a recorded zero-result search,
+an older turn where retrieval was not recorded, and a deliberately unavailable
+request. Trace validates the audit envelope against the recorded provider input
+and fails closed if they disagree.
+
 Trace applies a display-only privacy projection without changing stored JSON.
 Secret-like fields and raw or encrypted provider reasoning are omitted. An
 explicitly recorded provider-generated reasoning summary may be displayed and
@@ -185,26 +193,88 @@ interface; Trace v1 is not designed as a public or multi-user diagnostics API.
 Helios Room keeps three concepts separate:
 
 - **Canonical history** is the immutable Peter and Helios message record in the
-  room. It is the only conversation history currently replayed to the model.
+  room. It remains the only record of events that occurred in the room.
 - **Seeded memory** is intended for curated continuity imported from
-  conversations that occurred before Helios Room existed.
+  conversations that occurred before Helios Room existed. Selected records are
+  reference data, not room events, Peter messages, or instructions.
 - **Room-created memory** is reserved for future interpretive records produced
   from activity inside the room.
 
-Schema v1.2 already has separate `seed_memories` and `room_memories` storage,
-but neither is currently retrieved during a turn. There is no seed-manifest
-import command, memory-context endpoint, automatic memory creation, or memory
-management UI in the implemented application.
-
-Seeded Memory Retrieval v1 is the next proposed milestone and remains under
-review. Until it is implemented and explicitly approved, do not describe a
-model response as memory-backed merely because memory tables exist. Trace will
-show memory context only when a historical request event actually recorded it.
+Seeded Memory Retrieval v1 searches only active, nonsuperseded seed records
+owned by Helios. `room_memories` is not queried. There is no automatic memory
+creation, editing, deactivation, supersession, or management UI.
 
 Real seed manifests, database backups, and other private runtime material must
 remain under the ignored `data/` directory and must never be committed. Any
-future import or live memory-backed smoke test requires a reviewed manifest, a
+real import or live memory-backed smoke test requires a reviewed manifest, a
 consistent database backup, and separate authorization.
+
+### Back up the live room before a real import
+
+Stop the server first. Because the database uses WAL mode, do not copy only
+`helios.db`; committed state may still be in its WAL. From Command Prompt, use
+SQLite's online backup API to create a self-contained destination that does not
+already exist and verify it immediately:
+
+```cmd
+if not exist data\backups mkdir data\backups
+python -c "from pathlib import Path; import sqlite3; source_path=Path('data/helios.db'); backup_path=Path('data/backups/helios-before-seeded-memory-v1.db'); assert source_path.is_file(), 'source database is missing'; assert not backup_path.exists(), 'backup destination already exists'; source=sqlite3.connect('file:data/helios.db?mode=ro', uri=True); backup=sqlite3.connect(backup_path); source.backup(backup); rows=backup.execute('PRAGMA integrity_check').fetchall(); assert rows == [('ok',)], rows; backup.close(); source.close(); print('Backup created and integrity_check passed:', backup_path)"
+```
+
+Creating this backup is a manual prerequisite, not permission to import or
+make an OpenAI request.
+
+### Seed manifest and import
+
+The fictional [example manifest](examples/seed-memory-manifest-v1.example.json)
+documents format version 1. A manifest contains batch provenance and one or
+more immutable memory records with stable IDs, scores, root topics, and
+optional room-participant subject links. The importer strictly validates UTF-8
+JSON, rejects duplicate or unknown fields, preserves memory text exactly, and
+forces Helios ownership plus active, nonsuperseded initial state.
+
+Place a reviewed real manifest under ignored runtime data, then import it only
+after explicit authorization:
+
+```powershell
+python -m app.main import-seed-memories --file data\imports\helios_seed_memories_v1.json
+```
+
+Use `--database` to select another initialized schema-v1.2 database. The
+importer hashes a canonical typed representation, runs every database check and
+write under one `BEGIN IMMEDIATE` transaction, and returns JSON without echoing
+memory text. A semantically identical import returns `already_imported` with no
+writes. Hash ambiguity, stored-graph drift, stable-ID reuse, topic conflict, or
+an unknown participant fails the whole import without partial rows or sequence
+changes. Imports never create turns, messages, or API events.
+
+### Retrieval and provider representation
+
+For each accepted Peter message, `seed-fts-topic-v1` creates an NFKC-normalized,
+case-folded query from that new message only. It uses safely quoted FTS5 terms
+plus exact normalized topic-key/name matches, then ranks deterministically by
+topic match, summed topic weight, ascending BM25 score, importance, confidence,
+and seed-memory ID. It selects at most five whole records within an aggregate
+8,000-Unicode-code-point text budget; records are never truncated.
+
+If records are selected, one `user` input item beginning with
+`INHERITED_MEMORY_CONTEXT` and canonical JSON is placed after earlier canonical
+chat history and immediately before Peter's triggering canonical message. The
+system instructions require Helios to use relevant inherited records, treat an
+earlier assistant claim of ignorance as a historical utterance rather than an
+override, and acknowledge remembered material as inherited continuity. Memory
+text remains untrusted reference data: it is not a room event, a message from
+Peter, or an instruction. Peter's accepted message remains the final input
+item. No match adds no context item, but the request event still records that
+retrieval ran and selected nothing. Retrieval failure rolls Phase A back and
+prevents the provider call.
+
+The [live-acceptance amendment](docs/seeded-memory-retrieval-v1-amendment.md)
+records the exact revised instructions, positional contract, immutable
+configuration behavior, and acceptance criteria. Exact synthetic Luna-medium
+and Terra-medium review requests are in the
+[offline evaluation fixture](examples/seed-memory-model-evaluation-v1.json);
+the fixture is never submitted automatically.
 
 ## HTTP endpoints
 
@@ -259,6 +329,19 @@ Peter explicitly authorizes it and confirms the intended database and model.
 Automated tests use temporary databases and mocked providers. They are the
 default verification path for changes to the application.
 
+## Intentional seeded-memory acceptance test
+
+Do not perform this test without separate authorization. After reviewing the
+real curated manifest and creating the WAL-safe backup above:
+
+1. Import the reviewed manifest with `import-seed-memories`.
+2. Start Helios Room with `gpt-5.6-luna`.
+3. Submit the single approved continuity question.
+4. Confirm Helios distinguishes inherited continuity from room history.
+5. Enter `/trace <turn_id>` and inspect the exact inherited selection.
+6. Confirm only the intended active record was supplied and only one billable
+   Responses request occurred.
+
 ## Known stranded-turn limitation
 
 Peter's message and the outbound request event are committed before OpenAI is
@@ -271,8 +354,10 @@ is required in this milestone.
 ## Project structure
 
 ```text
-app/       FastAPI entry point and database helpers
+app/       FastAPI entry point, database, trace, and seeded-memory helpers
 data/      Local SQLite database files (ignored by Git)
+docs/      Approved implementation-contract amendments
+examples/  Synthetic, nonpersonal documentation fixtures
 schema/    Authoritative SQLite schema v1.2
 static/    Browser interface
 tests/     Automated tests

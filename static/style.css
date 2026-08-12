@@ -211,6 +211,13 @@ header h1 {
     outline-offset: 2px;
 }
 
+.trace-privacy-warning {
+    padding: 0.75rem 1.25rem;
+    color: #5f4b00;
+    background: #fff5c2;
+    font-size: 0.88rem;
+}
+
 .trace-body {
     overflow-y: auto;
     padding: 0 1.25rem 1.25rem;
