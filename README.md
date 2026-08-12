@@ -18,11 +18,15 @@ The project currently provides:
 - a FastAPI HTTP API and minimal browser chat interface
 - offline database, orchestration, API, and blank-message regression tests
 
+Seeded-memory import and retrieval are not implemented yet. Schema v1.2
+contains the future storage structures, but current turns do not query or send
+seeded or room-created memories.
+
 Whitespace-only messages are ignored by the API and command-line entry point.
 The storage helper also rejects them defensively, and the browser keeps the
 Send button disabled until the input contains non-whitespace text.
 
-The first API milestone deliberately replays only canonical Peter and Helios
+The current provider flow deliberately replays only canonical Peter and Helios
 `chat` text. It does not replay provider reasoning state or use tools, memory,
 streaming, provider-managed conversations, or automatic retries.
 
@@ -81,9 +85,10 @@ the following records exist:
 Initialization is idempotent and preserves existing messages. The database is
 local runtime data and is excluded from Git.
 
-The seeded `initial` Helios configuration remains an unused placeholder. The
-first accepted API-backed turn creates a separate immutable configuration with
-the requested model, exact system instructions, settings, and empty tool list.
+In a newly initialized database, the seeded `initial` Helios configuration is
+an unused placeholder. The first accepted API-backed turn creates a separate
+immutable configuration with the requested model, exact system instructions,
+settings, and empty tool list.
 
 ## Run the application
 
@@ -114,7 +119,7 @@ and followed by exactly one Helios Responses API call. While that call is in
 progress, the input and Send button are disabled and a temporary local status
 is shown.
 
-The first-turn provider settings are:
+The current provider settings are:
 
 - `store=False`
 - `reasoning={"effort": "low", "context": "current_turn"}`
@@ -175,12 +180,38 @@ Trace exposes private canonical messages, exact system instructions, request
 settings, and operational provenance. Keep the server bound to a trusted local
 interface; Trace v1 is not designed as a public or multi-user diagnostics API.
 
+## Memory status and boundaries
+
+Helios Room keeps three concepts separate:
+
+- **Canonical history** is the immutable Peter and Helios message record in the
+  room. It is the only conversation history currently replayed to the model.
+- **Seeded memory** is intended for curated continuity imported from
+  conversations that occurred before Helios Room existed.
+- **Room-created memory** is reserved for future interpretive records produced
+  from activity inside the room.
+
+Schema v1.2 already has separate `seed_memories` and `room_memories` storage,
+but neither is currently retrieved during a turn. There is no seed-manifest
+import command, memory-context endpoint, automatic memory creation, or memory
+management UI in the implemented application.
+
+Seeded Memory Retrieval v1 is the next proposed milestone and remains under
+review. Until it is implemented and explicitly approved, do not describe a
+model response as memory-backed merely because memory tables exist. Trace will
+show memory context only when a historical request event actually recorded it.
+
+Real seed manifests, database backups, and other private runtime material must
+remain under the ignored `data/` directory and must never be committed. Any
+future import or live memory-backed smoke test requires a reviewed manifest, a
+consistent database backup, and separate authorization.
+
 ## HTTP endpoints
 
 - `GET /` serves the browser interface.
 - `GET /api/messages` returns messages from the `main` room.
 - `POST /api/messages` accepts message text, assigns Peter server-side, and
-  performs the first API-backed Helios turn. Extra request fields are rejected.
+  performs one API-backed Helios turn. Extra request fields are rejected.
 - `GET /api/trace/latest` returns the latest recorded `main`-room turn through
   the read-only Trace v1 projection.
 - `GET /api/trace/{turn_id}` returns one recorded turn for a canonical positive
@@ -218,20 +249,15 @@ node --test tests/test_trace_ui.js
 node --check static/app.js
 ```
 
-## Intentional live smoke test
+## Live-provider safety
 
-Do not perform this test until Peter explicitly authorizes a live, billable
-OpenAI request. The current development database contains two Peter test
-messages in open turns, and both will be included in the first canonical replay
-unless Peter separately authorizes a database reset.
+Opening the application and using `/trace` do not contact OpenAI. Submitting an
+ordinary nonblank message does create canonical history and can make one
+billable Responses API request. Do not perform a live-provider smoke test until
+Peter explicitly authorizes it and confirms the intended database and model.
 
-After authorization:
-
-1. Put a valid key and `gpt-5.6-luna` in `.env` as shown above.
-2. Start the server with `python -m app.main serve`.
-3. Open <http://127.0.0.1:8000>.
-4. Submit one nonblank Peter message once.
-5. Confirm Peter and Helios appear in canonical order, then stop the server.
+Automated tests use temporary databases and mocked providers. They are the
+default verification path for changes to the application.
 
 ## Known stranded-turn limitation
 
