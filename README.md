@@ -14,6 +14,7 @@ The project currently provides:
 - persistent Peter and Helios messages with deterministic room and turn ordering
 - one-request, no-retry OpenAI Responses API orchestration
 - raw request/response/error API events with immutable model provenance
+- read-only, historical Trace v1 inspection for recorded turns
 - a FastAPI HTTP API and minimal browser chat interface
 - offline database, orchestration, API, and blank-message regression tests
 
@@ -92,6 +93,17 @@ Start the local server:
 python -m app.main serve
 ```
 
+To use a different existing database for both chat and trace routes, select it
+when starting the server:
+
+```powershell
+python -m app.main serve --database C:\path\to\helios.db
+```
+
+The selected path is not opened merely by parsing the `serve` command. Normal
+chat operations still require an initialized compatible database, while trace
+access refuses to create a missing file.
+
 Then open <http://127.0.0.1:8000> in a browser. The server binds to
 `127.0.0.1:8000` by default; use `--host` and `--port` to override those
 values.
@@ -126,12 +138,58 @@ python -m app.main store-message --message "Hello from Peter"
 This creates a new open turn and stores the message in the canonical room
 history.
 
+## Inspect a recorded turn with Trace v1
+
+Enter either local command in the browser message box:
+
+```text
+/trace
+/trace 17
+```
+
+`/trace` opens the latest turn in the `main` room. `/trace <turn_id>` opens the
+specified positive decimal turn ID. These commands are intercepted locally:
+they are not Peter messages, create no turn, message, API event, or admin event,
+and never reach OpenAI. Malformed `/trace` usage is also rejected before any
+canonical write.
+
+The accessible trace panel shows the selected turn and room identity, exact
+canonical messages and reply provenance, every referenced participant
+configuration, the recorded provider request, the recorded provider outcome,
+the ordered API-event timeline, redaction metadata, and recorded memory context
+when one exists. Human-only, open, cancelled, failed, and stranded turns are
+shown as recorded; a missing request or outcome is not inferred or fabricated.
+
+Trace data comes from one read-only SQLite snapshot. It never reruns a provider
+request, retries an old turn, reconstructs history using the current model, or
+queries current memory tables. No inherited memory retrieval is shown unless
+the historical request event explicitly recorded one.
+
+Trace applies a display-only privacy projection without changing stored JSON.
+Secret-like fields and raw or encrypted provider reasoning are omitted. An
+explicitly recorded provider-generated reasoning summary may be displayed and
+is labelled as a summary, while usage totals can still include aggregate
+reasoning-token counts. Omission locations are reported as JSON Pointers.
+
+Trace exposes private canonical messages, exact system instructions, request
+settings, and operational provenance. Keep the server bound to a trusted local
+interface; Trace v1 is not designed as a public or multi-user diagnostics API.
+
 ## HTTP endpoints
 
 - `GET /` serves the browser interface.
 - `GET /api/messages` returns messages from the `main` room.
 - `POST /api/messages` accepts message text, assigns Peter server-side, and
   performs the first API-backed Helios turn. Extra request fields are rejected.
+- `GET /api/trace/latest` returns the latest recorded `main`-room turn through
+  the read-only Trace v1 projection.
+- `GET /api/trace/{turn_id}` returns one recorded turn for a canonical positive
+  decimal SQLite turn ID.
+
+Both trace endpoints return JSON with `Cache-Control: no-store`. Missing or
+incompatible databases, invalid identifiers, missing turns, and invalid
+historical data use stable error codes and do not fall back to chat or provider
+behavior.
 
 Example request body:
 
@@ -156,6 +214,8 @@ Also run the complete offline verification set:
 ```powershell
 python -m compileall app tests
 git diff --check
+node --test tests/test_trace_ui.js
+node --check static/app.js
 ```
 
 ## Intentional live smoke test

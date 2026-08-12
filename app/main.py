@@ -5,14 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
+from .commands import classify_local_command, is_reserved_trace_command
 from .database import (
     DEFAULT_DATABASE_PATH,
     connect_database,
@@ -24,6 +26,11 @@ from .database import (
 from .models import MessageRequest
 from .openai_client import create_openai_client
 from .room_service import TurnServiceError, run_helios_turn
+from .trace_service import TraceServiceError, load_trace
+
+
+_CANONICAL_TURN_ID = re.compile(r"[1-9][0-9]*\Z")
+_SQLITE_MAX_INTEGER = 9_223_372_036_854_775_807
 
 # FastAPI application
 app = FastAPI(title="Helios Room")
@@ -98,6 +105,65 @@ async def post_message(request: MessageRequest):
         )
 
 
+@app.get("/api/trace/latest")
+async def get_latest_trace(request: Request):
+    """Return the latest main-room turn through the read-only trace reader."""
+
+    return await _trace_response(request, None)
+
+
+@app.get("/api/trace/{turn_id}")
+async def get_trace(request: Request, turn_id: str):
+    """Return a specific canonical decimal turn ID without path coercion."""
+
+    if _CANONICAL_TURN_ID.fullmatch(turn_id) is None:
+        return _trace_error(
+            TraceServiceError(
+                400,
+                "invalid_trace_turn_id",
+                "Trace turn IDs must be canonical positive decimal integers.",
+            )
+        )
+    parsed_turn_id = int(turn_id)
+    if parsed_turn_id > _SQLITE_MAX_INTEGER:
+        return _trace_error(
+            TraceServiceError(
+                400,
+                "invalid_trace_turn_id",
+                "Trace turn IDs must fit SQLite's signed 64-bit integer range.",
+            )
+        )
+    return await _trace_response(request, parsed_turn_id)
+
+
+async def _trace_response(request: Request, turn_id: int | None) -> JSONResponse:
+    try:
+        trace = await asyncio.to_thread(
+            load_trace,
+            request.app.state.database_path,
+            turn_id,
+        )
+    except TraceServiceError as error:
+        return _trace_error(error)
+    except Exception:
+        return _trace_error(
+            TraceServiceError(
+                500,
+                "trace_data_invalid",
+                "The recorded trace data is invalid.",
+            )
+        )
+    return JSONResponse(content=trace, headers={"Cache-Control": "no-store"})
+
+
+def _trace_error(error: TraceServiceError) -> JSONResponse:
+    return JSONResponse(
+        status_code=error.status_code,
+        content=error.as_payload(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Helios Room")
     parser.add_argument(
@@ -138,6 +204,14 @@ def main() -> None:
         if is_blank_message(arguments.message):
             print(json.dumps({"ignored": True, "reason": "empty_message"}, indent=2))
             return
+
+        if is_reserved_trace_command(classify_local_command(arguments.message)):
+            parser.exit(
+                status=2,
+                message=(
+                    "store-message rejects /trace commands; use the local browser UI.\n"
+                ),
+            )
 
         connection = connect_database(database_path=arguments.database)
         try:
@@ -187,6 +261,7 @@ def main() -> None:
             connection.close()
 
     elif arguments.command == "serve":
+        app.state.database_path = Path(arguments.database).expanduser().resolve()
         print(f"Starting Helios Room web server on http://{arguments.host}:{arguments.port}")
         uvicorn.run(app, host=arguments.host, port=arguments.port)
 

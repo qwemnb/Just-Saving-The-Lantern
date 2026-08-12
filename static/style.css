@@ -64,11 +64,7 @@ header h1 {
     flex-direction: column;
 }
 
-.message.peter {
-    align-items: flex-end;
-}
-
-.message.helios {
+.message.canonical-message {
     align-items: flex-start;
 }
 
@@ -84,17 +80,10 @@ header h1 {
     word-wrap: break-word;
 }
 
-.message.peter .message-content {
-    background: #667eea;
-    color: white;
-    border-bottom-right-radius: 4px;
-}
-
-.message.helios .message-content {
+.message.canonical-message .message-content {
     background: white;
     color: #333;
     border: 1px solid #e0e0e0;
-    border-bottom-left-radius: 4px;
 }
 
 .message.system .message-content {
@@ -161,6 +150,107 @@ header h1 {
 .send-button:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+}
+
+.trace-command-status,
+.trace-panel-status {
+    min-height: 1.5rem;
+    color: #8b1e3f;
+    font-size: 0.9rem;
+    padding: 0.3rem 1.25rem;
+    white-space: pre-wrap;
+}
+
+.trace-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 1rem;
+    background: rgba(20, 20, 32, 0.72);
+}
+
+.trace-overlay[hidden] {
+    display: none;
+}
+
+.trace-dialog {
+    width: min(900px, 100%);
+    max-height: 92vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 20px 70px rgba(0, 0, 0, 0.4);
+}
+
+.trace-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem 1.25rem;
+    color: #fff;
+    background: #5145a6;
+}
+
+.trace-close {
+    padding: 0.5rem 0.8rem;
+    border: 1px solid #fff;
+    border-radius: 6px;
+    color: #fff;
+    background: transparent;
+    cursor: pointer;
+}
+
+.trace-close:focus-visible {
+    outline: 3px solid #ffe082;
+    outline-offset: 2px;
+}
+
+.trace-body {
+    overflow-y: auto;
+    padding: 0 1.25rem 1.25rem;
+}
+
+.trace-section {
+    padding: 1rem 0;
+    border-top: 1px solid #dedee8;
+}
+
+.trace-section h3 {
+    margin-bottom: 0.75rem;
+}
+
+.trace-item {
+    display: block;
+    margin: 0.75rem 0;
+    padding: 0.8rem;
+    border: 1px solid #dedee8;
+    border-radius: 8px;
+    background: #fafafe;
+}
+
+.trace-field {
+    margin: 0.25rem 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.trace-pre {
+    margin-top: 0.35rem;
+    padding: 0.75rem;
+    overflow: auto;
+    border-radius: 6px;
+    background: #f2f2f8;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 0.84rem;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
 }
 
 /* Scrollbar styling */

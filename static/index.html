@@ -7,14 +7,14 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="container">
+    <main class="container" id="app-shell">
         <header>
             <h1>Helios Room</h1>
             <div class="room-info">The Room</div>
         </header>
 
         <div class="chat-container">
-            <div class="messages" id="messages">
+            <div class="messages" id="messages" aria-live="polite">
                 <div class="message system">
                     <div class="message-content">
                         Welcome to Helios Room. Messages are loading...
@@ -22,13 +22,15 @@
                 </div>
             </div>
 
+            <div id="trace-command-status" class="trace-command-status" role="status" aria-live="polite"></div>
+
             <div class="input-area">
                 <form id="message-form" class="message-form">
-                    <input 
-                        type="text" 
-                        id="message-input" 
-                        class="message-input" 
-                        placeholder="Type a message..." 
+                    <input
+                        type="text"
+                        id="message-input"
+                        class="message-input"
+                        placeholder="Type a message or /trace..."
                         autocomplete="off"
                         required
                     >
@@ -36,6 +38,23 @@
                 </form>
             </div>
         </div>
+    </main>
+
+    <div id="trace-overlay" class="trace-overlay" hidden>
+        <section
+            id="trace-dialog"
+            class="trace-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="trace-title"
+        >
+            <div class="trace-header">
+                <h2 id="trace-title">Turn trace</h2>
+                <button id="trace-close" class="trace-close" type="button" aria-label="Close turn trace">Close</button>
+            </div>
+            <div id="trace-panel-status" class="trace-panel-status" role="status" aria-live="polite"></div>
+            <div id="trace-body" class="trace-body"></div>
+        </section>
     </div>
 
     <script src="/static/app.js"></script>

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .commands import classify_local_command, is_reserved_trace_command
 from .database import (
     DEFAULT_DATABASE_PATH,
     connect_database,
@@ -119,6 +120,13 @@ async def run_helios_turn(
 
     if is_blank_message(message_text):
         return {"ignored": True, "reason": "empty_message"}
+
+    if is_reserved_trace_command(classify_local_command(message_text)):
+        raise TurnServiceError(
+            status_code=400,
+            code="local_command_only",
+            message="The /trace command is available only in the local browser UI.",
+        )
 
     environment = load_openai_environment(dotenv_path)
     if environment.api_key is None or not environment.api_key.strip():
