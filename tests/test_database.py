@@ -18,9 +18,9 @@ class DatabaseInitializationTests(unittest.TestCase):
     def test_initializes_schema_and_milestone_records(self) -> None:
         report = initialize_database(self.database_path)
 
-        self.assertEqual(report.schema_label, "1.2")
+        self.assertEqual(report.schema_label, "1.3")
         self.assertEqual(report.room_count, 1)
-        self.assertEqual(report.participant_count, 2)
+        self.assertEqual(report.participant_count, 3)
         self.assertEqual(report.active_membership_count, 2)
         self.assertEqual(report.helios_config_count, 1)
         self.assertEqual(report.integrity_check, "ok")
@@ -58,6 +58,7 @@ class DatabaseInitializationTests(unittest.TestCase):
             [
                 ("helios", "Helios", "ai"),
                 ("peter", "Peter", "human"),
+                ("room-system", "Room", "system"),
             ],
         )
         self.assertEqual(
@@ -70,7 +71,7 @@ class DatabaseInitializationTests(unittest.TestCase):
         report = initialize_database(self.database_path)
 
         self.assertEqual(report.room_count, 1)
-        self.assertEqual(report.participant_count, 2)
+        self.assertEqual(report.participant_count, 3)
         self.assertEqual(report.active_membership_count, 2)
         self.assertEqual(report.helios_config_count, 1)
 

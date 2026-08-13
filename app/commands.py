@@ -8,6 +8,7 @@ from enum import Enum
 
 
 _TRACE_COMMAND = re.compile(r"^/trace(?:\s+([1-9][0-9]*))?\s*$")
+_PARTICIPANTS_COMMAND = re.compile(r"^/participants\s*$")
 
 
 class LocalCommandKind(str, Enum):
@@ -17,6 +18,8 @@ class LocalCommandKind(str, Enum):
     TRACE_LATEST = "trace_latest"
     TRACE_TURN = "trace_turn"
     MALFORMED_TRACE = "malformed_trace"
+    PARTICIPANTS = "participants"
+    MALFORMED_PARTICIPANTS = "malformed_participants"
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,8 @@ def classify_local_command(message_text: str) -> LocalCommand:
     """
 
     stripped = message_text.strip()
+    if _PARTICIPANTS_COMMAND.fullmatch(stripped) is not None:
+        return LocalCommand(LocalCommandKind.PARTICIPANTS)
     match = _TRACE_COMMAND.fullmatch(stripped)
     if match is not None:
         turn_id_text = match.group(1)
@@ -46,10 +51,22 @@ def classify_local_command(message_text: str) -> LocalCommand:
     first_token = stripped.split(maxsplit=1)[0] if stripped else ""
     if first_token == "/trace":
         return LocalCommand(LocalCommandKind.MALFORMED_TRACE)
+    if first_token == "/participants":
+        return LocalCommand(LocalCommandKind.MALFORMED_PARTICIPANTS)
     return LocalCommand(LocalCommandKind.NON_COMMAND)
 
 
 def is_reserved_trace_command(command: LocalCommand) -> bool:
     """Return whether the classification must never enter canonical history."""
+
+    return command.kind in {
+        LocalCommandKind.TRACE_LATEST,
+        LocalCommandKind.TRACE_TURN,
+        LocalCommandKind.MALFORMED_TRACE,
+    }
+
+
+def is_reserved_local_command(command: LocalCommand) -> bool:
+    """Return whether any browser-only command is reserved."""
 
     return command.kind is not LocalCommandKind.NON_COMMAND

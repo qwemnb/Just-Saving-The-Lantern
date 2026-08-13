@@ -1,4 +1,4 @@
-"""Read-only, historical Trace v1 snapshots for the main Helios room."""
+"""Read-only, historical Trace v2 snapshots for the main Helios room."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .database import EXPECTED_SCHEMA_MIGRATION
+from .identity_service import ParticipantNameError, validate_display_alias
+from .read_snapshot import ReadSnapshotError, run_read_snapshot
+from .schema_validation import SchemaValidationError, validate_v13_foundation
 from .seed_memory import (
     INHERITED_MEMORY_HEADER,
     INHERITED_MEMORY_PROVENANCE,
@@ -89,48 +91,25 @@ def _data_invalid() -> TraceServiceError:
     )
 
 
-def open_trace_database(database_path: Path | str) -> sqlite3.Connection:
-    """Open an existing SQLite file in enforced read-only private-cache mode."""
-
-    connection: sqlite3.Connection | None = None
-    try:
-        path = Path(database_path).expanduser()
-        if not path.parent.is_dir() or not path.is_file():
-            raise _database_unavailable()
-        uri = f"{path.resolve().as_uri()}?mode=ro&cache=private"
-        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only = ON")
-        if connection.execute("PRAGMA query_only").fetchone()[0] != 1:
-            connection.close()
-            raise _database_unavailable()
-        return connection
-    except TraceServiceError:
-        if connection is not None:
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
-        raise
-    except (OSError, sqlite3.Error) as exception:
-        if connection is not None:
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
-        raise _database_unavailable() from exception
-
-
 def load_trace(database_path: Path | str, turn_id: int | None = None) -> dict[str, Any]:
-    """Load one deterministic Trace v1 document from a single snapshot."""
+    """Load one deterministic Trace v2 document from a single snapshot."""
 
-    connection = open_trace_database(database_path)
-    try:
-        connection.execute("BEGIN")
-        _validate_schema_marker(connection)
+    def load(connection: sqlite3.Connection) -> dict[str, Any]:
+        validate_v13_foundation(connection)
         return _load_snapshot(connection, turn_id)
+
+    try:
+        return run_read_snapshot(
+            database_path,
+            load,
+            allow_wal_retry=True,
+        ).value
     except TraceServiceError:
         raise
+    except ReadSnapshotError as exception:
+        raise _database_unavailable() from exception
+    except SchemaValidationError as exception:
+        raise _data_invalid() from exception
     except (
         json.JSONDecodeError,
         OverflowError,
@@ -143,28 +122,6 @@ def load_trace(database_path: Path | str, turn_id: int | None = None) -> dict[st
         raise _data_invalid() from exception
     except sqlite3.Error as exception:
         raise _database_unavailable() from exception
-    finally:
-        try:
-            if connection.in_transaction:
-                connection.rollback()
-        finally:
-            connection.close()
-
-
-def _validate_schema_marker(connection: sqlite3.Connection) -> None:
-    try:
-        rows = connection.execute(
-            """
-            SELECT migration_no, schema_label
-            FROM schema_migrations
-            ORDER BY migration_no
-            """
-        ).fetchall()
-    except sqlite3.Error as exception:
-        raise _database_unavailable() from exception
-    versions = [(row["migration_no"], row["schema_label"]) for row in rows]
-    if versions != [EXPECTED_SCHEMA_MIGRATION]:
-        raise _database_unavailable()
 
 
 def _load_snapshot(
@@ -237,7 +194,7 @@ def _load_snapshot(
         }
 
     return {
-        "trace_version": 1,
+        "trace_version": 2,
         "turn": {
             "id": selected_turn_id,
             "status": turn["status"],
@@ -326,10 +283,29 @@ def _load_messages(
             participant.participant_type,
             reply.id AS found_reply_id,
             reply.turn_id AS reply_turn_id,
-            reply.room_id AS reply_room_id
+            reply.room_id AS reply_room_id,
+            route.message_id AS found_route_id,
+            route.room_id AS route_room_id,
+            route.sender_participant_id,
+            route.destination_kind,
+            route.recipient_participant_id,
+            route.routing_mode,
+            sender_alias.participant_id AS sender_alias_owner,
+            sender_alias.display_alias AS sender_display_name,
+            sender_alias.alias_key AS sender_alias_key,
+            destination_alias.participant_id AS destination_alias_owner,
+            destination_alias.display_alias AS destination_display_name,
+            destination_alias.alias_key AS destination_alias_key,
+            recipient.participant_key AS recipient_key,
+            destination_owner.participant_key AS destination_owner_key
         FROM messages AS m
         LEFT JOIN participants AS participant ON participant.id = m.participant_id
         LEFT JOIN messages AS reply ON reply.id = m.reply_to_id
+        LEFT JOIN message_routes AS route ON route.message_id = m.id
+        LEFT JOIN participant_aliases AS sender_alias ON sender_alias.id = route.sender_alias_id
+        LEFT JOIN participant_aliases AS destination_alias ON destination_alias.id = route.destination_alias_id
+        LEFT JOIN participants AS recipient ON recipient.id = route.recipient_participant_id
+        LEFT JOIN participants AS destination_owner ON destination_owner.id = destination_alias.participant_id
         WHERE m.turn_id = ?
         ORDER BY m.turn_sequence_no, m.id
         """,
@@ -351,6 +327,10 @@ def _load_messages(
             or sequence_no in seen_sequence_numbers
             or room_sequence_no <= 0
             or room_sequence_no in seen_room_sequence_numbers
+            or row["found_route_id"] != row["id"]
+            or row["route_room_id"] != room_id
+            or row["sender_participant_id"] != row["participant_id"]
+            or row["sender_alias_owner"] != row["participant_id"]
         ):
             raise _data_invalid()
         seen_sequence_numbers.add(sequence_no)
@@ -366,6 +346,42 @@ def _load_messages(
         config_id = row["participant_config_id"]
         if config_id is not None:
             config_ids.add(config_id)
+        if row["destination_kind"] == "participant":
+            if (
+                row["recipient_participant_id"] is None
+                or row["recipient_key"] is None
+                or row["destination_alias_owner"] != row["recipient_participant_id"]
+            ):
+                raise _data_invalid()
+            _validate_trace_alias(
+                row["destination_display_name"], row["destination_alias_key"]
+            )
+            destination = {
+                "kind": "participant",
+                "participant_key": row["recipient_key"],
+                "display_name": row["destination_display_name"],
+            }
+        elif row["destination_kind"] == "room":
+            if (
+                row["recipient_participant_id"] is not None
+                or row["destination_owner_key"] != "room-system"
+                or row["destination_alias_key"] != "room"
+                or row["destination_display_name"] != "Room"
+            ):
+                raise _data_invalid()
+            destination = {
+                "kind": "room",
+                "display_name": row["destination_display_name"],
+            }
+        else:
+            raise _data_invalid()
+        _validate_trace_alias(
+            row["sender_display_name"],
+            row["sender_alias_key"],
+            allow_room=row["participant_key"] == "room-system",
+        )
+        if row["routing_mode"] not in {"legacy_implicit", "explicit"}:
+            raise _data_invalid()
         messages.append(
             {
                 "id": row["id"],
@@ -383,9 +399,28 @@ def _load_messages(
                 "message_type": row["message_type"],
                 "message_text": row["message_text"],
                 "created_at": row["created_at"],
+                "routing": {
+                    "routing_mode": row["routing_mode"],
+                    "sender": {
+                        "participant_key": row["participant_key"],
+                        "display_name": row["sender_display_name"],
+                    },
+                    "destination": destination,
+                },
             }
         )
     return messages, config_ids
+
+
+def _validate_trace_alias(display: Any, stored_key: Any, *, allow_room: bool = False) -> None:
+    if allow_room and display == "Room" and stored_key == "room":
+        return
+    try:
+        accepted, normalized = validate_display_alias(display)
+    except ParticipantNameError as exception:
+        raise _data_invalid() from exception
+    if accepted != display or normalized != stored_key:
+        raise _data_invalid()
 
 
 def _load_events(

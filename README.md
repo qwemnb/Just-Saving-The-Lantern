@@ -9,15 +9,16 @@ tool, and memory behavior can be inspected.
 
 The project currently provides:
 
-- the unchanged SQLite schema v1.2
+- SQLite schema v1.3 with stable participant identity, immutable aliases, and routing snapshots
 - idempotent database initialization and milestone seed data
-- persistent Peter and Helios messages with deterministic room and turn ordering
+- persistent Peter, Helios, and Room-directed messages with deterministic ordering
 - one-request, no-retry OpenAI Responses API orchestration
 - raw request/response/error API events with immutable model provenance
-- read-only, historical Trace v1 inspection for recorded turns
+- read-only, historical Trace v2 inspection with immutable route display
 - strict, atomic seeded-memory manifest import with semantic idempotency
 - deterministic local seeded-memory retrieval with recorded provenance
-- a FastAPI HTTP API and minimal browser chat interface
+- a read-only participant directory and structured participant/Room destinations
+- a browser participant panel, destination picker, and local participant command
 - offline database, orchestration, API, and blank-message regression tests
 
 Whitespace-only messages are ignored by the API and command-line entry point.
@@ -30,10 +31,19 @@ memories immediately before Peter's triggering message. It does not replay
 provider reasoning state or use tools, room-created memory, streaming,
 provider-managed conversations, or automatic retries.
 
+Gemini integration, provider-visible participant rosters, and automated
+handoffs or turn-taking remain separate future milestones. This foundation
+records identity and addressing metadata but does not expose that metadata to
+providers or add another execution path.
+
 ## Requirements
 
 - Python 3.10 or newer
 - dependencies from `requirements.txt`
+
+Node is not a runtime dependency. It is optional developer-only tooling for
+the standalone JavaScript test file; database initialization, migration,
+server startup, and the browser UI do not require Node.
 
 Install the dependencies from the project root:
 
@@ -73,17 +83,53 @@ participant configuration. Changing models never rewrites earlier provenance.
 python -m app.main init-db
 ```
 
-This creates `data/helios.db`, installs schema v1.2 when needed, and ensures
+This creates `data/helios.db`, installs schema v1.3 when needed, and ensures
 the following records exist:
 
 - room `main` / `The Room`
 - human participant `peter` / `Peter`
 - AI participant `helios` / `Helios`
+- hidden system participant `room-system` with immutable alias `Room`
 - active room membership for both participants
 - one minimal OpenAI participant config for Helios labeled `initial`
 
-Initialization is idempotent and preserves existing messages. The database is
-local runtime data and is excluded from Git.
+Initialization is idempotent and preserves existing messages. A fresh target
+receives the complete v1.3 graph. An existing v1.3 target is validated without
+repairing or reseeding it. The database is local runtime data and is excluded
+from Git.
+
+`init-db` does not upgrade an existing v1.2 database. It stops with a
+migration-required error so an upgrade can happen only through the explicit,
+reviewable procedure below.
+
+### Back up and migrate schema v1.2
+
+Stop the server before migration. The human operator—not the application—must
+create and verify a self-contained SQLite backup. Because WAL state may contain
+committed changes, use SQLite's backup API rather than copying only the `.db`
+file:
+
+```powershell
+New-Item -ItemType Directory -Force data\backups | Out-Null
+python -c "from pathlib import Path; import sqlite3; source=sqlite3.connect('file:data/helios.db?mode=ro', uri=True); target=Path('data/backups/helios-before-v1.3.db'); assert not target.exists(); backup=sqlite3.connect(target); source.backup(backup); assert backup.execute('PRAGMA integrity_check').fetchall()==[('ok',)]; backup.close(); source.close()"
+```
+
+Then run the one explicit migration command:
+
+```powershell
+python -m app.main migrate-database --database data\helios.db
+```
+
+The migration uses one `BEGIN IMMEDIATE` transaction, validates the exact v1.2
+history and canonical data, preserves existing IDs/text/order/provenance,
+creates aliases and `room-system`, and backfills one `legacy_implicit` route per
+message. Any failure rolls the transaction back. A completed v1.3 database
+returns `already_current` without writes.
+
+If live acceptance fails after a successful migration, stop the server, move
+the migrated database and any `-wal`/`-shm` companions out of `data/`, and
+restore with SQLite's backup API from the verified backup. Do not overwrite a
+running database or restore while any Helios Room process has it open.
 
 In a newly initialized database, the seeded `initial` Helios configuration is
 an unused placeholder. The first accepted API-backed turn creates a separate
@@ -105,19 +151,79 @@ when starting the server:
 python -m app.main serve --database C:\path\to\helios.db
 ```
 
-The selected path is not opened merely by parsing the `serve` command. Normal
-chat operations still require an initialized compatible database, while trace
-access refuses to create a missing file.
+Before binding a socket or serving static files, `serve` performs a read-only
+schema preflight against one consistent SQLite snapshot. It accepts only exact
+schema history 1.2 then 1.3, the complete required schema objects, the mature
+identity and alias foundation, current-primary/name-event lineage, one route
+per canonical message, and successful integrity and foreign-key checks.
+Startup never initializes, migrates, checkpoints, repairs, or creates the
+selected database. A missing path, an exact migration-eligible v1.2 database,
+and an incompatible database return these sanitized errors respectively:
+
+```text
+database_not_initialized
+database_migration_required
+database_schema_incompatible
+```
+
+The accepted result applies to the snapshot checked during preflight. A later
+process can still replace or modify the database, so participant directory,
+message history, Trace, Room-post, and Helios-turn services validate their own
+current snapshots and fail closed instead of trusting stale startup state.
+
+Read-only startup, participant-directory, message-history, and Trace snapshots
+use this exact WAL-sidecar matrix:
+
+- WAL and SHM both present: ordinary SQLite `mode=ro`; the main file and WAL
+  remain byte-for-byte unchanged, while SQLite may update only its own lock or
+  read-mark state in the existing SHM.
+- WAL present without SHM, or SHM present without WAL: fail closed before
+  opening SQLite.
+- Neither sidecar present on a clean, checkpointed WAL-mode database: use the
+  narrow `mode=ro&immutable=1` path and require the same strong main-file
+  fingerprint before and after the read.
+
+That fingerprint includes the canonical resolved path, filesystem identity
+where the operating system exposes it, byte size, nanosecond modification
+time, and SHA-256. The immutable result is discarded if the main file changes
+or a sidecar appears. If both sidecars appear during a runtime read, the stale
+immutable result may be discarded and the new WAL snapshot validated once;
+one-sided states are never retried. Absent sidecars remain absent after a clean
+read-only snapshot.
 
 Then open <http://127.0.0.1:8000> in a browser. The server binds to
 `127.0.0.1:8000` by default; use `--host` and `--port` to override those
 values.
 
-The browser displays messages from the `main` room in deterministic room
-sequence. A nonblank submission is authored as Peter on the server, committed,
-and followed by exactly one Helios Responses API call. While that call is in
-progress, the input and Send button are disabled and a temporary local status
-is shown.
+The browser loads its participant panel and destination choices only from the
+read-only directory endpoint. Select Helios for the existing one-request AI
+flow, or select Room to save a canonical Peter note without loading provider
+configuration, searching memory, constructing a client, or creating an API
+event. Press `[` in an otherwise blank composer to open the searchable picker;
+historical aliases are lookup terms but the current primary name is displayed.
+The selected destination persists after a successful send.
+
+Permanent identity is the internal participant ID plus the stable application
+`participant_key`. A display alias is only a label. Every participant has one
+current primary alias and append-only historical aliases. Alias comparison is
+global, NFKC-normalized, and case-folded; adopted names never change participant
+IDs/keys or rewrite old messages. Each message stores immutable sender and
+destination alias snapshots, so earlier history retains the names used then.
+The current-primary projection must always equal the latest append-only name
+event. Every participant begins with one bootstrap event; later adopted events
+form an unbroken previous/new alias chain and correlate to the exact canonical
+Room notice and immutable Room route. Directly changing a primary projection
+without a matching adopted event makes the foundation invalid. Returning to a
+historical or bootstrap alias is valid only through a new adopted event.
+
+Foundation validation deliberately permits mature data: additional valid
+rooms, participants, active or historical memberships, multiple immutable
+configurations, and legitimate completed, open, failed, cancelled, human-only,
+Room-only, or stranded turns. Only the unique `main` room receives this
+milestone's required Peter/Helios membership checks. Foundation validation is
+layered beneath bounded directory, history, and selected-turn Trace checks; it
+does not globally require every historical turn to contain a provider event,
+AI response, memory retrieval, or currently valid Trace projection.
 
 The current provider settings are:
 
@@ -137,13 +243,20 @@ accepted message remains canonical and visible.
 ## Store a Peter message from the command line
 
 ```powershell
-python -m app.main store-message --message "Hello from Peter"
+python -m app.main store-message --destination-kind room --message "Hello from Peter"
 ```
 
-This creates a new open turn and stores the message in the canonical room
-history.
+This Room-only command creates one completed Peter turn, one exact canonical
+message, and one explicit Room route atomically. Participant destinations and
+`--participant-key` are rejected; the command never invokes Helios.
 
-## Inspect a recorded turn with Trace v1
+## Inspect participants and recorded turns locally
+
+Enter `/participants` to open and refresh the participant panel without
+posting a message. Exact and malformed `/participants` forms are intercepted
+locally and rejected by the API/CLI as defense in depth.
+
+Trace v2 retains the existing commands:
 
 Enter either local command in the browser message box:
 
@@ -165,7 +278,7 @@ the ordered API-event timeline, redaction metadata, and recorded memory context
 when one exists. Human-only, open, cancelled, failed, and stranded turns are
 shown as recorded; a missing request or outcome is not inferred or fabricated.
 
-Trace data comes from one read-only SQLite snapshot. It never reruns a provider
+Trace data comes from one sidecar-aware read-only SQLite snapshot. It never reruns a provider
 request, retries an old turn, reconstructs history using the current model, or
 queries current memory tables. No inherited memory retrieval is shown unless
 the historical request event explicitly recorded one.
@@ -186,7 +299,7 @@ reasoning-token counts. Omission locations are reported as JSON Pointers.
 
 Trace exposes private canonical messages, exact system instructions, request
 settings, and operational provenance. Keep the server bound to a trusted local
-interface; Trace v1 is not designed as a public or multi-user diagnostics API.
+interface; Trace v2 is not designed as a public or multi-user diagnostics API.
 
 ## Memory status and boundaries
 
@@ -240,7 +353,7 @@ after explicit authorization:
 python -m app.main import-seed-memories --file data\imports\helios_seed_memories_v1.json
 ```
 
-Use `--database` to select another initialized schema-v1.2 database. The
+Use `--database` to select another initialized schema-v1.3 database. The
 importer hashes a canonical typed representation, runs every database check and
 write under one `BEGIN IMMEDIATE` transaction, and returns JSON without echoing
 memory text. A semantically identical import returns `already_imported` with no
@@ -280,10 +393,12 @@ the fixture is never submitted automatically.
 
 - `GET /` serves the browser interface.
 - `GET /api/messages` returns messages from the `main` room.
-- `POST /api/messages` accepts message text, assigns Peter server-side, and
-  performs one API-backed Helios turn. Extra request fields are rejected.
+- `GET /api/participants` returns directory version 1 without provider or memory access.
+- `POST /api/messages` requires exact `message_text` and structured
+  `destination` fields, assigns Peter server-side, and either posts to Room or
+  performs one API-backed Helios turn. Extra fields are rejected.
 - `GET /api/trace/latest` returns the latest recorded `main`-room turn through
-  the read-only Trace v1 projection.
+  the read-only Trace v2 projection.
 - `GET /api/trace/{turn_id}` returns one recorded turn for a canonical positive
   decimal SQLite turn ID.
 
@@ -296,9 +411,16 @@ Example request body:
 
 ```json
 {
-  "message_text": "Hello from Peter"
+  "message_text": "Hello from Peter",
+  "destination": {
+    "kind": "participant",
+    "participant_key": "helios"
+  }
 }
 ```
+
+A Room destination is exactly `{"kind":"room"}`. Display aliases are never
+accepted as server routing authority.
 
 ## Run tests
 
@@ -315,9 +437,13 @@ Also run the complete offline verification set:
 ```powershell
 python -m compileall app tests
 git diff --check
-node --test tests/test_trace_ui.js
+node tests/test_trace_ui.js
 node --check static/app.js
 ```
+
+Run the Node commands only when Node is available. If it is unavailable, report
+the JavaScript suite as not run; do not treat that as an application runtime
+failure and do not remove or weaken the JavaScript tests.
 
 ## Live-provider safety
 
@@ -358,7 +484,7 @@ app/       FastAPI entry point, database, trace, and seeded-memory helpers
 data/      Local SQLite database files (ignored by Git)
 docs/      Approved implementation-contract amendments
 examples/  Synthetic, nonpersonal documentation fixtures
-schema/    Authoritative SQLite schema v1.2
+schema/    Authoritative SQLite schema v1.3 and ordered migrations
 static/    Browser interface
 tests/     Automated tests
 ```

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from .database import EXPECTED_SCHEMA_MIGRATION, connect_database
+from .database import EXPECTED_SCHEMA_MIGRATIONS, connect_database
 
 
 RETRIEVER_VERSION = "seed-fts-topic-v1"
@@ -491,7 +491,7 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
             "seed_database_unavailable",
             "The configured seed-memory database is unavailable or incompatible.",
         ) from exception
-    if [(row[0], row[1]) for row in rows] != [EXPECTED_SCHEMA_MIGRATION]:
+    if [(row[0], row[1]) for row in rows] != list(EXPECTED_SCHEMA_MIGRATIONS):
         raise SeedMemoryError(
             "seed_database_unavailable",
             "The configured seed-memory database is unavailable or incompatible.",

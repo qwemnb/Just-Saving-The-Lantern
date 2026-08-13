@@ -44,11 +44,14 @@ class MessageApiTests(unittest.TestCase):
     def test_whitespace_only_message_is_ignored(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             response = asyncio.run(
-                main.post_message(main.MessageRequest(message_text=" \t\r\n "))
+                main.post_message(main.MessageRequest(
+                    message_text=" \t\r\n ",
+                    destination={"kind": "participant", "participant_key": "helios"},
+                ))
             )
 
         self.assertEqual(
-            response,
+            json.loads(response.body),
             {"ignored": True, "reason": "empty_message"},
         )
 
@@ -78,8 +81,8 @@ class MessageApiTests(unittest.TestCase):
         self.assertIn("const messageText = input.value;", javascript)
         self.assertIn("if (!messageText.trim()) return;", javascript)
         self.assertIn("message_text: messageText", javascript)
-        self.assertNotIn("participant_key:", javascript)
-        self.assertIn("Helios is responding...", javascript)
+        self.assertIn("participant_key: destination.participant_key", javascript)
+        self.assertIn("destination: destination.kind", javascript)
 
     def test_post_acceptance_error_response_contains_canonical_ids(self) -> None:
         class FailingResponses:
@@ -100,7 +103,10 @@ class MessageApiTests(unittest.TestCase):
         }
         with patch.dict(os.environ, environment, clear=True):
             response = asyncio.run(
-                main.post_message(main.MessageRequest(message_text="Accepted Peter text"))
+                main.post_message(main.MessageRequest(
+                    message_text="Accepted Peter text",
+                    destination={"kind": "participant", "participant_key": "helios"},
+                ))
             )
 
         payload = json.loads(response.body)
@@ -123,6 +129,8 @@ class MessageApiTests(unittest.TestCase):
             str(self.database_path),
             "--message",
             "\t\r\n",
+            "--destination-kind",
+            "room",
         ]
 
         with patch.object(sys, "argv", arguments), patch(

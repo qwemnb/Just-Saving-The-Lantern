@@ -2,7 +2,28 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from typing import Annotated, Literal, Union
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ParticipantDestination(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["participant"]
+    participant_key: str
+
+
+class RoomDestination(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["room"]
+
+
+MessageDestination = Annotated[
+    Union[ParticipantDestination, RoomDestination],
+    Field(discriminator="kind"),
+]
 
 
 class MessageRequest(BaseModel):
@@ -15,4 +36,5 @@ class MessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     message_text: str
+    destination: MessageDestination
 

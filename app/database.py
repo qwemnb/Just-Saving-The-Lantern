@@ -3,20 +3,41 @@
 from __future__ import annotations
 
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
+from .schema_validation import (
+    SchemaValidationError,
+    V12_HISTORY,
+    V13_HISTORY,
+    schema_history,
+    validate_database_integrity,
+    validate_v12_source,
+    validate_v13_foundation,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "schema" / "helios_room_schema_v1_2.sql"
+DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "schema" / "helios_room_schema_v1_3.sql"
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "helios.db"
 
-EXPECTED_SCHEMA_MIGRATION = (1, "1.2")
+EXPECTED_SCHEMA_MIGRATIONS = ((1, "1.2"), (2, "1.3"))
+# Kept as the current marker for modules that need only the current label.
+EXPECTED_SCHEMA_MIGRATION = EXPECTED_SCHEMA_MIGRATIONS[-1]
 BUSY_TIMEOUT_MS = 5_000
 
 
 class DatabaseInitializationError(RuntimeError):
     """Raised when an existing database is incompatible or incomplete."""
+
+    def __init__(self, message: str, code: str = "database_initialization_failed") -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def as_payload(self) -> dict[str, str]:
+        return {"error": self.code, "message": self.message}
 
 
 @dataclass(frozen=True)
@@ -54,7 +75,7 @@ def initialize_database(
     database_path: Path | str = DEFAULT_DATABASE_PATH,
     schema_path: Path | str = DEFAULT_SCHEMA_PATH,
 ) -> InitializationReport:
-    """Install schema v1.2 when needed and ensure milestone seed records exist.
+    """Install schema v1.3 when needed and ensure milestone seed records exist.
 
     The schema is executed only for a database with no user-defined objects.
     Seed creation is idempotent and runs under ``BEGIN IMMEDIATE`` so two local
@@ -63,40 +84,62 @@ def initialize_database(
 
     database_path = Path(database_path)
     schema_path = Path(schema_path)
-    schema_sql = schema_path.read_text(encoding="utf-8")
-
     connection = connect_database(database_path)
     try:
-        _install_or_validate_schema(connection, schema_sql)
+        if _table_exists(connection, "schema_migrations"):
+            connection.execute("BEGIN")
+            try:
+                history = schema_history(connection)
+                if history == V12_HISTORY:
+                    validate_v12_source(connection)
+                    raise DatabaseInitializationError(
+                        "Database schema v1.2 requires the explicit migrate-database command.",
+                        code="database_migration_required",
+                    )
+                if history != V13_HISTORY:
+                    raise DatabaseInitializationError(
+                        "The existing database schema is incompatible."
+                    )
+                validate_v13_foundation(connection)
+                validate_database_integrity(connection)
+                report = _build_report(connection, database_path)
+            except (SchemaValidationError, sqlite3.Error, TypeError, ValueError) as error:
+                raise DatabaseInitializationError(
+                    "The existing database schema or foundation data is incompatible."
+                ) from error
+            finally:
+                if connection.in_transaction:
+                    connection.rollback()
+            return report
+
+        object_count = connection.execute(
+            """
+            SELECT count(*) FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            """
+        ).fetchone()[0]
+        if object_count:
+            raise DatabaseInitializationError(
+                "Database contains objects but has no schema_migrations table; "
+                "refusing to guess its state."
+            )
+        connection.executescript(schema_path.read_text(encoding="utf-8"))
         _seed_initial_room(connection)
-        return _build_report(connection, database_path)
+        connection.execute("BEGIN")
+        try:
+            validate_v13_foundation(connection)
+            validate_database_integrity(connection)
+            report = _build_report(connection, database_path)
+        except (SchemaValidationError, sqlite3.Error, TypeError, ValueError) as error:
+            raise DatabaseInitializationError(
+                "The initialized database failed schema validation."
+            ) from error
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+        return report
     finally:
         connection.close()
-
-
-def _install_or_validate_schema(
-    connection: sqlite3.Connection,
-    schema_sql: str,
-) -> None:
-    if _table_exists(connection, "schema_migrations"):
-        _validate_schema_version(connection)
-        return
-
-    object_count = connection.execute(
-        """
-        SELECT count(*)
-        FROM sqlite_schema
-        WHERE name NOT LIKE 'sqlite_%'
-        """
-    ).fetchone()[0]
-    if object_count:
-        raise DatabaseInitializationError(
-            "Database contains objects but has no schema_migrations table; "
-            "refusing to guess its state."
-        )
-
-    connection.executescript(schema_sql)
-    _validate_schema_version(connection)
 
 
 def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
@@ -111,28 +154,19 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-def _validate_schema_version(connection: sqlite3.Connection) -> None:
-    rows = connection.execute(
-        """
-        SELECT migration_no, schema_label
-        FROM schema_migrations
-        ORDER BY migration_no
-        """
-    ).fetchall()
-    versions = [(row["migration_no"], row["schema_label"]) for row in rows]
-    if versions != [EXPECTED_SCHEMA_MIGRATION]:
-        raise DatabaseInitializationError(
-            "Expected only Helios Room schema migration "
-            f"{EXPECTED_SCHEMA_MIGRATION!r}, found {versions!r}."
-        )
-
-
 def _seed_initial_room(connection: sqlite3.Connection) -> None:
     connection.execute("BEGIN IMMEDIATE")
     try:
         room_id = _ensure_room(connection)
         peter_id = _ensure_participant(connection, "peter", "Peter", "human")
         helios_id = _ensure_participant(connection, "helios", "Helios", "ai")
+        room_system_id = _ensure_participant(
+            connection, "room-system", "Room", "system"
+        )
+
+        _ensure_identity_bootstrap(connection, peter_id, "Peter")
+        _ensure_identity_bootstrap(connection, helios_id, "Helios")
+        _ensure_identity_bootstrap(connection, room_system_id, "Room")
 
         _ensure_active_membership(connection, room_id, peter_id)
         _ensure_active_membership(connection, room_id, helios_id)
@@ -276,6 +310,86 @@ def _ensure_initial_helios_config(
         )
 
 
+def _ensure_identity_bootstrap(
+    connection: sqlite3.Connection,
+    participant_id: int,
+    display_alias: str,
+) -> None:
+    """Create the one immutable bootstrap alias graph for a participant."""
+
+    alias_key = unicodedata.normalize("NFKC", display_alias).casefold()
+    rows = connection.execute(
+        """
+        SELECT id, display_alias, alias_key
+        FROM participant_aliases
+        WHERE participant_id = ?
+        ORDER BY id
+        """,
+        (participant_id,),
+    ).fetchall()
+    if not rows:
+        cursor = connection.execute(
+            """
+            INSERT INTO participant_aliases (
+                participant_id, display_alias, alias_key
+            ) VALUES (?, ?, ?)
+            """,
+            (participant_id, display_alias, alias_key),
+        )
+        alias_id = cursor.lastrowid
+        connection.execute(
+            """
+            INSERT INTO participant_primary_aliases (participant_id, alias_id)
+            VALUES (?, ?)
+            """,
+            (participant_id, alias_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO participant_name_events (
+                event_type, room_id, actor_participant_id,
+                subject_participant_id, previous_alias_id,
+                new_alias_id, canonical_message_id
+            ) VALUES ('bootstrap', NULL, ?, ?, NULL, ?, NULL)
+            """,
+            (participant_id, participant_id, alias_id),
+        )
+        return
+
+    if len(rows) != 1 or dict(rows[0]) != {
+        "id": rows[0]["id"],
+        "display_alias": display_alias,
+        "alias_key": alias_key,
+    }:
+        raise DatabaseInitializationError("Participant alias bootstrap data is invalid.")
+    alias_id = rows[0]["id"]
+    primary = connection.execute(
+        """SELECT alias_id FROM participant_primary_aliases
+           WHERE participant_id = ?""",
+        (participant_id,),
+    ).fetchall()
+    events = connection.execute(
+        """SELECT event_type, room_id, actor_participant_id,
+                  subject_participant_id, previous_alias_id, new_alias_id,
+                  canonical_message_id
+           FROM participant_name_events WHERE subject_participant_id = ?""",
+        (participant_id,),
+    ).fetchall()
+    if len(primary) != 1 or primary[0]["alias_id"] != alias_id or len(events) != 1:
+        raise DatabaseInitializationError("Participant identity bootstrap data is invalid.")
+    event = events[0]
+    if (
+        event["event_type"] != "bootstrap"
+        or event["room_id"] is not None
+        or event["actor_participant_id"] != participant_id
+        or event["subject_participant_id"] != participant_id
+        or event["previous_alias_id"] is not None
+        or event["new_alias_id"] != alias_id
+        or event["canonical_message_id"] is not None
+    ):
+        raise DatabaseInitializationError("Participant bootstrap event is invalid.")
+
+
 def _build_report(
     connection: sqlite3.Connection,
     database_path: Path,
@@ -300,7 +414,7 @@ def _build_report(
 
     return InitializationReport(
         database_path=str(database_path.resolve()),
-        schema_label=EXPECTED_SCHEMA_MIGRATION[1],
+        schema_label=EXPECTED_SCHEMA_MIGRATIONS[-1][1],
         room_count=count("SELECT count(*) FROM rooms"),
         participant_count=count("SELECT count(*) FROM participants"),
         active_membership_count=count(
@@ -374,8 +488,14 @@ def store_message(
     participant_config_id: int | None = None,
     reply_to_id: int | None = None,
     message_type: str = "chat",
+    *,
+    sender_alias_id: int | None = None,
+    destination_kind: str | None = None,
+    destination_alias_id: int | None = None,
+    recipient_participant_id: int | None = None,
+    routing_mode: str = "explicit",
 ) -> int:
-    """Store a message and return its ID.
+    """Atomically stage a canonical message and its immutable route.
 
     Allocates room_sequence_no and turn_sequence_no as needed.
     For human messages, participant_config_id should be None.
@@ -386,6 +506,42 @@ def store_message(
     """
     if is_blank_message(message_text):
         raise ValueError("message_text must contain non-whitespace text")
+
+    if sender_alias_id is None or destination_kind is None or destination_alias_id is None:
+        sender_alias_row = connection.execute(
+            """SELECT ppa.alias_id, p.participant_key
+               FROM participant_primary_aliases AS ppa
+               JOIN participants AS p ON p.id=ppa.participant_id
+               WHERE ppa.participant_id=?""",
+            (participant_id,),
+        ).fetchone()
+        if sender_alias_row is None:
+            raise ValueError("sender routing identity is required")
+        sender_alias_id = sender_alias_row["alias_id"]
+        if message_type == "chat" and sender_alias_row["participant_key"] in {"peter", "helios"}:
+            recipient_key = "helios" if sender_alias_row["participant_key"] == "peter" else "peter"
+            recipient = connection.execute(
+                """SELECT p.id, ppa.alias_id FROM participants AS p
+                   JOIN participant_primary_aliases AS ppa ON ppa.participant_id=p.id
+                   WHERE p.participant_key=?""",
+                (recipient_key,),
+            ).fetchone()
+            if recipient is None:
+                raise ValueError("recipient routing identity is required")
+            destination_kind = "participant"
+            recipient_participant_id = recipient["id"]
+            destination_alias_id = recipient["alias_id"]
+        else:
+            room_alias = connection.execute(
+                """SELECT ppa.alias_id FROM participants AS p
+                   JOIN participant_primary_aliases AS ppa ON ppa.participant_id=p.id
+                   WHERE p.participant_key='room-system'"""
+            ).fetchone()
+            if room_alias is None:
+                raise ValueError("Room routing identity is required")
+            destination_kind = "room"
+            recipient_participant_id = None
+            destination_alias_id = room_alias["alias_id"]
 
     room_sequence_no = allocate_next_room_sequence_no(connection, room_id)
 
@@ -428,5 +584,25 @@ def store_message(
             message_text,
         ),
     )
-    return cursor.lastrowid
+    message_id = cursor.lastrowid
+    connection.execute(
+        """
+        INSERT INTO message_routes (
+            message_id, room_id, sender_participant_id, sender_alias_id,
+            destination_kind, recipient_participant_id,
+            destination_alias_id, routing_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            message_id,
+            room_id,
+            participant_id,
+            sender_alias_id,
+            destination_kind,
+            recipient_participant_id,
+            destination_alias_id,
+            routing_mode,
+        ),
+    )
+    return message_id
 

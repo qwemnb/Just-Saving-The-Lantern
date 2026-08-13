@@ -16,7 +16,7 @@ body {
 
 .container {
     width: 100%;
-    max-width: 900px;
+    max-width: 1100px;
     background: white;
     border-radius: 12px;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
@@ -42,6 +42,18 @@ header h1 {
 .room-info {
     font-size: 14px;
     opacity: 0.9;
+    letter-spacing: 0.02em;
+}
+
+button,
+input {
+    font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible {
+    outline: 3px solid #f4b942;
+    outline-offset: 2px;
 }
 
 .chat-container {
@@ -67,6 +79,105 @@ header h1 {
 .message.canonical-message {
     align-items: flex-start;
 }
+
+.room-layout {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+}
+
+.participant-panel {
+    width: 245px;
+    flex: 0 0 245px;
+    padding: 1.1rem;
+    overflow-y: auto;
+    border-right: 1px solid #ddd9ee;
+    background: linear-gradient(180deg, #fbfaff 0%, #f5f3fc 100%);
+}
+
+.participant-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.8rem;
+}
+
+.participant-panel-header h2 {
+    color: #342d68;
+    font-size: 1rem;
+    letter-spacing: 0.01em;
+}
+
+.participants-refresh,
+.participants-toggle {
+    min-height: 36px;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid #aaa3d0;
+    border-radius: 999px;
+    color: #4a427e;
+    background: #fff;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.participants-refresh:hover,
+.participants-toggle:hover {
+    border-color: #756aae;
+    background: #f0edff;
+}
+
+.read-status {
+    min-height: 1.25rem;
+    margin-bottom: 0.55rem;
+    color: #8b1e3f;
+    font-size: 0.8rem;
+    line-height: 1.35;
+}
+
+.read-status:empty {
+    min-height: 0;
+    margin-bottom: 0;
+}
+
+.history-read-status {
+    padding: 0.5rem 1.25rem 0;
+    background: #f8f9fa;
+}
+
+.participant-list { display: grid; gap: 0.5rem; }
+.participant-entry {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.22rem;
+    width: 100%;
+    min-height: 54px;
+    padding: 0.7rem 0.75rem;
+    border: 1px solid #d8d3eb;
+    border-radius: 10px;
+    background: white;
+    text-align: left;
+    overflow-wrap: anywhere;
+    box-shadow: 0 2px 7px rgba(60, 48, 110, 0.05);
+}
+.participant-entry:not(:disabled) { cursor: pointer; }
+.participant-entry:not(:disabled):hover {
+    border-color: #877bc0;
+    background: #f7f5ff;
+}
+.participant-entry:disabled {
+    border-style: dashed;
+    color: #686575;
+    background: #eeedf3;
+    box-shadow: none;
+    opacity: 1;
+}
+.participant-entry strong { color: #30295f; }
+.participant-entry:disabled strong { color: #565361; }
+.participant-entry small { max-width: 100%; font-size: 0.72rem; overflow-wrap: anywhere; }
+.availability-label { font-weight: 600; text-transform: uppercase; letter-spacing: 0.035em; }
+.participants-toggle { display: none; }
 
 .message.system {
     align-items: center;
@@ -110,6 +221,7 @@ header h1 {
 .message-form {
     display: flex;
     gap: 10px;
+    align-items: stretch;
 }
 
 .message-input {
@@ -151,6 +263,75 @@ header h1 {
     opacity: 0.6;
     cursor: not-allowed;
 }
+
+.destination-control { position: relative; }
+.destination-control > button {
+    height: 100%;
+    min-height: 44px;
+    max-width: 180px;
+    padding: 0.65rem 0.9rem;
+    overflow: hidden;
+    border: 2px solid #c8c1e3;
+    border-radius: 22px;
+    background: linear-gradient(180deg, #faf9ff 0%, #eeeaff 100%);
+    color: #3f376f;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.destination-control > button:hover:not(:disabled) {
+    border-color: #756aae;
+    background: #ebe7ff;
+}
+.destination-control > button:disabled {
+    border-color: #d5d3dd;
+    color: #777480;
+    background: #efeff2;
+    cursor: not-allowed;
+}
+.destination-picker {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 0.5rem);
+    z-index: 20;
+    width: min(280px, calc(100vw - 2rem));
+    max-height: min(340px, 55vh);
+    padding: 0.65rem;
+    overflow-y: auto;
+    border: 1px solid #bdb5dc;
+    border-radius: 12px;
+    background: white;
+    box-shadow: 0 12px 32px rgba(45, 34, 92, 0.24);
+}
+.destination-picker[hidden] { display: none; }
+.destination-picker input {
+    width: 100%;
+    min-height: 42px;
+    padding: 0.6rem 0.7rem;
+    margin-bottom: 0.45rem;
+    border: 1px solid #c8c2df;
+    border-radius: 8px;
+}
+.destination-option {
+    display: block;
+    width: 100%;
+    min-height: 42px;
+    padding: 0.6rem 0.7rem;
+    border: 0;
+    border-radius: 7px;
+    background: white;
+    color: #342d68;
+    text-align: left;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+.destination-option:hover,
+.destination-option.active,
+.destination-option[aria-selected="true"] {
+    background: #ece9ff;
+}
+.destination-option[aria-selected="true"] { font-weight: 700; }
 
 .trace-command-status,
 .trace-panel-status {
@@ -276,4 +457,34 @@ header h1 {
 
 .messages::-webkit-scrollbar-thumb:hover {
     background: #a1a1a1;
+}
+
+@media (max-width: 760px) {
+    body { padding: 0; }
+    .container { height: 100vh; border-radius: 0; }
+    .participant-panel {
+        position: absolute;
+        z-index: 30;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        transform: translateX(-105%);
+        transition: transform .2s;
+        box-shadow: 8px 0 24px rgba(0,0,0,.2);
+    }
+    .participant-panel.drawer-open { transform: translateX(0); }
+    .room-layout { position: relative; }
+    .participants-toggle { display: block; min-height: 40px; margin: 0.5rem 1rem 0; align-self: flex-start; }
+    .message-form { flex-wrap: wrap; }
+    .destination-control { width: 100%; }
+    .destination-control > button { width: 100%; max-width: none; min-height: 44px; }
+    .participants-refresh { min-height: 40px; }
+    .participant-entry { min-height: 48px; }
+    .send-button { min-height: 44px; }
+}
+
+@media (max-width: 420px) {
+    .input-area { padding: 12px; }
+    .message-input { min-width: 0; }
+    .send-button { padding-inline: 18px; }
 }

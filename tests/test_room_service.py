@@ -435,6 +435,7 @@ class RoomServiceTests(unittest.TestCase):
 
     def test_invalid_participant_identity_is_a_preflight_failure(self) -> None:
         with closing(connect_database(self.database_path)) as connection:
+            connection.execute("DROP TRIGGER participants_identity_no_update")
             connection.execute(
                 "UPDATE participants SET name = 'Unexpected' WHERE participant_key = ?",
                 (PETER_KEY,),
@@ -446,7 +447,7 @@ class RoomServiceTests(unittest.TestCase):
             self._run(factory)
 
         self.assertEqual(caught.exception.status_code, 503)
-        self.assertEqual(caught.exception.code, "invalid_participant_configuration")
+        self.assertEqual(caught.exception.code, "invalid_database_configuration")
         self.assertEqual(factory.api_keys, [])
         self.assertEqual(self._counts(self.database_path)["turns"], 0)
 
@@ -507,6 +508,23 @@ class RoomServiceTests(unittest.TestCase):
                 """
             )
             visitor_id = cursor.lastrowid
+            visitor_alias_id = connection.execute(
+                """INSERT INTO participant_aliases
+                   (participant_id, display_alias, alias_key)
+                   VALUES (?, 'Visitor', 'visitor')""",
+                (visitor_id,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO participant_primary_aliases (participant_id,alias_id) VALUES (?,?)",
+                (visitor_id, visitor_alias_id),
+            )
+            connection.execute(
+                """INSERT INTO participant_name_events
+                   (event_type,room_id,actor_participant_id,subject_participant_id,
+                    previous_alias_id,new_alias_id,canonical_message_id)
+                   VALUES ('bootstrap',NULL,?,?,NULL,?,NULL)""",
+                (visitor_id, visitor_id, visitor_alias_id),
+            )
             connection.execute(
                 "INSERT INTO room_participants (room_id, participant_id) VALUES (?, ?)",
                 (room_id, visitor_id),

@@ -20,7 +20,6 @@ from app.room_service import TurnServiceError, run_helios_turn
 from app.trace_service import (
     TraceServiceError,
     load_trace,
-    open_trace_database,
     project_trace_json,
 )
 
@@ -129,6 +128,29 @@ class TraceFixture(unittest.TestCase):
                     reply_to_id,
                     text,
                 ),
+            )
+            sender_alias_id = connection.execute(
+                "SELECT alias_id FROM participant_primary_aliases WHERE participant_id=?",
+                (participant_id,),
+            ).fetchone()[0]
+            participant_key = connection.execute(
+                "SELECT participant_key FROM participants WHERE id=?",
+                (participant_id,),
+            ).fetchone()[0]
+            recipient_key = "peter" if participant_key == "helios" else "helios"
+            recipient = connection.execute(
+                """SELECT p.id, ppa.alias_id FROM participants AS p
+                   JOIN participant_primary_aliases AS ppa ON ppa.participant_id=p.id
+                   WHERE p.participant_key=?""",
+                (recipient_key,),
+            ).fetchone()
+            connection.execute(
+                """INSERT INTO message_routes
+                   (message_id,room_id,sender_participant_id,sender_alias_id,
+                    destination_kind,recipient_participant_id,destination_alias_id,routing_mode)
+                   VALUES (?,?,?,?,'participant',?,?,'explicit')""",
+                (cursor.lastrowid, self.room_id, participant_id, sender_alias_id,
+                 recipient["id"], recipient["alias_id"]),
             )
             connection.commit()
             return cursor.lastrowid
@@ -365,7 +387,7 @@ class TraceCommandTests(TraceFixture):
             self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM api_events").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM admin_events").fetchone()[0], 0)
-            self.assertEqual(connection.execute("SELECT count(*) FROM participants").fetchone()[0], 2)
+            self.assertEqual(connection.execute("SELECT count(*) FROM participants").fetchone()[0], 3)
             self.assertEqual(connection.execute("SELECT count(*) FROM participant_configs").fetchone()[0], 1)
 
         accepted_turn = self.add_turn()
@@ -387,6 +409,8 @@ class TraceCommandTests(TraceFixture):
                 str(target),
                 "--message",
                 text,
+                "--destination-kind",
+                "room",
             ]
             with self.subTest(text=text), patch.object(sys, "argv", argv), patch(
                 "sys.stderr", new_callable=io.StringIO
@@ -394,7 +418,7 @@ class TraceCommandTests(TraceFixture):
                 with self.assertRaises(SystemExit) as raised:
                     main.main()
                 self.assertNotEqual(raised.exception.code, 0)
-                self.assertIn("local browser UI", error_output.getvalue())
+                self.assertIn("browser interface", error_output.getvalue())
                 self.assertFalse(target.exists())
                 self.assertFalse(target.parent.exists())
 
@@ -412,7 +436,7 @@ class TraceProjectionTests(TraceFixture):
 
         trace = load_trace(self.database_path, turn_id)
 
-        self.assertEqual(trace["trace_version"], 1)
+        self.assertEqual(trace["trace_version"], 2)
         self.assertEqual(trace["turn"]["id"], turn_id)
         self.assertEqual(trace["turn"]["initiated_by"]["participant_key"], "peter")
         self.assertEqual(
@@ -782,17 +806,6 @@ class TraceRouteAndReadOnlyTests(TraceFixture):
             trace = load_trace(self.database_path, turn_id)
         self.assertEqual(trace["turn"]["id"], turn_id)
 
-        connection = open_trace_database(self.database_path)
-        try:
-            with self.assertRaises(sqlite3.OperationalError):
-                connection.execute(
-                    "INSERT INTO rooms (room_key, name) VALUES ('write', 'Write')"
-                )
-        finally:
-            connection.close()
-
-        import app.trace_service as trace_service
-
         real_connect = sqlite3.connect
         trackers: list[TrackingConnection] = []
 
@@ -802,11 +815,12 @@ class TraceRouteAndReadOnlyTests(TraceFixture):
             trackers.append(tracker)
             return tracker
 
-        with patch.object(trace_service.sqlite3, "connect", side_effect=tracked_connect):
+        with patch("app.read_snapshot.sqlite3.connect", side_effect=tracked_connect):
             load_trace(self.database_path, turn_id)
         self.assertEqual(trackers[0].commit_calls, 0)
         self.assertEqual(trackers[0].rollback_calls, 1)
-        self.assertIn("mode=ro&cache=private", trackers[0].connect_uri)
+        self.assertIn("mode=ro&immutable=1", trackers[0].connect_uri)
+        self.assertIn("pragma query_only = on", "\n".join(trackers[0].sql).casefold())
 
     def test_wal_writer_cannot_mix_snapshot_state(self) -> None:
         turn_id = self.add_turn()
@@ -821,8 +835,9 @@ class TraceRouteAndReadOnlyTests(TraceFixture):
             return result
 
         with patch.object(trace_service, "_load_messages", side_effect=load_then_write):
-            trace = load_trace(self.database_path, turn_id)
-        self.assertEqual(trace["api_events"], [])
+            with self.assertRaises(TraceServiceError) as raised:
+                load_trace(self.database_path, turn_id)
+        self.assertEqual(raised.exception.code, "trace_database_unavailable")
         self.assertEqual(load_trace(self.database_path, turn_id)["api_events"][0]["event_type"], "future.after-snapshot")
 
     def test_route_reader_runs_across_thread_boundary_and_never_loads_environment(self) -> None:
@@ -849,23 +864,29 @@ class TraceRouteAndReadOnlyTests(TraceFixture):
         self.assertTrue(worker_threads)
         self.assertNotEqual(worker_threads[0], caller_thread)
 
-    def test_serve_selects_resolved_database_without_opening_it(self) -> None:
+    def test_serve_missing_database_fails_preflight_without_creating_it(self) -> None:
         selected = Path(self.temporary_directory.name) / "not-created" / "chosen.db"
         argv = ["helios-room", "serve", "--database", str(selected)]
+        stderr = io.StringIO()
         with patch.object(sys, "argv", argv), patch.object(
             main.uvicorn, "run"
-        ) as run_server, patch.object(
-            main, "connect_database", side_effect=AssertionError("serve must not open database")
-        ), patch("sys.stdout", new_callable=io.StringIO):
-            main.main()
-        self.assertEqual(main.app.state.database_path, selected.resolve())
+        ) as run_server, patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as raised:
+                main.main()
+        self.assertEqual(raised.exception.code, 1)
         self.assertFalse(selected.exists())
-        run_server.assert_called_once()
+        self.assertFalse(selected.parent.exists())
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "error": "database_not_initialized",
+                "message": "The Helios Room database is not initialized.",
+            },
+        )
+        run_server.assert_not_called()
 
     def test_trace_queries_no_memory_tables(self) -> None:
         turn_id = self.add_turn()
-        import app.trace_service as trace_service
-
         real_connect = sqlite3.connect
         trackers: list[TrackingConnection] = []
 
@@ -875,7 +896,7 @@ class TraceRouteAndReadOnlyTests(TraceFixture):
             trackers.append(tracker)
             return tracker
 
-        with patch.object(trace_service.sqlite3, "connect", side_effect=tracked_connect):
+        with patch("app.read_snapshot.sqlite3.connect", side_effect=tracked_connect):
             load_trace(self.database_path, turn_id)
         sql = "\n".join(trackers[0].sql).casefold()
         self.assertNotIn("seed_memor", sql)

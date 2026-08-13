@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .commands import classify_local_command, is_reserved_trace_command
+from .commands import classify_local_command, is_reserved_local_command
 from .database import (
     DEFAULT_DATABASE_PATH,
     connect_database,
@@ -28,12 +28,14 @@ from .openai_client import (
     safe_exception_diagnostics,
     serialize_provider_response,
 )
+from .identity_service import current_alias, resolve_room_post_context
 from .seed_memory import (
     RESULT_LIMIT as MEMORY_RESULT_LIMIT,
     TEXT_BUDGET_CHARS as MEMORY_TEXT_BUDGET_CHARS,
     search_seeded_memories,
     serialize_inherited_memory_context,
 )
+from .schema_validation import validate_v13_foundation
 
 
 ROOM_KEY = "main"
@@ -109,8 +111,10 @@ class AcceptedTurn:
     room_id: int
     peter_message_id: int
     helios_id: int
+    peter_id: int
     helios_config_id: int
     provider_request: dict[str, Any]
+    api_key: str
 
 
 def canonical_json(value: Any) -> str:
@@ -127,6 +131,7 @@ def canonical_json(value: Any) -> str:
 async def run_helios_turn(
     message_text: str,
     *,
+    destination_participant_key: str = HELIOS_KEY,
     database_path: Path | str = DEFAULT_DATABASE_PATH,
     client_factory: Callable[[str], Any] | None = None,
     dotenv_path: Path | str | None = None,
@@ -136,40 +141,24 @@ async def run_helios_turn(
     if is_blank_message(message_text):
         return {"ignored": True, "reason": "empty_message"}
 
-    if is_reserved_trace_command(classify_local_command(message_text)):
+    if is_reserved_local_command(classify_local_command(message_text)):
         raise TurnServiceError(
             status_code=400,
             code="local_command_only",
-            message="The /trace command is available only in the local browser UI.",
+            message="Local commands are available only in the browser interface.",
         )
-
-    environment = load_openai_environment(dotenv_path)
-    if environment.api_key is None or not environment.api_key.strip():
-        raise TurnServiceError(
-            status_code=503,
-            code="missing_openai_api_key",
-            message="OPENAI_API_KEY is missing or blank.",
-        )
-    if environment.model is None or not environment.model.strip():
-        raise TurnServiceError(
-            status_code=503,
-            code="missing_openai_model",
-            message="HELIOS_OPENAI_MODEL is missing or blank.",
-        )
-
-    identity = await asyncio.to_thread(_preflight_database, database_path)
     accepted = await asyncio.to_thread(
         _accept_turn,
         database_path,
-        identity,
         message_text,
-        environment.model,
+        destination_participant_key,
+        dotenv_path,
     )
 
     factory = client_factory or create_openai_client
     client: Any | None = None
     try:
-        client = factory(environment.api_key)
+        client = factory(accepted.api_key)
         response = await create_response(client, accepted.provider_request)
     except asyncio.CancelledError as exception:
         raise _stranded_turn_error(accepted, cause=exception) from exception
@@ -181,7 +170,7 @@ async def run_helios_turn(
             "error": safe_exception_diagnostics(
                 exception,
                 reason=reason,
-                secrets=(environment.api_key,),
+                secrets=(accepted.api_key,),
             ),
         }
         await _finalize_failure_or_raise(
@@ -212,14 +201,14 @@ async def run_helios_turn(
     try:
         raw_response = serialize_provider_response(
             response,
-            api_key=environment.api_key,
+            api_key=accepted.api_key,
         )
     except Exception as exception:
         error_payload = {
             "error": safe_exception_diagnostics(
                 exception,
                 reason="provider_response_serialization_failed",
-                secrets=(environment.api_key,),
+                secrets=(accepted.api_key,),
             )
         }
         await _finalize_failure_or_raise(database_path, accepted, error_payload)
@@ -351,13 +340,79 @@ def _preflight_database(database_path: Path | str) -> RoomIdentity:
 
 def _accept_turn(
     database_path: Path | str,
-    identity: RoomIdentity,
     message_text: str,
-    model: str,
+    destination_participant_key: str,
+    dotenv_path: Path | str | None,
 ) -> AcceptedTurn:
-    connection = connect_database(database_path)
+    try:
+        connection = connect_database(database_path)
+    except (OSError, sqlite3.Error) as exception:
+        raise TurnServiceError(
+            status_code=503,
+            code="invalid_database_configuration",
+            message="The Helios database configuration is invalid.",
+        ) from exception
     try:
         connection.execute("BEGIN IMMEDIATE")
+        try:
+            context = resolve_room_post_context(connection)
+        except Exception as exception:
+            raise TurnServiceError(
+                status_code=503,
+                code="invalid_database_configuration",
+                message="The Helios database configuration is invalid.",
+            ) from exception
+        destination_rows = connection.execute(
+            """SELECT id, participant_key, name, participant_type
+               FROM participants WHERE participant_key=?""",
+            (destination_participant_key,),
+        ).fetchall()
+        destination = destination_rows[0] if len(destination_rows) == 1 else None
+        active_count = 0 if destination is None else connection.execute(
+            """SELECT count(*) FROM room_participants
+               WHERE room_id=? AND participant_id=? AND left_at IS NULL""",
+            (context["room_id"], destination["id"]),
+        ).fetchone()[0]
+        if (
+            destination is None
+            or destination["participant_key"] != HELIOS_KEY
+            or destination["participant_type"] != "ai"
+            or destination["name"] != "Helios"
+            or active_count != 1
+        ):
+            raise TurnServiceError(
+                status_code=409,
+                code="participant_destination_unavailable",
+                message="The selected participant destination is unavailable.",
+            )
+        try:
+            validate_v13_foundation(connection)
+        except Exception as exception:
+            raise TurnServiceError(
+                status_code=503,
+                code="invalid_database_configuration",
+                message="The Helios database configuration is invalid.",
+            ) from exception
+        identity = RoomIdentity(
+            room_id=context["room_id"],
+            peter_id=context["peter"]["id"],
+            helios_id=destination["id"],
+        )
+        helios_alias = current_alias(connection, identity.helios_id)
+        environment = load_openai_environment(dotenv_path)
+        if environment.api_key is None or not environment.api_key.strip():
+            raise TurnServiceError(
+                status_code=503,
+                code="missing_openai_api_key",
+                message="OPENAI_API_KEY is missing or blank.",
+            )
+        if environment.model is None or not environment.model.strip():
+            raise TurnServiceError(
+                status_code=503,
+                code="missing_openai_model",
+                message="HELIOS_OPENAI_MODEL is missing or blank.",
+            )
+        model = environment.model
         config_id = find_or_create_helios_configuration(
             connection,
             helios_id=identity.helios_id,
@@ -375,6 +430,10 @@ def _accept_turn(
             message_text=message_text,
             turn_id=turn_id,
             message_type="chat",
+            sender_alias_id=context["peter_alias"]["id"],
+            destination_kind="participant",
+            destination_alias_id=helios_alias["id"],
+            recipient_participant_id=identity.helios_id,
         )
         boundary = connection.execute(
             "SELECT room_sequence_no FROM messages WHERE id = ?",
@@ -454,8 +513,10 @@ def _accept_turn(
             room_id=identity.room_id,
             peter_message_id=peter_message_id,
             helios_id=identity.helios_id,
+            peter_id=identity.peter_id,
             helios_config_id=config_id,
             provider_request=provider_request,
+            api_key=environment.api_key,
         )
     except Exception:
         connection.rollback()
@@ -562,26 +623,101 @@ def _load_and_validate_history(
 ) -> list[dict[str, str]]:
     rows = connection.execute(
         """
-        SELECT m.message_type, m.message_text, p.participant_key
+        SELECT m.id, m.message_type, m.message_text, p.participant_key,
+               p.participant_type, mr.routing_mode, mr.destination_kind,
+               rp.participant_key AS recipient_key,
+               sa.participant_id AS sender_alias_owner,
+               da.participant_id AS destination_alias_owner,
+               dap.participant_key AS destination_alias_owner_key,
+               da.alias_key AS destination_alias_key
         FROM messages AS m
         JOIN participants AS p ON p.id = m.participant_id
+        JOIN message_routes AS mr ON mr.message_id = m.id
+            AND mr.room_id = m.room_id
+            AND mr.sender_participant_id = m.participant_id
+        JOIN participant_aliases AS sa ON sa.id = mr.sender_alias_id
+            AND sa.participant_id = m.participant_id
+        JOIN participant_aliases AS da ON da.id = mr.destination_alias_id
+        JOIN participants AS dap ON dap.id = da.participant_id
+        LEFT JOIN participants AS rp ON rp.id = mr.recipient_participant_id
         WHERE m.room_id = ? AND m.room_sequence_no <= ?
         ORDER BY m.room_sequence_no
         """,
         (room_id, boundary),
     ).fetchall()
+    expected_count = connection.execute(
+        "SELECT count(*) FROM messages WHERE room_id=? AND room_sequence_no<=?",
+        (room_id, boundary),
+    ).fetchone()[0]
+    if len(rows) != expected_count:
+        raise TurnServiceError(
+            status_code=409,
+            code="unsupported_history_route",
+            message="Canonical history contains invalid routing data.",
+        )
 
     provider_input: list[dict[str, str]] = []
     for row in rows:
+        valid_room_destination = (
+            row["destination_kind"] == "room"
+            and row["recipient_key"] is None
+            and row["destination_alias_owner_key"] == "room-system"
+            and row["destination_alias_key"] == "room"
+        )
+        if row["message_type"] == "system":
+            if row["routing_mode"] == "legacy_implicit" and valid_room_destination:
+                bootstrap_count = connection.execute(
+                    """SELECT count(*)
+                       FROM participant_name_events AS pne
+                       JOIN message_routes AS mr ON mr.message_id=?
+                       WHERE pne.event_type='bootstrap'
+                         AND pne.subject_participant_id=mr.sender_participant_id
+                         AND pne.new_alias_id=mr.sender_alias_id
+                         AND pne.room_id IS NULL
+                         AND pne.previous_alias_id IS NULL
+                         AND pne.canonical_message_id IS NULL""",
+                    (row["id"],),
+                ).fetchone()[0]
+                if bootstrap_count == 1:
+                    continue
+            if (
+                row["routing_mode"] == "explicit"
+                and row["participant_key"] == "room-system"
+                and row["participant_type"] == "system"
+                and valid_room_destination
+            ):
+                event_count = connection.execute(
+                    """SELECT count(*) FROM participant_name_events
+                       WHERE event_type='adopted' AND canonical_message_id=?
+                         AND room_id=?""",
+                    (row["id"], room_id),
+                ).fetchone()[0]
+                if event_count == 1:
+                    continue
+            raise TurnServiceError(
+                status_code=409,
+                code="unsupported_history_message_type",
+                message="Canonical history contains an unsupported system message.",
+            )
         if row["message_type"] != "chat":
             raise TurnServiceError(
                 status_code=409,
                 code="unsupported_history_message_type",
                 message="Canonical history contains an unsupported message type.",
             )
-        if row["participant_key"] == PETER_KEY:
+        if (
+            row["participant_key"] == PETER_KEY
+            and (
+                (row["destination_kind"] == "participant" and row["recipient_key"] == HELIOS_KEY)
+                or valid_room_destination
+            )
+        ):
             role = "user"
-        elif row["participant_key"] == HELIOS_KEY:
+        elif (
+            row["participant_key"] == HELIOS_KEY
+            and row["destination_kind"] == "participant"
+            and row["recipient_key"] == PETER_KEY
+        ):
             role = "assistant"
         else:
             raise TurnServiceError(
@@ -602,6 +738,7 @@ def _finalize_success(
     connection = connect_database(database_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        validate_v13_foundation(connection)
         _assert_turn_open(connection, accepted)
         helios_message_id = store_message(
             connection,
@@ -612,6 +749,10 @@ def _finalize_success(
             turn_id=accepted.turn_id,
             reply_to_id=accepted.peter_message_id,
             message_type="chat",
+            sender_alias_id=current_alias(connection, accepted.helios_id)["id"],
+            destination_kind="participant",
+            destination_alias_id=current_alias(connection, accepted.peter_id)["id"],
+            recipient_participant_id=accepted.peter_id,
         )
         _insert_api_event(
             connection,
@@ -642,6 +783,7 @@ def _finalize_failure(
     connection = connect_database(database_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        validate_v13_foundation(connection)
         _assert_turn_open(connection, accepted)
         _insert_api_event(
             connection,

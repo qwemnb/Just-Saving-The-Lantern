@@ -7,8 +7,12 @@ const {
     classifyTraceCommand,
     renderTrace,
     setupApp,
+    loadMessages,
     TRACE_USAGE,
-    NO_MEMORY_RETRIEVAL
+    NO_MEMORY_RETRIEVAL,
+    NETWORK_READ_ERROR,
+    HISTORY_READ_FALLBACK,
+    DIRECTORY_READ_FALLBACK
 } = require('../static/app.js');
 
 
@@ -27,6 +31,20 @@ class FakeElement {
         this.parentNode = null;
         this.scrollTop = 0;
         this.scrollHeight = 0;
+        this.attributes = new Map();
+        this.classList = {
+            toggle: name => {
+                const names = new Set(this.className.split(/\s+/).filter(Boolean));
+                names.has(name) ? names.delete(name) : names.add(name);
+                this.className = [...names].join(' ');
+                return names.has(name);
+            },
+            add: name => {
+                const names = new Set(this.className.split(/\s+/).filter(Boolean));
+                names.add(name);
+                this.className = [...names].join(' ');
+            }
+        };
     }
 
     appendChild(child) {
@@ -51,6 +69,10 @@ class FakeElement {
         const listeners = this.listeners.get(type) || [];
         listeners.push(listener);
         this.listeners.set(type, listeners);
+    }
+
+    setAttribute(name, value) {
+        this.attributes.set(name, String(value));
     }
 
     async dispatch(type, extra = {}) {
@@ -151,6 +173,7 @@ function makeDocument() {
     form.appendChild(input);
     form.appendChild(send);
     doc.register('messages');
+    doc.register('history-read-status');
     doc.register('app-shell', 'main');
     const overlay = doc.register('trace-overlay');
     overlay.hidden = true;
@@ -160,6 +183,33 @@ function makeDocument() {
     doc.register('trace-body');
     return doc;
 }
+
+
+function makeDirectoryDocument() {
+    const doc = makeDocument();
+    doc.register('destination-button', 'button');
+    const picker = doc.register('destination-picker');
+    picker.hidden = true;
+    doc.register('destination-search', 'input');
+    doc.register('destination-options');
+    doc.register('participant-list');
+    doc.register('participant-panel', 'aside');
+    doc.register('participants-toggle', 'button');
+    doc.register('participants-refresh', 'button');
+    doc.register('participant-read-status');
+    return doc;
+}
+
+
+const DIRECTORY = {
+    directory_version: 1,
+    room: { room_key: 'main', name: 'The Room' },
+    destinations: [
+        { kind: 'room', label: 'Room', addressable: true },
+        { kind: 'participant', participant_key: 'helios', primary_name: 'Helios', aliases: ['Helios', 'Sol'], participant_type: 'ai', addressable: true },
+        { kind: 'participant', participant_key: 'peter', primary_name: 'Peter', aliases: ['Peter'], participant_type: 'human', addressable: false }
+    ]
+};
 
 
 function response(ok, payload, status = 200) {
@@ -173,7 +223,7 @@ function response(ok, payload, status = 200) {
 
 function minimalTrace(overrides = {}) {
     return {
-        trace_version: 1,
+        trace_version: 2,
         turn: {
             id: 17,
             status: 'open',
@@ -396,4 +446,184 @@ test('static dialog declares modal semantics and a visible labelled close contro
     assert.match(html, /aria-labelledby="trace-title"/);
     assert.match(html, /id="trace-close"[^>]*>Close<\/button>/);
     assert.match(html, /id="trace-command-status"/);
+});
+
+
+test('directory initializes Helios, bracket opens searchable picker, and Room POST is structured', async () => {
+    const doc = makeDirectoryDocument();
+    const calls = [];
+    const fetchStub = async (url, options = {}) => {
+        calls.push({ url, options });
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages' && options.method === 'POST') return response(true, { status: 'completed' });
+        if (url === '/api/messages') return response(true, []);
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    setupApp(doc, fetchStub);
+    await settle();
+    assert.equal(doc.getElementById('destination-button').textContent, 'To: Helios');
+    assert.match(allText(doc.getElementById('participant-list')), /Previously: Sol/);
+    assert.match(allText(doc.getElementById('participant-list')), /Not addressable/);
+
+    const input = doc.getElementById('message-input');
+    input.value = '   ';
+    const bracket = await input.dispatch('keydown', { key: '[' });
+    assert.equal(bracket.defaultPrevented, true);
+    assert.equal(input.value, '   ');
+    assert.equal(doc.getElementById('destination-picker').hidden, false);
+    assert.equal(doc.activeElement, doc.getElementById('destination-search'));
+
+    const roomOption = doc.getElementById('destination-options').children[0];
+    await roomOption.dispatch('click');
+    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+    input.value = '  exact room text  ';
+    await input.dispatch('input');
+    calls.length = 0;
+    await doc.getElementById('message-form').dispatch('submit');
+    const post = calls.find(call => call.options.method === 'POST');
+    assert.deepEqual(JSON.parse(post.options.body), {
+        message_text: '  exact room text  ',
+        destination: { kind: 'room' }
+    });
+    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+});
+
+
+test('participants command refetches locally and malformed form never posts', async () => {
+    const doc = makeDirectoryDocument();
+    const calls = [];
+    const fetchStub = async (url, options = {}) => {
+        calls.push({ url, options });
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages') return response(true, []);
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    setupApp(doc, fetchStub);
+    await settle();
+    calls.length = 0;
+    const input = doc.getElementById('message-input');
+    input.value = ' /participants ';
+    await doc.getElementById('message-form').dispatch('submit');
+    assert.deepEqual(calls.map(call => call.url), ['/api/participants']);
+    assert.equal(input.value, '');
+
+    calls.length = 0;
+    input.value = '/participants secret';
+    await doc.getElementById('message-form').dispatch('submit');
+    assert.deepEqual(calls, []);
+    assert.equal(doc.getElementById('trace-command-status').textContent, 'Usage: /participants');
+});
+
+
+test('history read failures use only local literals and never create message elements', async () => {
+    const cases = [
+        ['message_history_invalid', 'The message history data is invalid.'],
+        ['message_history_unavailable', 'The message history is unavailable.'],
+        ['unknown_code', HISTORY_READ_FALLBACK],
+        [null, HISTORY_READ_FALLBACK]
+    ];
+    for (const [code, expected] of cases) {
+        const doc = makeDocument();
+        const hostile = '<img src=x onerror=alert(404)> SECRET';
+        const fetchStub = async () => response(false, {
+            ...(code === null ? {} : { error: code }),
+            message: hostile
+        }, 500);
+        assert.equal(await loadMessages(fetchStub, doc), false);
+        assert.equal(doc.getElementById('history-read-status').textContent, expected);
+        assert.doesNotMatch(allText(doc.getElementById('messages')), /SECRET|img/);
+        assert.doesNotMatch(doc.getElementById('history-read-status').textContent, /SECRET|img/);
+    }
+});
+
+
+test('invalid JSON, non-JSON, and network history failures use exact safe fallbacks', async () => {
+    for (const invalidResponse of [
+        { ok: false, async json() { throw new Error('HOSTILE JSON'); } },
+        { ok: true, async json() { throw new Error('HOSTILE HTML'); } }
+    ]) {
+        const doc = makeDocument();
+        await loadMessages(async () => invalidResponse, doc);
+        assert.equal(doc.getElementById('history-read-status').textContent, HISTORY_READ_FALLBACK);
+    }
+    const doc = makeDocument();
+    await loadMessages(async () => { throw new Error('HOSTILE URL'); }, doc);
+    assert.equal(doc.getElementById('history-read-status').textContent, NETWORK_READ_ERROR);
+});
+
+
+test('directory failures are independent, local, and keep sending disabled', async () => {
+    const doc = makeDirectoryDocument();
+    const hostile = '<script>PRIVATE DIRECTORY</script>';
+    const fetchStub = async url => {
+        if (url === '/api/messages') {
+            return response(false, {
+                error: 'message_history_invalid',
+                message: 'PRIVATE HISTORY'
+            }, 500);
+        }
+        return response(false, {
+            error: 'participant_directory_unavailable',
+            message: hostile
+        }, 503);
+    };
+    const controller = setupApp(doc, fetchStub);
+    await settle();
+    assert.equal(
+        doc.getElementById('participant-read-status').textContent,
+        'The participant directory is unavailable.'
+    );
+    assert.equal(
+        doc.getElementById('history-read-status').textContent,
+        'The message history data is invalid.'
+    );
+    assert.equal(doc.getElementById('destination-button').disabled, true);
+    assert.equal(doc.getElementById('message-form').querySelector('.send-button').disabled, true);
+    assert.doesNotMatch(
+        [
+            doc.getElementById('participant-read-status').textContent,
+            doc.getElementById('history-read-status').textContent,
+            allText(doc.getElementById('participant-list')),
+            allText(doc.getElementById('messages'))
+        ].join('\n'),
+        /PRIVATE/
+    );
+
+    await controller.loadDirectory();
+    assert.equal(
+        doc.getElementById('history-read-status').textContent,
+        'The message history data is invalid.'
+    );
+});
+
+
+test('successful endpoint refresh clears only its own read status', async () => {
+    const doc = makeDirectoryDocument();
+    let directoryFails = true;
+    const fetchStub = async url => {
+        if (url === '/api/messages') return response(true, []);
+        if (directoryFails) {
+            return response(false, { error: 'participant_directory_invalid' }, 500);
+        }
+        return response(true, DIRECTORY);
+    };
+    const controller = setupApp(doc, fetchStub);
+    await settle();
+    doc.getElementById('history-read-status').textContent = 'still relevant';
+    directoryFails = false;
+    await controller.loadDirectory();
+    assert.equal(doc.getElementById('participant-read-status').textContent, '');
+    assert.equal(doc.getElementById('history-read-status').textContent, 'still relevant');
+});
+
+
+test('static read statuses, cache tokens, and focus-visible selectors are present', () => {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'static', 'index.html'), 'utf8');
+    const css = fs.readFileSync(path.join(__dirname, '..', 'static', 'style.css'), 'utf8');
+    assert.match(html, /id="history-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.match(html, /id="participant-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.match(html, /style\.css\?v=schema-preflight-ui-v1/);
+    assert.match(html, /app\.js\?v=schema-preflight-ui-v1/);
+    assert.match(css, /button:focus-visible/);
+    assert.match(css, /input:focus-visible/);
 });

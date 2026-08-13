@@ -11,21 +11,28 @@ from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-from .commands import classify_local_command, is_reserved_trace_command
+from .commands import classify_local_command, is_reserved_local_command
 from .database import (
     DEFAULT_DATABASE_PATH,
-    connect_database,
-    create_turn,
+    DatabaseInitializationError,
     initialize_database,
     is_blank_message,
-    store_message,
 )
+from .identity_service import (
+    IdentityServiceError,
+    load_message_history,
+    load_participant_directory,
+    post_room_message,
+)
+from .migration import DatabaseMigrationError, migrate_database
 from .models import MessageRequest
 from .openai_client import create_openai_client
+from .preflight import DatabasePreflightError, preflight_database
 from .room_service import TurnServiceError, run_helios_turn
 from .seed_memory import SeedMemoryError, import_seed_memories, load_seed_manifest
 from .trace_service import TraceServiceError, load_trace
@@ -45,66 +52,86 @@ static_dir = Path(__file__).parent.parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
+@app.exception_handler(RequestValidationError)
+async def invalid_message_request(_request: Request, _error: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "invalid_message_request",
+            "message": "The message request is invalid.",
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """Serve the main chat interface."""
     index_path = static_dir / "index.html"
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        index_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/messages")
 async def get_messages():
     """Retrieve all messages from the room."""
-    return await asyncio.to_thread(_load_messages, app.state.database_path)
-
-
-def _load_messages(database_path: Path | str) -> list[dict[str, object]]:
-    connection = connect_database(database_path)
     try:
-        rows = connection.execute(
-            """
-            SELECT 
-                m.id,
-                m.message_text,
-                m.created_at,
-                p.participant_key,
-                m.room_sequence_no
-            FROM messages m
-            JOIN participants p ON m.participant_id = p.id
-            WHERE m.room_id = (SELECT id FROM rooms WHERE room_key = 'main')
-            ORDER BY m.room_sequence_no
-            """
-        ).fetchall()
-        
-        return [
-            {
-                "id": row["id"],
-                "message_text": row["message_text"],
-                "created_at": row["created_at"],
-                "participant_key": row["participant_key"],
-                "room_sequence_no": row["room_sequence_no"],
-            }
-            for row in rows
-        ]
-    finally:
-        connection.close()
+        messages = await asyncio.to_thread(
+            load_message_history, app.state.database_path
+        )
+    except IdentityServiceError as error:
+        return _identity_error(error)
+    return JSONResponse(content=messages, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/participants")
+async def get_participants():
+    """Return the read-only, versioned main-room destination directory."""
+
+    try:
+        directory = await asyncio.to_thread(
+            load_participant_directory, app.state.database_path
+        )
+    except IdentityServiceError as error:
+        return _identity_error(error)
+    return JSONResponse(content=directory, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/messages")
 async def post_message(request: MessageRequest):
-    """Run one browser-authored Peter/Helios turn."""
+    """Store one explicit Room post or run one explicit Peter/Helios turn."""
     try:
-        return await run_helios_turn(
-            request.message_text,
-            database_path=app.state.database_path,
-            client_factory=app.state.openai_client_factory,
-            dotenv_path=app.state.dotenv_path,
-        )
+        if request.destination.kind == "room":
+            result = await asyncio.to_thread(
+                post_room_message, request.message_text, app.state.database_path
+            )
+        else:
+            result = await run_helios_turn(
+                request.message_text,
+                destination_participant_key=request.destination.participant_key,
+                database_path=app.state.database_path,
+                client_factory=app.state.openai_client_factory,
+                dotenv_path=app.state.dotenv_path,
+            )
+        return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
     except TurnServiceError as error:
         return JSONResponse(
             status_code=error.status_code,
             content=error.as_payload(),
+            headers={"Cache-Control": "no-store"},
         )
+    except IdentityServiceError as error:
+        return _identity_error(error)
+
+
+def _identity_error(error: IdentityServiceError) -> JSONResponse:
+    return JSONResponse(
+        status_code=error.status_code,
+        content=error.as_payload(),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/trace/latest")
@@ -170,7 +197,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Helios Room")
     parser.add_argument(
         "command",
-        choices=("init-db", "store-message", "import-seed-memories", "serve"),
+        choices=(
+            "init-db",
+            "migrate-database",
+            "store-message",
+            "import-seed-memories",
+            "serve",
+        ),
         help=(
             "Initialize the database, store a test message, import validated seed "
             "memories, or start the web server."
@@ -184,6 +217,15 @@ def main() -> None:
     parser.add_argument(
         "--message",
         help="Message text to store (for store-message command).",
+    )
+    parser.add_argument(
+        "--destination-kind",
+        choices=("room", "participant"),
+        help="Required Room destination kind for store-message.",
+    )
+    parser.add_argument(
+        "--participant-key",
+        help="Unsupported by the Room-only store-message command.",
     )
     parser.add_argument(
         "--file",
@@ -203,71 +245,46 @@ def main() -> None:
     arguments = parser.parse_args()
 
     if arguments.command == "init-db":
-        report = initialize_database(database_path=arguments.database)
+        try:
+            report = initialize_database(database_path=arguments.database)
+        except DatabaseInitializationError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            raise SystemExit(1) from None
         print(json.dumps(asdict(report), indent=2))
+
+    elif arguments.command == "migrate-database":
+        try:
+            report = migrate_database(arguments.database)
+        except DatabaseMigrationError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            raise SystemExit(1) from None
+        print(json.dumps(report.as_dict(), indent=2))
 
     elif arguments.command == "store-message":
         if arguments.message is None:
             parser.error("--message is required for store-message command")
+        if arguments.destination_kind != "room":
+            parser.error("store-message requires --destination-kind room")
+        if arguments.participant_key is not None:
+            parser.error("--participant-key is not supported by store-message")
 
         if is_blank_message(arguments.message):
             print(json.dumps({"ignored": True, "reason": "empty_message"}, indent=2))
             return
 
-        if is_reserved_trace_command(classify_local_command(arguments.message)):
+        if is_reserved_local_command(classify_local_command(arguments.message)):
             parser.exit(
                 status=2,
                 message=(
-                    "store-message rejects /trace commands; use the local browser UI.\n"
+                    "store-message rejects local commands; use the browser interface.\n"
                 ),
             )
-
-        connection = connect_database(database_path=arguments.database)
         try:
-            connection.execute("BEGIN IMMEDIATE")
-
-            # Get room and participant IDs
-            room_row = connection.execute(
-                "SELECT id FROM rooms WHERE room_key = ?",
-                ("main",),
-            ).fetchone()
-            if not room_row:
-                raise RuntimeError("Room 'main' not found")
-            room_id = room_row["id"]
-
-            participant_row = connection.execute(
-                "SELECT id FROM participants WHERE participant_key = ?",
-                ("peter",),
-            ).fetchone()
-            if not participant_row:
-                raise RuntimeError("Participant 'peter' not found")
-            participant_id = participant_row["id"]
-
-            # Create a turn and store the message
-            turn_id = create_turn(connection, room_id, participant_id)
-            message_id = store_message(
-                connection,
-                room_id=room_id,
-                participant_id=participant_id,
-                message_text=arguments.message,
-                turn_id=turn_id,
-            )
-
-            connection.commit()
-
-            result = {
-                "turn_id": turn_id,
-                "message_id": message_id,
-                "room_id": room_id,
-                "participant_id": participant_id,
-                "message": arguments.message,
-            }
-            print(json.dumps(result, indent=2))
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+            result = post_room_message(arguments.message, arguments.database)
+        except IdentityServiceError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            raise SystemExit(1) from None
+        print(json.dumps(result, indent=2))
 
     elif arguments.command == "import-seed-memories":
         if arguments.file is None:
@@ -281,6 +298,11 @@ def main() -> None:
         print(json.dumps(report, indent=2, ensure_ascii=False))
 
     elif arguments.command == "serve":
+        try:
+            preflight_database(arguments.database)
+        except DatabasePreflightError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            raise SystemExit(1) from None
         app.state.database_path = Path(arguments.database).expanduser().resolve()
         print(f"Starting Helios Room web server on http://{arguments.host}:{arguments.port}")
         uvicorn.run(app, host=arguments.host, port=arguments.port)

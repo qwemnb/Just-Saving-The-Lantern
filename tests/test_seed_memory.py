@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from app import main
 from app.database import connect_database, initialize_database
+from app.preflight import preflight_database
 from app.room_service import SYSTEM_INSTRUCTIONS, TurnServiceError, run_helios_turn
 from app.seed_memory import (
     INHERITED_MEMORY_HEADER,
@@ -1583,6 +1584,10 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         status, _, body = asyncio.run(self._asgi_trace_get("/api/trace/11"))
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(body)["error"], "trace_data_invalid")
+        self.assertEqual(
+            preflight_database(self.database_path).schema_label,
+            "1.3",
+        )
         with closing(connect_database(self.database_path)) as connection:
             after = self._conversation_rows(connection)
         self.assertEqual(after, before)
@@ -1644,7 +1649,10 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         return int(start["status"]), headers, response_body
 
     async def _asgi_post(self, message_text: str) -> tuple[int, dict[str, object]]:
-        body = json.dumps({"message_text": message_text}).encode("utf-8")
+        body = json.dumps({
+            "message_text": message_text,
+            "destination": {"kind": "participant", "participant_key": "helios"},
+        }).encode("utf-8")
         sent: list[dict[str, object]] = []
         delivered = False
 

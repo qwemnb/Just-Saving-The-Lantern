@@ -4,16 +4,27 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Helios Room</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=schema-preflight-ui-v1">
 </head>
 <body>
     <main class="container" id="app-shell">
         <header>
             <h1>Helios Room</h1>
-            <div class="room-info">The Room</div>
+            <div class="room-info" role="status">The Room · local persistent room</div>
         </header>
 
+        <div class="room-layout">
+        <aside id="participant-panel" class="participant-panel" aria-label="Participants">
+            <div class="participant-panel-header">
+                <h2>Participants</h2>
+                <button id="participants-refresh" class="participants-refresh" type="button">Refresh</button>
+            </div>
+            <div id="participant-read-status" class="read-status" role="status" aria-live="polite"></div>
+            <div id="participant-list" class="participant-list">Loading&hellip;</div>
+        </aside>
         <div class="chat-container">
+            <button id="participants-toggle" class="participants-toggle" type="button" aria-expanded="false">Participants</button>
+            <div id="history-read-status" class="read-status history-read-status" role="status" aria-live="polite"></div>
             <div class="messages" id="messages" aria-live="polite">
                 <div class="message system">
                     <div class="message-content">
@@ -26,17 +37,25 @@
 
             <div class="input-area">
                 <form id="message-form" class="message-form">
+                    <div class="destination-control">
+                        <button id="destination-button" type="button" disabled aria-haspopup="listbox" aria-expanded="false" aria-controls="destination-options">Choose destination</button>
+                        <div id="destination-picker" class="destination-picker" hidden>
+                            <input id="destination-search" type="search" placeholder="Find a participant" aria-label="Find a destination" autocomplete="off">
+                            <div id="destination-options" role="listbox"></div>
+                        </div>
+                    </div>
                     <input
                         type="text"
                         id="message-input"
                         class="message-input"
-                        placeholder="Type a message or /trace..."
+                        placeholder="Type a message, /trace, or /participants..."
                         autocomplete="off"
                         required
                     >
                     <button type="submit" class="send-button" disabled>Send</button>
                 </form>
             </div>
+        </div>
         </div>
     </main>
 
@@ -58,6 +77,6 @@
         </section>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=schema-preflight-ui-v1"></script>
 </body>
 </html>
