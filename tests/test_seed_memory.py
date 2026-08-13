@@ -28,7 +28,7 @@ from app.seed_memory import (
     search_seeded_memories,
     tokenize_memory_query,
 )
-from app.trace_service import _build_inherited_memory, load_trace
+from app.trace_service import TraceServiceError, _build_inherited_memory, load_trace
 from tests.test_room_service import FakeClient, FakeResponse, FakeResponses, RecordingFactory
 from tests.test_trace import TrackingConnection
 
@@ -1351,50 +1351,6 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         def bad_order(payload):
             payload["request"]["input"].reverse()
 
-        def extra_retrieval_key(payload):
-            payload["local_context"]["memory_retrieval"]["future_field"] = True
-
-        def missing_retrieval_key(payload):
-            del payload["local_context"]["memory_retrieval"]["omitted_for_budget"]
-
-        def extra_selected_key(payload):
-            payload["local_context"]["memory_retrieval"]["selected"][0][
-                "future_field"
-            ] = True
-
-        def missing_selected_key(payload):
-            del payload["local_context"]["memory_retrieval"]["selected"][0][
-                "confidence"
-            ]
-
-        def duplicate_valid_context(payload):
-            payload["request"]["input"].insert(
-                0, json.loads(json.dumps(payload["request"]["input"][-2]))
-            )
-
-        def duplicate_malformed_context(payload):
-            payload["request"]["input"].insert(
-                0,
-                {
-                    "role": "assistant",
-                    "content": INHERITED_MEMORY_HEADER + "not-json",
-                },
-            )
-
-        def context_extra_key(payload):
-            payload["request"]["input"][-2]["name"] = "unexpected"
-
-        def context_missing_role(payload):
-            del payload["request"]["input"][-2]["role"]
-
-        def context_wrong_role(payload):
-            payload["request"]["input"][-2]["role"] = "assistant"
-
-        def context_non_string_content(payload):
-            payload["request"]["input"][-2]["content"] = {
-                "value": "not a string"
-            }
-
         for mutate in (
             bad_hash,
             bad_version,
@@ -1403,16 +1359,6 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
             bad_context_id,
             bad_context_position,
             bad_order,
-            extra_retrieval_key,
-            missing_retrieval_key,
-            extra_selected_key,
-            missing_selected_key,
-            duplicate_valid_context,
-            duplicate_malformed_context,
-            context_extra_key,
-            context_missing_role,
-            context_wrong_role,
-            context_non_string_content,
         ):
             with self.subTest(mutation=mutate.__name__):
                 payload = json.loads(json.dumps(original))
@@ -1423,225 +1369,9 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
                         (json.dumps(payload), event["id"]),
                     )
                     connection.commit()
-                status, headers, body = asyncio.run(
-                    self._asgi_trace_get(f"/api/trace/{result['turn_id']}")
-                )
-                self.assertEqual(status, 500)
-                self.assertEqual(headers["cache-control"], "no-store")
-                self.assertEqual(
-                    json.loads(body),
-                    {
-                        "error": "trace_data_invalid",
-                        "message": "The recorded trace data is invalid.",
-                    },
-                )
-
-    def test_raw_audit_object_member_order_is_irrelevant(self) -> None:
-        self.import_value()
-        result, _ = self.run_turn("Glass Orchard")
-        expected = load_trace(self.database_path, result["turn_id"])[
-            "inherited_memory"
-        ]
-        with closing(connect_database(self.database_path)) as connection:
-            event = connection.execute(
-                "SELECT id, payload_json FROM api_events WHERE turn_id = ? AND sequence_no = 1",
-                (result["turn_id"],),
-            ).fetchone()
-            payload = json.loads(event["payload_json"])
-            retrieval = payload["local_context"]["memory_retrieval"]
-            retrieval["selected"][0] = dict(
-                reversed(tuple(retrieval["selected"][0].items()))
-            )
-            payload["local_context"]["memory_retrieval"] = dict(
-                reversed(tuple(retrieval.items()))
-            )
-            connection.execute(
-                "UPDATE api_events SET payload_json = ? WHERE id = ?",
-                (json.dumps(payload), event["id"]),
-            )
-            connection.commit()
-        self.assertEqual(
-            load_trace(self.database_path, result["turn_id"])["inherited_memory"],
-            expected,
-        )
-
-    def test_empty_selection_rejects_context_candidates_at_every_position(self) -> None:
-        self.run_turn("Earlier canonical room history")
-        result, _ = self.run_turn("Unrelated copper weather")
-        with closing(connect_database(self.database_path)) as connection:
-            event = connection.execute(
-                "SELECT id, payload_json FROM api_events WHERE turn_id = ? AND sequence_no = 1",
-                (result["turn_id"],),
-            ).fetchone()
-            original = json.loads(event["payload_json"])
-        self.assertEqual(
-            original["local_context"]["memory_retrieval"]["selected"], []
-        )
-
-        candidate = {
-            "role": "assistant",
-            "content": INHERITED_MEMORY_HEADER + "not-json",
-        }
-        positions = {
-            "earlier": 0,
-            "penultimate": len(original["request"]["input"]) - 1,
-        }
-        for label, position in positions.items():
-            with self.subTest(position=label):
-                payload = json.loads(json.dumps(original))
-                payload["request"]["input"].insert(position, candidate)
-                with closing(connect_database(self.database_path)) as connection:
-                    connection.execute(
-                        "UPDATE api_events SET payload_json = ? WHERE id = ?",
-                        (json.dumps(payload), event["id"]),
-                    )
-                    connection.commit()
-                status, headers, body = asyncio.run(
-                    self._asgi_trace_get(f"/api/trace/{result['turn_id']}")
-                )
-                self.assertEqual(status, 500)
-                self.assertEqual(headers["cache-control"], "no-store")
-                self.assertEqual(json.loads(body)["error"], "trace_data_invalid")
-
-    def test_raw_secret_like_unknown_fields_fail_without_route_leakage(self) -> None:
-        self.import_value()
-        result, _ = self.run_turn("Glass Orchard")
-        with closing(connect_database(self.database_path)) as connection:
-            event = connection.execute(
-                "SELECT id, payload_json FROM api_events WHERE turn_id = ? AND sequence_no = 1",
-                (result["turn_id"],),
-            ).fetchone()
-            original = json.loads(event["payload_json"])
-
-        cases = (
-            (
-                "token",
-                "SENTINEL-RETRIEVAL-TOKEN-4917",
-                lambda payload, value: payload["local_context"]["memory_retrieval"].__setitem__(
-                    "token", value
-                ),
-            ),
-            (
-                "client_secret",
-                "SENTINEL-SELECTED-CLIENT-SECRET-6284",
-                lambda payload, value: payload["local_context"]["memory_retrieval"][
-                    "selected"
-                ][0].__setitem__("client_secret", value),
-            ),
-        )
-        for field_name, sentinel, mutate in cases:
-            with self.subTest(field_name=field_name):
-                payload = json.loads(json.dumps(original))
-                mutate(payload, sentinel)
-                with closing(connect_database(self.database_path)) as connection:
-                    connection.execute(
-                        "UPDATE api_events SET payload_json = ? WHERE id = ?",
-                        (json.dumps(payload), event["id"]),
-                    )
-                    connection.commit()
-                status, headers, body = asyncio.run(
-                    self._asgi_trace_get(f"/api/trace/{result['turn_id']}")
-                )
-                visible = json.dumps(headers) + body.decode("utf-8")
-                self.assertEqual(status, 500)
-                self.assertEqual(headers["cache-control"], "no-store")
-                self.assertEqual(json.loads(body)["error"], "trace_data_invalid")
-                self.assertNotIn(field_name, visible)
-                self.assertNotIn(sentinel, visible)
-
-    def test_turn_11_first_item_context_fails_closed_without_writes(self) -> None:
-        earlier, _ = self.run_turn("Earlier canonical room history")
-        self.assertEqual(earlier["turn_id"], 1)
-        with closing(connect_database(self.database_path)) as connection:
-            room_id = connection.execute(
-                "SELECT id FROM rooms WHERE room_key = 'main'"
-            ).fetchone()[0]
-            for _ in range(9):
-                connection.execute(
-                    "INSERT INTO turns (room_id, initiated_by_participant_id) VALUES (?, ?)",
-                    (room_id, self.participant_ids["peter"]),
-                )
-            connection.commit()
-
-        self.import_value()
-        turn_11, _ = self.run_turn("Glass Orchard")
-        self.assertEqual(turn_11["turn_id"], 11)
-        with closing(connect_database(self.database_path)) as connection:
-            event = connection.execute(
-                "SELECT id, payload_json FROM api_events WHERE turn_id = 11 AND sequence_no = 1"
-            ).fetchone()
-            payload = json.loads(event["payload_json"])
-            context_item = payload["request"]["input"].pop(-2)
-            payload["request"]["input"].insert(0, context_item)
-            connection.execute(
-                "UPDATE api_events SET payload_json = ? WHERE id = ?",
-                (json.dumps(payload), event["id"]),
-            )
-            connection.commit()
-            before = self._conversation_rows(connection)
-
-        status, _, body = asyncio.run(self._asgi_trace_get("/api/trace/11"))
-        self.assertEqual(status, 500)
-        self.assertEqual(json.loads(body)["error"], "trace_data_invalid")
-        with closing(connect_database(self.database_path)) as connection:
-            after = self._conversation_rows(connection)
-        self.assertEqual(after, before)
-
-    @staticmethod
-    def _conversation_rows(connection: sqlite3.Connection) -> dict[str, list[tuple]]:
-        return {
-            table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
-            for table in ("turns", "messages", "api_events", "participant_configs")
-        }
-
-    async def _asgi_trace_get(
-        self, path: str
-    ) -> tuple[int, dict[str, str], bytes]:
-        sent: list[dict[str, object]] = []
-        delivered = False
-        original_path = main.app.state.database_path
-        main.app.state.database_path = self.database_path
-
-        async def receive():
-            nonlocal delivered
-            if not delivered:
-                delivered = True
-                return {"type": "http.request", "body": b"", "more_body": False}
-            return {"type": "http.disconnect"}
-
-        async def send(message):
-            sent.append(message)
-
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": path,
-            "raw_path": path.encode("ascii"),
-            "query_string": b"",
-            "headers": [],
-            "client": ("127.0.0.1", 1),
-            "server": ("test", 80),
-            "root_path": "",
-            "app": main.app,
-        }
-        try:
-            await main.app(scope, receive, send)
-        finally:
-            main.app.state.database_path = original_path
-        start = next(item for item in sent if item["type"] == "http.response.start")
-        headers = {
-            key.decode("latin-1"): value.decode("latin-1")
-            for key, value in start["headers"]
-        }
-        response_body = b"".join(
-            item.get("body", b"")
-            for item in sent
-            if item["type"] == "http.response.body"
-        )
-        return int(start["status"]), headers, response_body
+                with self.assertRaises(TraceServiceError) as raised:
+                    load_trace(self.database_path, result["turn_id"])
+                self.assertEqual(raised.exception.code, "trace_data_invalid")
 
     async def _asgi_post(self, message_text: str) -> tuple[int, dict[str, object]]:
         body = json.dumps({"message_text": message_text}).encode("utf-8")

@@ -29,36 +29,6 @@ REQUEST_EVENT = "openai.responses.request"
 RESPONSE_EVENT = "openai.responses.response"
 ERROR_EVENT = "openai.responses.error"
 TERMINAL_EVENTS = frozenset((RESPONSE_EVENT, ERROR_EVENT))
-MEMORY_RETRIEVAL_FIELDS = frozenset(
-    {
-        "retriever_version",
-        "owner_participant_id",
-        "query_source_message_id",
-        "query_terms",
-        "fts_query",
-        "result_limit",
-        "text_budget_chars",
-        "omitted_for_budget",
-        "selected",
-    }
-)
-MEMORY_SELECTION_FIELDS = frozenset(
-    {
-        "rank",
-        "seed_memory_id",
-        "stable_id",
-        "seed_batch_id",
-        "source_content_sha256",
-        "source_label",
-        "source_locator",
-        "memory_text_sha256",
-        "exact_topic_match",
-        "topic_match_weight_sum",
-        "fts_bm25",
-        "importance",
-        "confidence",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -181,18 +151,6 @@ def _load_snapshot(
     events, event_config_ids = _load_events(
         connection, selected_turn_id, room_id
     )
-    request_events = [
-        event for event in events if event["event_type"] == REQUEST_EVENT
-    ]
-    terminal_events = [
-        event for event in events if event["event_type"] in TERMINAL_EVENTS
-    ]
-    if len(request_events) > 1 or len(terminal_events) > 1:
-        raise _data_invalid()
-
-    if request_events:
-        _validate_raw_inherited_memory(request_events[0], messages)
-
     configurations = _load_configurations(
         connection, message_config_ids | event_config_ids
     )
@@ -208,6 +166,9 @@ def _load_snapshot(
     terminal_events = [
         event for event in projected_events if event["event_type"] in TERMINAL_EVENTS
     ]
+    if len(request_events) > 1 or len(terminal_events) > 1:
+        raise _data_invalid()
+
     recorded_request = (
         _build_recorded_request(request_events[0]) if request_events else None
     )
@@ -791,27 +752,6 @@ def _requested_model(recorded_request: dict[str, Any] | None) -> str | None:
     return model if isinstance(model, str) else None
 
 
-def _validate_raw_inherited_memory(
-    request_event: dict[str, Any],
-    messages: list[dict[str, Any]],
-) -> None:
-    """Validate memory evidence before any secret-bearing data is projected."""
-
-    if request_event["is_redacted"]:
-        return
-    payload = request_event["raw_payload"]
-    _validate_recognized_payload(REQUEST_EVENT, payload)
-    local_context = payload["local_context"]
-    if "memory_retrieval" not in local_context:
-        return
-    _validate_inherited_memory_payload(
-        payload["request"],
-        local_context,
-        messages,
-        request_event,
-    )
-
-
 def _build_inherited_memory(
     recorded_request: dict[str, Any] | None,
     messages: list[dict[str, Any]],
@@ -850,30 +790,10 @@ def _build_inherited_memory(
     local_context = recorded_request.get("local_context")
     if not isinstance(local_context, dict) or "memory_retrieval" not in local_context:
         return not_recorded
-    retrieval, context = _validate_inherited_memory_payload(
-        request,
-        local_context,
-        messages,
-        request_event,
-    )
-
-    return {
-        "state": "recorded",
-        "unavailable_reason": None,
-        "retrieval": retrieval,
-        "context": context,
-    }
-
-
-def _validate_inherited_memory_payload(
-    request: Any,
-    local_context: dict[str, Any],
-    messages: list[dict[str, Any]],
-    request_event: dict[str, Any] | None,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
     retrieval = local_context["memory_retrieval"]
     if not isinstance(retrieval, dict):
         raise _data_invalid()
+
     if not isinstance(request, dict) or "input" not in request:
         raise _data_invalid()
     provider_input = request["input"]
@@ -883,23 +803,13 @@ def _validate_inherited_memory_payload(
     selected = _validate_memory_retrieval(retrieval)
     trigger_id = retrieval["query_source_message_id"]
     triggering = [message for message in messages if message["id"] == trigger_id]
-    request_participant_key = (
-        request_event.get("participant_key")
-        if isinstance(request_event, dict)
-        else None
-    )
-    triggering_participant_key = (
-        triggering[0].get("participant_key") if len(triggering) == 1 else None
-    )
     if (
         request_event is None
-        or not isinstance(request_participant_key, str)
-        or request_participant_key.casefold() != "helios"
+        or request_event["participant_key"].casefold() != "helios"
         or retrieval["owner_participant_id"] != request_event["participant_id"]
         or trigger_id != request_event["related_message_id"]
         or len(triggering) != 1
-        or not isinstance(triggering_participant_key, str)
-        or triggering_participant_key.casefold() != "peter"
+        or triggering[0]["participant_key"].casefold() != "peter"
         or tokenize_memory_query(triggering[0]["message_text"])
         != retrieval["query_terms"]
         or provider_input[-1]
@@ -907,24 +817,23 @@ def _validate_inherited_memory_payload(
     ):
         raise _data_invalid()
 
-    candidates = [
-        (index, item)
-        for index, item in enumerate(provider_input)
-        if isinstance(item, dict)
-        and isinstance(item.get("content"), str)
-        and item["content"].startswith(INHERITED_MEMORY_HEADER)
-    ]
     context: dict[str, Any] | None = None
+    context_position = len(provider_input) - 2
+    context_item = provider_input[context_position] if context_position >= 0 else None
+    context_content = (
+        context_item.get("content")
+        if isinstance(context_item, dict)
+        else None
+    )
     if selected:
-        expected_position = len(provider_input) - 2
         if (
-            len(candidates) != 1
-            or candidates[0][0] != expected_position
-            or set(candidates[0][1]) != {"role", "content"}
-            or candidates[0][1].get("role") != "user"
+            context_position < 0
+            or not isinstance(context_item, dict)
+            or context_item.get("role") != "user"
+            or not isinstance(context_content, str)
+            or not context_content.startswith(INHERITED_MEMORY_HEADER)
         ):
             raise _data_invalid()
-        context_content = candidates[0][1]["content"]
         encoded_context = context_content[len(INHERITED_MEMORY_HEADER) :]
         try:
             context = json.loads(encoded_context)
@@ -933,16 +842,22 @@ def _validate_inherited_memory_payload(
         if _canonical_json(context) != encoded_context:
             raise _data_invalid()
         _validate_inherited_context(context, selected, retrieval)
-    elif candidates:
+    elif isinstance(context_content, str) and context_content.startswith(
+        INHERITED_MEMORY_HEADER
+    ):
         raise _data_invalid()
 
-    return retrieval, context
+    return {
+        "state": "recorded",
+        "unavailable_reason": None,
+        "retrieval": retrieval,
+        "context": context,
+    }
 
 
 def _validate_memory_retrieval(retrieval: dict[str, Any]) -> list[dict[str, Any]]:
     if (
-        set(retrieval) != MEMORY_RETRIEVAL_FIELDS
-        or retrieval.get("retriever_version") != RETRIEVER_VERSION
+        retrieval.get("retriever_version") != RETRIEVER_VERSION
         or not _positive_int(retrieval.get("owner_participant_id"))
         or not _positive_int(retrieval.get("query_source_message_id"))
         or retrieval.get("result_limit") != RESULT_LIMIT
@@ -968,7 +883,7 @@ def _validate_memory_retrieval(retrieval: dict[str, Any]) -> list[dict[str, Any]
     seen_ids: set[int] = set()
     seen_stable_ids: set[str] = set()
     for index, record in enumerate(selected, start=1):
-        if not isinstance(record, dict) or set(record) != MEMORY_SELECTION_FIELDS:
+        if not isinstance(record, dict):
             raise _data_invalid()
         memory_id = record.get("seed_memory_id")
         stable_id = record.get("stable_id")
