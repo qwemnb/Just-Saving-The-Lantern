@@ -787,8 +787,8 @@ class BrowserCacheContractTests(unittest.TestCase):
         response = asyncio.run(self.request("/"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
-        self.assertIn("style.css?v=schema-preflight-ui-v1", response.text)
-        self.assertIn("app.js?v=schema-preflight-ui-v1", response.text)
+        self.assertIn("style.css?v=gemini-participant-v1", response.text)
+        self.assertIn("app.js?v=gemini-participant-v1", response.text)
 
 
 if __name__ == "__main__":

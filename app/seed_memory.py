@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .database import EXPECTED_SCHEMA_MIGRATIONS, connect_database
+from .participant_registry import registration_for
+from .schema_validation import validate_database_integrity, validate_v13_foundation
 
 
 RETRIEVER_VERSION = "seed-fts-topic-v1"
@@ -332,6 +334,8 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
 def import_seed_memories(
     database_path: Path | str,
     manifest: ValidatedSeedManifest,
+    *,
+    owner_participant_key: str = "helios",
 ) -> dict[str, Any]:
     """Atomically import or verify one canonical seed-memory graph."""
 
@@ -351,7 +355,15 @@ def import_seed_memories(
     try:
         connection.execute("BEGIN IMMEDIATE")
         _validate_schema(connection)
-        helios_id = _resolve_participant(connection, "helios", owner=True)
+        try:
+            validate_v13_foundation(connection)
+            validate_database_integrity(connection)
+        except Exception as exception:
+            raise SeedMemoryError(
+                "seed_database_unavailable",
+                "The configured seed-memory database is unavailable or incompatible.",
+            ) from exception
+        owner_id = _resolve_owner(connection, owner_participant_key)
         subject_ids = _resolve_subjects(connection, manifest.value["memories"])
         matching = connection.execute(
             """
@@ -371,7 +383,7 @@ def import_seed_memories(
             if not _stored_graph_matches(
                 connection,
                 matching[0],
-                helios_id,
+                owner_id,
                 subject_ids,
                 manifest,
             ):
@@ -381,7 +393,13 @@ def import_seed_memories(
                 )
             versions = _version_report(connection, batch_id)
             connection.rollback()
-            return _import_report("already_imported", batch_id, manifest, versions)
+            return _import_report(
+                "already_imported",
+                batch_id,
+                manifest,
+                versions,
+                owner_participant_key,
+            )
 
         stable_ids = [memory["stable_id"] for memory in manifest.value["memories"]]
         placeholders = ",".join("?" for _ in stable_ids)
@@ -391,7 +409,7 @@ def import_seed_memories(
             WHERE owner_participant_id = ?
               AND source_record_id IN ({placeholders})
             """,
-            (helios_id, *stable_ids),
+            (owner_id, *stable_ids),
         ).fetchall()
         if conflicts:
             raise SeedMemoryError(
@@ -430,7 +448,7 @@ def import_seed_memories(
                 """,
                 (
                     batch_id,
-                    helios_id,
+                    owner_id,
                     memory["memory_text"],
                     memory["category"],
                     memory["importance"],
@@ -461,7 +479,13 @@ def import_seed_memories(
                 {"stable_id": memory["stable_id"], "seed_memory_id": memory_id}
             )
         connection.commit()
-        return _import_report("imported", batch_id, manifest, versions)
+        return _import_report(
+            "imported",
+            batch_id,
+            manifest,
+            versions,
+            owner_participant_key,
+        )
     except SeedMemoryError:
         if connection.in_transaction:
             connection.rollback()
@@ -515,6 +539,43 @@ def _resolve_participant(
         )
         raise SeedMemoryError(code, message)
     return row["id"]
+
+
+def _resolve_owner(connection: sqlite3.Connection, participant_key: str) -> int:
+    """Resolve one registered, active AI owner after foundation validation."""
+
+    if not isinstance(participant_key, str) or not participant_key:
+        raise SeedMemoryError(
+            "seed_owner_participant_invalid",
+            "The seed-memory owner participant is unavailable.",
+        )
+    rows = connection.execute(
+        """SELECT id, participant_key, participant_type
+           FROM participants WHERE participant_key = ?""",
+        (participant_key,),
+    ).fetchall()
+    if (
+        len(rows) != 1
+        or rows[0]["participant_type"] != "ai"
+        or registration_for(rows[0]["participant_key"]) is None
+    ):
+        raise SeedMemoryError(
+            "seed_owner_participant_invalid",
+            "The seed-memory owner participant is unavailable.",
+        )
+    active = connection.execute(
+        """SELECT count(*)
+           FROM room_participants AS rp
+           JOIN rooms AS r ON r.id = rp.room_id AND r.room_key = 'main'
+           WHERE rp.participant_id = ? AND rp.left_at IS NULL""",
+        (rows[0]["id"],),
+    ).fetchone()[0]
+    if active != 1:
+        raise SeedMemoryError(
+            "seed_owner_participant_invalid",
+            "The seed-memory owner participant is unavailable.",
+        )
+    return rows[0]["id"]
 
 
 def _resolve_subjects(
@@ -574,7 +635,7 @@ def _find_or_create_topics(
 def _stored_graph_matches(
     connection: sqlite3.Connection,
     batch_row: sqlite3.Row,
-    helios_id: int,
+    owner_id: int,
     subject_ids: dict[str, int],
     manifest: ValidatedSeedManifest,
 ) -> bool:
@@ -626,7 +687,7 @@ def _stored_graph_matches(
         )
         expected = (
             batch_row["id"],
-            helios_id,
+            owner_id,
             memory["memory_text"],
             memory["category"],
             memory["importance"],
@@ -698,11 +759,13 @@ def _import_report(
     batch_id: int,
     manifest: ValidatedSeedManifest,
     versions: list[dict[str, Any]],
+    owner_participant_key: str,
 ) -> dict[str, Any]:
     return {
         "status": status,
         "seed_batch_id": batch_id,
         "source_content_sha256": manifest.source_content_sha256,
+        "owner_participant_key": owner_participant_key,
         "memory_count": len(versions),
         "memories": versions,
     }

@@ -20,8 +20,8 @@ class DatabaseInitializationTests(unittest.TestCase):
 
         self.assertEqual(report.schema_label, "1.3")
         self.assertEqual(report.room_count, 1)
-        self.assertEqual(report.participant_count, 3)
-        self.assertEqual(report.active_membership_count, 2)
+        self.assertEqual(report.participant_count, 4)
+        self.assertEqual(report.active_membership_count, 3)
         self.assertEqual(report.helios_config_count, 1)
         self.assertEqual(report.integrity_check, "ok")
         self.assertEqual(report.foreign_key_violations, 0)
@@ -56,6 +56,7 @@ class DatabaseInitializationTests(unittest.TestCase):
         self.assertEqual(
             [tuple(row) for row in participants],
             [
+                ("gemini", "Gemini", "ai"),
                 ("helios", "Helios", "ai"),
                 ("peter", "Peter", "human"),
                 ("room-system", "Room", "system"),
@@ -71,8 +72,8 @@ class DatabaseInitializationTests(unittest.TestCase):
         report = initialize_database(self.database_path)
 
         self.assertEqual(report.room_count, 1)
-        self.assertEqual(report.participant_count, 3)
-        self.assertEqual(report.active_membership_count, 2)
+        self.assertEqual(report.participant_count, 4)
+        self.assertEqual(report.active_membership_count, 3)
         self.assertEqual(report.helios_config_count, 1)
 
     def test_connections_enforce_foreign_keys(self) -> None:

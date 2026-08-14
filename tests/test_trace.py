@@ -212,7 +212,7 @@ class TraceFixture(unittest.TestCase):
             }
         )
         config_id = self.add_config(settings_json=settings)
-        self.add_message(
+        helios_message = self.add_message(
             turn_id,
             "Visible Helios output",
             participant_id=self.helios_id,
@@ -245,13 +245,6 @@ class TraceFixture(unittest.TestCase):
         self.add_event(
             turn_id,
             2,
-            "future.scalar",
-            17,
-            related_message_id=earlier_message,
-        )
-        self.add_event(
-            turn_id,
-            3,
             "openai.responses.response",
             {
                 "response": {
@@ -293,6 +286,14 @@ class TraceFixture(unittest.TestCase):
             },
             config_id=config_id,
             participant_id=self.helios_id,
+            related_message_id=helios_message,
+        )
+        self.add_event(
+            turn_id,
+            3,
+            "future.scalar",
+            17,
+            related_message_id=earlier_message,
         )
         return turn_id, peter_message, config_id
 
@@ -387,7 +388,7 @@ class TraceCommandTests(TraceFixture):
             self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM api_events").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM admin_events").fetchone()[0], 0)
-            self.assertEqual(connection.execute("SELECT count(*) FROM participants").fetchone()[0], 3)
+            self.assertEqual(connection.execute("SELECT count(*) FROM participants").fetchone()[0], 4)
             self.assertEqual(connection.execute("SELECT count(*) FROM participant_configs").fetchone()[0], 1)
 
         accepted_turn = self.add_turn()
@@ -455,14 +456,14 @@ class TraceProjectionTests(TraceFixture):
             config["omitted_json_pointers"],
             [
                 "/settings/apiKey",
-                "/settings/a~1b/token",
                 "/settings/a~0b/0/clientSecret",
+                "/settings/a~1b/token",
             ],
         )
         self.assertEqual([event["sequence_no"] for event in trace["api_events"]], [1, 2, 3])
-        self.assertEqual(trace["api_events"][1]["payload"], 17)
-        self.assertEqual(trace["api_events"][1]["related_message_outside_selected_turn"], True)
-        self.assertNotEqual(trace["api_events"][1]["related_message_turn_id"], turn_id)
+        self.assertEqual(trace["api_events"][2]["payload"], 17)
+        self.assertEqual(trace["api_events"][2]["related_message_outside_selected_turn"], True)
+        self.assertNotEqual(trace["api_events"][2]["related_message_turn_id"], turn_id)
         request = trace["recorded_request"]
         self.assertEqual(request["request"]["model"], "historical-request-model")
         self.assertNotIn("headers", request["request"])
@@ -473,7 +474,7 @@ class TraceProjectionTests(TraceFixture):
         self.assertEqual(outcome["resolved_model"], "historical-resolved-model")
         self.assertEqual(outcome["output_text"], "Visible output")
         self.assertEqual(outcome["usage"]["output_tokens_details"]["reasoning_tokens"], 2)
-        response_event = trace["api_events"][2]
+        response_event = trace["api_events"][1]
         reasoning = response_event["payload"]["response"]["output"][0]
         self.assertEqual(reasoning["summary_label"], "Provider-generated reasoning summary")
         self.assertEqual(reasoning["summary"][0]["text"], "Recorded provider summary")
@@ -587,9 +588,23 @@ class TraceProjectionTests(TraceFixture):
 
     def test_terminal_without_request_and_error_allowlist(self) -> None:
         turn_id = self.add_turn(status="failed")
+        peter_message = self.add_message(turn_id, "Accepted request")
+        config_id = self.add_config()
         self.add_event(
             turn_id,
             1,
+            "openai.responses.request",
+            {
+                "request": {"model": "recorded", "input": []},
+                "local_context": {"trigger_message_id": peter_message},
+            },
+            participant_id=self.helios_id,
+            config_id=config_id,
+            related_message_id=peter_message,
+        )
+        self.add_event(
+            turn_id,
+            2,
             "openai.responses.error",
             {
                 "error": {
@@ -604,23 +619,40 @@ class TraceProjectionTests(TraceFixture):
                 },
                 "exception_object": {"anything": "unsafe"},
             },
+            participant_id=self.helios_id,
+            config_id=config_id,
+            related_message_id=peter_message,
         )
         trace = load_trace(self.database_path, turn_id)
         outcome = trace["provider_outcome"]
-        self.assertIsNone(outcome["requested_model"])
+        self.assertEqual(outcome["requested_model"], "recorded")
         self.assertEqual(outcome["error"]["http_status"], 429)
         serialized = json.dumps(trace)
         self.assertNotIn("private/file", serialized)
         self.assertNotIn("SELECT secret", serialized)
         self.assertNotIn("unsafe\"", serialized)
-        self.assertIn("/error/traceback", trace["api_events"][0]["omitted_json_pointers"])
-        self.assertIn("/exception_object", trace["api_events"][0]["omitted_json_pointers"])
+        self.assertIn("/error/traceback", trace["api_events"][1]["omitted_json_pointers"])
+        self.assertIn("/exception_object", trace["api_events"][1]["omitted_json_pointers"])
 
     def test_unusable_response_error_shape_is_allowlisted(self) -> None:
         turn_id = self.add_turn(status="failed")
+        peter_message = self.add_message(turn_id, "Accepted request")
+        config_id = self.add_config()
         self.add_event(
             turn_id,
             1,
+            "openai.responses.request",
+            {
+                "request": {"model": "recorded", "input": []},
+                "local_context": {"trigger_message_id": peter_message},
+            },
+            participant_id=self.helios_id,
+            config_id=config_id,
+            related_message_id=peter_message,
+        )
+        self.add_event(
+            turn_id,
+            2,
             "openai.responses.error",
             {
                 "reason": "provider_incomplete",
@@ -634,8 +666,11 @@ class TraceProjectionTests(TraceFixture):
                     "output": [{"private": "object"}],
                 },
             },
+            participant_id=self.helios_id,
+            config_id=config_id,
+            related_message_id=peter_message,
         )
-        event = load_trace(self.database_path, turn_id)["api_events"][0]
+        event = load_trace(self.database_path, turn_id)["api_events"][1]
         self.assertEqual(event["payload"]["response"]["id"], "resp_bad")
         self.assertNotIn("headers_dump", event["payload"]["response"])
         self.assertNotIn("output", event["payload"]["response"])

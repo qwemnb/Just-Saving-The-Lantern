@@ -160,16 +160,19 @@ def _seed_initial_room(connection: sqlite3.Connection) -> None:
         room_id = _ensure_room(connection)
         peter_id = _ensure_participant(connection, "peter", "Peter", "human")
         helios_id = _ensure_participant(connection, "helios", "Helios", "ai")
+        gemini_id = _ensure_participant(connection, "gemini", "Gemini", "ai")
         room_system_id = _ensure_participant(
             connection, "room-system", "Room", "system"
         )
 
         _ensure_identity_bootstrap(connection, peter_id, "Peter")
         _ensure_identity_bootstrap(connection, helios_id, "Helios")
+        _ensure_identity_bootstrap(connection, gemini_id, "Gemini")
         _ensure_identity_bootstrap(connection, room_system_id, "Room")
 
         _ensure_active_membership(connection, room_id, peter_id)
         _ensure_active_membership(connection, room_id, helios_id)
+        _ensure_active_membership(connection, room_id, gemini_id)
         _ensure_initial_helios_config(connection, helios_id)
     except Exception:
         connection.rollback()

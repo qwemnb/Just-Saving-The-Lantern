@@ -12,7 +12,9 @@ const {
     NO_MEMORY_RETRIEVAL,
     NETWORK_READ_ERROR,
     HISTORY_READ_FALLBACK,
-    DIRECTORY_READ_FALLBACK
+    DIRECTORY_READ_FALLBACK,
+    POST_ERROR_FALLBACK,
+    sendMessage
 } = require('../static/app.js');
 
 
@@ -552,6 +554,43 @@ test('invalid JSON, non-JSON, and network history failures use exact safe fallba
 });
 
 
+test('POST errors ignore attacker-controlled server messages and trust only positive accepted IDs', async () => {
+    const hostile = '<img src=x onerror=alert("PRIVATE")>';
+    for (const [payload, expected, accepted] of [
+        [
+            { error: 'gemini_provider_failure', message: hostile, turn_id: 7, peter_message_id: 8 },
+            'Gemini could not respond. Your message was saved.',
+            true
+        ],
+        [
+            { error: 'future_attacker_code', message: hostile, turn_id: 7, peter_message_id: 8 },
+            POST_ERROR_FALLBACK,
+            true
+        ],
+        [
+            { error: 'gemini_provider_failure', message: hostile, turn_id: '7', peter_message_id: 8 },
+            'Gemini could not respond. Your message was saved.',
+            false
+        ]
+    ]) {
+        await assert.rejects(
+            sendMessage('exact text', { kind: 'participant', participant_key: 'gemini' },
+                async () => response(false, payload, 502)),
+            error => error.message === expected
+                && error.postAccepted === accepted
+                && !error.message.includes('PRIVATE')
+        );
+    }
+    await assert.rejects(
+        sendMessage('exact text', { kind: 'participant', participant_key: 'gemini' },
+            async () => { throw new Error(hostile); }),
+        error => error.message === POST_ERROR_FALLBACK
+            && error.postAccepted === false
+            && error.code === null
+    );
+});
+
+
 test('directory failures are independent, local, and keep sending disabled', async () => {
     const doc = makeDirectoryDocument();
     const hostile = '<script>PRIVATE DIRECTORY</script>';
@@ -622,8 +661,8 @@ test('static read statuses, cache tokens, and focus-visible selectors are presen
     const css = fs.readFileSync(path.join(__dirname, '..', 'static', 'style.css'), 'utf8');
     assert.match(html, /id="history-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
     assert.match(html, /id="participant-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
-    assert.match(html, /style\.css\?v=schema-preflight-ui-v1/);
-    assert.match(html, /app\.js\?v=schema-preflight-ui-v1/);
+    assert.match(html, /style\.css\?v=gemini-participant-v1/);
+    assert.match(html, /app\.js\?v=gemini-participant-v1/);
     assert.match(css, /button:focus-visible/);
     assert.match(css, /input:focus-visible/);
 });

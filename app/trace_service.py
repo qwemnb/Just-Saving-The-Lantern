@@ -13,6 +13,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .identity_service import ParticipantNameError, validate_display_alias
+from .gemini_client import (
+    FAILURE_KINDS as GEMINI_FAILURE_KINDS,
+    GEMINI_SYSTEM_INSTRUCTIONS,
+    MAX_SAFE_INTEGER,
+    TOKEN_COUNT_FIELDS as GEMINI_TOKEN_COUNT_FIELDS,
+    content_from_recorded,
+    recorded_settings as gemini_recorded_settings,
+    validate_bounded_stored_response,
+    validate_recorded_google_request_payload,
+    validate_stored_success_response,
+)
 from .read_snapshot import ReadSnapshotError, run_read_snapshot
 from .schema_validation import SchemaValidationError, validate_v13_foundation
 from .seed_memory import (
@@ -30,7 +41,14 @@ ROOM_KEY = "main"
 REQUEST_EVENT = "openai.responses.request"
 RESPONSE_EVENT = "openai.responses.response"
 ERROR_EVENT = "openai.responses.error"
-TERMINAL_EVENTS = frozenset((RESPONSE_EVENT, ERROR_EVENT))
+GOOGLE_REQUEST_EVENT = "google.generate_content.request"
+GOOGLE_RESPONSE_EVENT = "google.generate_content.response"
+GOOGLE_ERROR_EVENT = "google.generate_content.error"
+REQUEST_EVENTS = frozenset((REQUEST_EVENT, GOOGLE_REQUEST_EVENT))
+RESPONSE_EVENTS = frozenset((RESPONSE_EVENT, GOOGLE_RESPONSE_EVENT))
+ERROR_EVENTS = frozenset((ERROR_EVENT, GOOGLE_ERROR_EVENT))
+TERMINAL_EVENTS = RESPONSE_EVENTS | ERROR_EVENTS
+RECOGNIZED_EVENTS = REQUEST_EVENTS | TERMINAL_EVENTS
 MEMORY_RETRIEVAL_FIELDS = frozenset(
     {
         "retriever_version",
@@ -138,9 +156,7 @@ def _load_snapshot(
     events, event_config_ids = _load_events(
         connection, selected_turn_id, room_id
     )
-    request_events = [
-        event for event in events if event["event_type"] == REQUEST_EVENT
-    ]
+    request_events = [event for event in events if event["event_type"] in REQUEST_EVENTS]
     terminal_events = [
         event for event in events if event["event_type"] in TERMINAL_EVENTS
     ]
@@ -157,11 +173,10 @@ def _load_snapshot(
     _validate_configuration_references(
         messages, events, configurations_by_id
     )
+    _validate_event_family(turn, messages, events, configurations_by_id)
 
     projected_events = [_project_event(event) for event in events]
-    request_events = [
-        event for event in projected_events if event["event_type"] == REQUEST_EVENT
-    ]
+    request_events = [event for event in projected_events if event["event_type"] in REQUEST_EVENTS]
     terminal_events = [
         event for event in projected_events if event["event_type"] in TERMINAL_EVENTS
     ]
@@ -614,6 +629,105 @@ def _validate_configuration_references(
             raise _data_invalid()
 
 
+def _validate_event_family(
+    turn: sqlite3.Row,
+    messages: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    configurations: dict[int, dict[str, Any]],
+) -> None:
+    """Validate provider family, state cardinality, and correlations."""
+
+    recognized = [event for event in events if event["event_type"] in RECOGNIZED_EVENTS]
+    if not recognized:
+        return
+    families = {
+        "google" if event["event_type"].startswith("google.") else "openai"
+        for event in recognized
+    }
+    if len(families) != 1:
+        raise _data_invalid()
+    family = next(iter(families))
+    request = [event for event in recognized if event["event_type"] in REQUEST_EVENTS]
+    terminal = [event for event in recognized if event["event_type"] in TERMINAL_EVENTS]
+    if len(request) != 1 or request[0]["sequence_no"] != 1:
+        raise _data_invalid()
+    status = turn["status"]
+    if status == "open":
+        if terminal:
+            raise _data_invalid()
+    elif status in {"completed", "failed", "cancelled"}:
+        if len(terminal) != 1 or terminal[0]["sequence_no"] != 2:
+            raise _data_invalid()
+    else:
+        raise _data_invalid()
+    # Redacted events remain cardinality evidence, but cannot establish the
+    # payload-dependent replay and message-correlation facts below.
+    if any(event["is_redacted"] for event in recognized):
+        return
+    expected_key = "gemini" if family == "google" else "helios"
+    config = configurations.get(request[0]["participant_config_id"])
+    peter_messages = [
+        message for message in messages
+        if message["participant_key"] == "peter" and message["message_type"] == "chat"
+    ]
+    if (
+        request[0]["participant_key"] != expected_key
+        or config is None
+        or config["participant_key"] != expected_key
+        or config["provider"] != family
+        or len(peter_messages) != 1
+        or request[0]["related_message_id"] != peter_messages[0]["id"]
+        or request[0]["related_message_turn_id"] != turn["id"]
+    ):
+        raise _data_invalid()
+    if family == "google":
+        model = request[0]["raw_payload"]["request"].get("model")
+        slug = (
+            re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+            if isinstance(model, str)
+            else ""
+        ) or "model"
+        label = config["config_label"]
+        prefix = f"seed-memory-google-{slug}-v"
+        if (
+            config["model"] != model
+            or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS
+            or config["settings"] != gemini_recorded_settings()
+            or config["tools"] != []
+            or not isinstance(label, str)
+            or not label.startswith(prefix)
+            or not label[len(prefix):].isdigit()
+            or int(label[len(prefix):]) <= 0
+        ):
+            raise _data_invalid()
+    if status == "open":
+        return
+    if (
+        terminal[0]["participant_key"] != expected_key
+        or terminal[0]["participant_config_id"] != request[0]["participant_config_id"]
+    ):
+        raise _data_invalid()
+    if status == "completed":
+        ai_messages = [
+            message for message in messages
+            if message["participant_key"] == expected_key and message["message_type"] == "chat"
+        ]
+        if (
+            terminal[0]["event_type"] not in RESPONSE_EVENTS
+            or len(ai_messages) != 1
+            or terminal[0]["related_message_id"] != ai_messages[0]["id"]
+        ):
+            raise _data_invalid()
+    elif status == "failed":
+        if (
+            terminal[0]["event_type"] not in ERROR_EVENTS
+            or terminal[0]["related_message_id"] != peter_messages[0]["id"]
+        ):
+            raise _data_invalid()
+    elif status != "cancelled":
+        raise _data_invalid()
+
+
 def _project_event(event: dict[str, Any]) -> dict[str, Any]:
     raw_payload = event["raw_payload"]
     event_type = event["event_type"]
@@ -621,7 +735,11 @@ def _project_event(event: dict[str, Any]) -> dict[str, Any]:
     if not redacted:
         _validate_recognized_payload(event_type, raw_payload)
 
-    if event_type == ERROR_EVENT and not redacted:
+    if event_type == GOOGLE_RESPONSE_EVENT and not redacted:
+        payload, omissions = _project_google_response_envelope(raw_payload)
+    elif event_type == GOOGLE_ERROR_EVENT and not redacted:
+        payload, omissions = _project_google_error_payload(raw_payload)
+    elif event_type in ERROR_EVENTS and not redacted:
         payload, omissions = _project_error_payload(raw_payload)
     else:
         payload, omissions = project_trace_json(raw_payload)
@@ -670,6 +788,234 @@ def _validate_recognized_payload(event_type: str, payload: Any) -> None:
         )
         if provider_error == unusable_response:
             raise _data_invalid()
+    elif event_type == GOOGLE_REQUEST_EVENT:
+        _validate_google_request_payload(payload)
+    elif event_type == GOOGLE_RESPONSE_EVENT:
+        if not isinstance(payload, dict) or set(payload) != {"response"}:
+            raise _data_invalid()
+        response = validate_bounded_stored_response(payload["response"])
+        validate_stored_success_response(response)
+    elif event_type == GOOGLE_ERROR_EVENT:
+        _validate_google_error_payload(payload)
+
+
+def _validate_google_request_payload(payload: Any) -> None:
+    try:
+        validate_recorded_google_request_payload(payload)
+    except (TypeError, ValueError) as exception:
+        raise _data_invalid() from exception
+
+
+def _validate_google_error_payload(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        raise _data_invalid()
+    if set(payload) == {"error"}:
+        error = payload["error"]
+        if not isinstance(error, dict):
+            raise _data_invalid()
+        reason = error.get("reason")
+        if reason == "gemini_provider_failure":
+            required = {
+                "error_class": "ProviderError",
+                "reason": reason,
+                "summary": "The Gemini provider request failed.",
+            }
+            optional = {"http_status", "provider_error_code", "provider_request_id"}
+        elif reason == "gemini_provider_timeout":
+            required = {
+                "error_class": "TimeoutError",
+                "reason": reason,
+                "summary": "The Gemini provider request timed out.",
+            }
+            optional = {"http_status", "provider_error_code", "provider_request_id"}
+        elif reason == "gemini_provider_response_serialization_failed":
+            required = {
+                "error_class": "ResponseSerializationError",
+                "reason": reason,
+                "summary": "The Gemini provider response could not be recorded safely.",
+            }
+            optional = set()
+        else:
+            raise _data_invalid()
+        if not set(error).issubset(set(required) | optional):
+            raise _data_invalid()
+        if any(error.get(key) != value for key, value in required.items()):
+            raise _data_invalid()
+        if "http_status" in error and (
+            type(error["http_status"]) is not int or not 100 <= error["http_status"] <= 599
+        ):
+            raise _data_invalid()
+        for key, limit in (("provider_error_code", 128), ("provider_request_id", 256)):
+            if key in error and (
+                not isinstance(error[key], str)
+                or re.fullmatch(rf"[A-Za-z0-9_.:-]{{1,{limit}}}", error[key]) is None
+            ):
+                raise _data_invalid()
+        return
+    if set(payload) != {"error", "response"}:
+        raise _data_invalid()
+    error = payload["error"]
+    if (
+        not isinstance(error, dict)
+        or set(error) != {"failure_kind", "reason", "summary"}
+        or error.get("failure_kind") not in GEMINI_FAILURE_KINDS
+        or error.get("reason") != "gemini_provider_unusable_response"
+        or error.get("summary") != "The Gemini provider returned an unusable response."
+    ):
+        raise _data_invalid()
+    validate_bounded_stored_response(payload["response"])
+
+
+def _project_google_response_envelope(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    response, omissions = _project_google_response(
+        payload["response"], ("response",), allow_visible_text=True
+    )
+    return {"response": response}, omissions
+
+
+def _project_google_error_payload(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    error = dict(payload["error"])
+    if "response" not in payload:
+        return {"error": error}, []
+    response, omissions = _project_google_response(
+        payload["response"], ("response",), allow_visible_text=False
+    )
+    return {"error": error, "response": response}, omissions
+
+
+def _project_google_response(
+    response: dict[str, Any],
+    base: tuple[str | int, ...],
+    *,
+    allow_visible_text: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    """Project only the closed Gemini Trace surface; omit extensions wholesale."""
+
+    result: dict[str, Any] = {}
+    omissions: list[str] = []
+    trace_top = {"candidates", "model_version", "prompt_feedback", "usage_metadata"}
+    for key, value in response.items():
+        path = (*base, key)
+        if key not in trace_top:
+            omissions.append(_json_pointer(path))
+            continue
+        if key == "candidates" and isinstance(value, list):
+            candidates: list[Any] = []
+            for index, candidate in enumerate(value):
+                if not isinstance(candidate, dict):
+                    omissions.append(_json_pointer((*path, index)))
+                    continue
+                candidate_result: dict[str, Any] = {}
+                for candidate_key, candidate_value in candidate.items():
+                    candidate_path = (*path, index, candidate_key)
+                    if candidate_key in {"finish_reason", "index"}:
+                        projected, child = project_trace_json(candidate_value, candidate_path)
+                        candidate_result[candidate_key] = projected
+                        omissions.extend(child)
+                    elif candidate_key == "safety_ratings":
+                        projected, child = _project_google_safety_ratings(
+                            candidate_value, candidate_path
+                        )
+                        candidate_result[candidate_key] = projected
+                        omissions.extend(child)
+                    elif candidate_key == "content" and isinstance(candidate_value, dict):
+                        content_result: dict[str, Any] = {}
+                        for content_key in candidate_value:
+                            if content_key not in {"role", "parts"}:
+                                omissions.append(
+                                    _json_pointer((*candidate_path, content_key))
+                                )
+                        if "role" in candidate_value:
+                            content_result["role"] = candidate_value["role"]
+                        parts_result: list[dict[str, Any]] = []
+                        raw_parts = candidate_value.get("parts")
+                        if not isinstance(raw_parts, list):
+                            omissions.append(_json_pointer((*candidate_path, "parts")))
+                            raw_parts = []
+                        for part_index, part in enumerate(raw_parts):
+                            part_path = (*candidate_path, "parts", part_index)
+                            if not isinstance(part, dict):
+                                omissions.append(_json_pointer(part_path))
+                                continue
+                            part_result: dict[str, Any] = {}
+                            is_thought = part.get("thought") is True
+                            for part_key, part_value in part.items():
+                                item_path = (*part_path, part_key)
+                                if part_key == "thought_signature_b64" or (
+                                    part_key == "text"
+                                    and (is_thought or not allow_visible_text)
+                                ):
+                                    omissions.append(_json_pointer(item_path))
+                                elif part_key in {"text", "thought"}:
+                                    part_result[part_key] = part_value
+                                else:
+                                    omissions.append(_json_pointer(item_path))
+                            parts_result.append(part_result)
+                        content_result["parts"] = parts_result
+                        candidate_result["content"] = content_result
+                    else:
+                        omissions.append(_json_pointer(candidate_path))
+                candidates.append(candidate_result)
+            result[key] = candidates
+        elif key == "usage_metadata" and isinstance(value, dict):
+            usage: dict[str, Any] = {}
+            for usage_key, usage_value in value.items():
+                usage_path = (*path, usage_key)
+                if usage_key in GEMINI_TOKEN_COUNT_FIELDS:
+                    usage[usage_key] = usage_value
+                else:
+                    omissions.append(_json_pointer(usage_path))
+            result[key] = usage
+        elif key == "prompt_feedback" and isinstance(value, dict):
+            feedback: dict[str, Any] = {}
+            for feedback_key, feedback_value in value.items():
+                feedback_path = (*path, feedback_key)
+                if feedback_key == "block_reason":
+                    projected, child = project_trace_json(feedback_value, feedback_path)
+                    feedback[feedback_key] = projected
+                    omissions.extend(child)
+                elif feedback_key == "safety_ratings":
+                    projected, child = _project_google_safety_ratings(
+                        feedback_value, feedback_path
+                    )
+                    feedback[feedback_key] = projected
+                    omissions.extend(child)
+                else:
+                    omissions.append(_json_pointer(feedback_path))
+            result[key] = feedback
+        elif key in {"model_version"}:
+            result[key] = value
+        else:
+            omissions.append(_json_pointer(path))
+    return result, sorted(set(omissions))
+
+
+def _project_google_safety_ratings(
+    value: Any,
+    base: tuple[str | int, ...],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not isinstance(value, list):
+        return [], [_json_pointer(base)]
+    projected: list[dict[str, Any]] = []
+    omissions: list[str] = []
+    for index, rating in enumerate(value):
+        path = (*base, index)
+        if not isinstance(rating, dict):
+            omissions.append(_json_pointer(path))
+            continue
+        item: dict[str, Any] = {}
+        for key, child in rating.items():
+            child_path = (*path, key)
+            if key in {"category", "probability", "blocked"}:
+                item[key] = child
+            else:
+                omissions.append(_json_pointer(child_path))
+        projected.append(item)
+    return projected, omissions
 
 
 def _project_error_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -736,6 +1082,7 @@ def project_trace_json(
             _normalize_key(key) == "type" and _normalized_value(child) == "reasoning"
             for key, child in item.items()
         )
+        gemini_thought_part = item.get("thought") is True
         projected: dict[str, Any] = {}
         summary_retained = False
         for key, child in item.items():
@@ -743,7 +1090,11 @@ def project_trace_json(
             child_path = (*path, key)
             omit = (
                 _is_secret_key(normalized)
-                or normalized in {"encryptedcontent", "reasoningtext"}
+                or normalized in {
+                    "encryptedcontent", "reasoningtext", "thoughtsignature",
+                    "thoughtsignatureb64",
+                }
+                or (gemini_thought_part and normalized == "text")
                 or (reasoning_item and normalized not in {"id", "type", "status", "summary"})
             )
             if omit:
@@ -801,7 +1152,7 @@ def _json_pointer(path: tuple[str | int, ...]) -> str:
 
 
 def _unique(values: Iterable[str]) -> list[str]:
-    return list(dict.fromkeys(values))
+    return sorted(set(values))
 
 
 def _build_recorded_request(event: dict[str, Any]) -> dict[str, Any]:
@@ -871,7 +1222,9 @@ def _build_inherited_memory(
     request = recorded_request.get("request")
     omissions = recorded_request.get("omitted_json_pointers", [])
     input_omitted = any(
-        pointer == "/request/input" or pointer.startswith("/request/input/")
+        pointer in {"/request/input", "/request/contents"}
+        or pointer.startswith("/request/input/")
+        or pointer.startswith("/request/contents/")
         for pointer in omissions
     )
     if input_omitted:
@@ -909,9 +1262,13 @@ def _validate_inherited_memory_payload(
     retrieval = local_context["memory_retrieval"]
     if not isinstance(retrieval, dict):
         raise _data_invalid()
-    if not isinstance(request, dict) or "input" not in request:
+    if not isinstance(request, dict):
         raise _data_invalid()
-    provider_input = request["input"]
+    is_gemini = "contents" in request
+    input_key = "contents" if is_gemini else "input"
+    if input_key not in request:
+        raise _data_invalid()
+    provider_input = request[input_key]
     if not isinstance(provider_input, list) or not provider_input:
         raise _data_invalid()
 
@@ -929,7 +1286,7 @@ def _validate_inherited_memory_payload(
     if (
         request_event is None
         or not isinstance(request_participant_key, str)
-        or request_participant_key.casefold() != "helios"
+        or request_participant_key != ("gemini" if is_gemini else "helios")
         or retrieval["owner_participant_id"] != request_event["participant_id"]
         or trigger_id != request_event["related_message_id"]
         or len(triggering) != 1
@@ -937,17 +1294,40 @@ def _validate_inherited_memory_payload(
         or triggering_participant_key.casefold() != "peter"
         or tokenize_memory_query(triggering[0]["message_text"])
         != retrieval["query_terms"]
-        or provider_input[-1]
-        != {"role": "user", "content": triggering[0]["message_text"]}
+        or local_context.get("trigger_message_id") != trigger_id
+        or local_context.get("room_sequence_boundary")
+        != triggering[0]["room_sequence_no"]
     ):
+        raise _data_invalid()
+
+    expected_trigger = (
+        {"role": "user", "parts": [{"text": triggering[0]["message_text"]}]}
+        if is_gemini
+        else {"role": "user", "content": triggering[0]["message_text"]}
+    )
+    if provider_input[-1] != expected_trigger:
         raise _data_invalid()
 
     candidates = [
         (index, item)
         for index, item in enumerate(provider_input)
-        if isinstance(item, dict)
-        and isinstance(item.get("content"), str)
-        and item["content"].startswith(INHERITED_MEMORY_HEADER)
+        if isinstance(item, dict) and (
+            (
+                not is_gemini
+                and isinstance(item.get("content"), str)
+                and item["content"].startswith(INHERITED_MEMORY_HEADER)
+            )
+            or (
+                is_gemini
+                and set(item) == {"role", "parts"}
+                and isinstance(item.get("parts"), list)
+                and len(item["parts"]) == 1
+                and isinstance(item["parts"][0], dict)
+                and set(item["parts"][0]) == {"text"}
+                and isinstance(item["parts"][0].get("text"), str)
+                and item["parts"][0]["text"].startswith(INHERITED_MEMORY_HEADER)
+            )
+        )
     ]
     context: dict[str, Any] | None = None
     if selected:
@@ -955,11 +1335,15 @@ def _validate_inherited_memory_payload(
         if (
             len(candidates) != 1
             or candidates[0][0] != expected_position
-            or set(candidates[0][1]) != {"role", "content"}
+            or set(candidates[0][1]) != ({"role", "parts"} if is_gemini else {"role", "content"})
             or candidates[0][1].get("role") != "user"
         ):
             raise _data_invalid()
-        context_content = candidates[0][1]["content"]
+        context_content = (
+            candidates[0][1]["parts"][0]["text"]
+            if is_gemini
+            else candidates[0][1]["content"]
+        )
         encoded_context = context_content[len(INHERITED_MEMORY_HEADER) :]
         try:
             context = json.loads(encoded_context)
@@ -1167,6 +1551,39 @@ def _build_provider_outcome(
             "error": None,
         }
 
+    if event["event_type"] == GOOGLE_RESPONSE_EVENT:
+        response = event["payload"]["response"]
+        candidate = response["candidates"][0]
+        return {
+            **common,
+            "response_id": None,
+            "status": candidate.get("finish_reason"),
+            "resolved_model": response.get("model_version"),
+            "usage": response.get("usage_metadata"),
+            "safety_ratings": candidate.get("safety_ratings"),
+            "output_text": _visible_gemini_output(candidate.get("content")),
+            "error": None,
+        }
+
+    if event["event_type"] == GOOGLE_ERROR_EVENT:
+        payload = event["payload"]
+        if "response" not in payload:
+            return {**common, "error": payload["error"]}
+        response = payload["response"]
+        candidate = (
+            response.get("candidates", [None])[0]
+            if isinstance(response.get("candidates"), list) and response["candidates"]
+            else None
+        )
+        return {
+            **common,
+            "status": candidate.get("finish_reason") if isinstance(candidate, dict) else None,
+            "resolved_model": response.get("model_version"),
+            "usage": response.get("usage_metadata"),
+            "error": payload["error"],
+            "unusable_response": response,
+        }
+
     payload = event["payload"]
     if "error" in payload:
         return {**common, "error": payload["error"]}
@@ -1204,3 +1621,16 @@ def _visible_output_text(response: dict[str, Any]) -> str | None:
                 ):
                     visible.append(part["text"])
     return "\n".join(visible) if visible else None
+
+
+def _visible_gemini_output(content: Any) -> str | None:
+    if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
+        return None
+    visible = [
+        part["text"]
+        for part in content["parts"]
+        if isinstance(part, dict)
+        and part.get("thought") is not True
+        and isinstance(part.get("text"), str)
+    ]
+    return "".join(visible) if visible else None

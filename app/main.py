@@ -29,9 +29,17 @@ from .identity_service import (
     load_participant_directory,
     post_room_message,
 )
+from .gemini_client import create_gemini_client
+from .gemini_identity import (
+    GeminiIdentityError,
+    install_gemini,
+    publish_gemini_welcome,
+)
+from .gemini_service import run_gemini_turn
 from .migration import DatabaseMigrationError, migrate_database
 from .models import MessageRequest
 from .openai_client import create_openai_client
+from .participant_registry import registration_for
 from .preflight import DatabasePreflightError, preflight_database
 from .room_service import TurnServiceError, run_helios_turn
 from .seed_memory import SeedMemoryError, import_seed_memories, load_seed_manifest
@@ -45,6 +53,7 @@ _SQLITE_MAX_INTEGER = 9_223_372_036_854_775_807
 app = FastAPI(title="Helios Room")
 app.state.database_path = DEFAULT_DATABASE_PATH
 app.state.openai_client_factory = create_openai_client
+app.state.gemini_client_factory = create_gemini_client
 app.state.dotenv_path = None
 
 # Mount static files
@@ -108,13 +117,36 @@ async def post_message(request: MessageRequest):
                 post_room_message, request.message_text, app.state.database_path
             )
         else:
-            result = await run_helios_turn(
-                request.message_text,
-                destination_participant_key=request.destination.participant_key,
-                database_path=app.state.database_path,
-                client_factory=app.state.openai_client_factory,
-                dotenv_path=app.state.dotenv_path,
-            )
+            participant_key = request.destination.participant_key
+            registration = registration_for(participant_key)
+            if registration is None:
+                raise TurnServiceError(
+                    status_code=409,
+                    code="participant_destination_unavailable",
+                    message="The selected participant destination is unavailable.",
+                )
+            if registration.participant_key == "helios":
+                result = await run_helios_turn(
+                    request.message_text,
+                    destination_participant_key=participant_key,
+                    database_path=app.state.database_path,
+                    client_factory=app.state.openai_client_factory,
+                    dotenv_path=app.state.dotenv_path,
+                )
+            elif registration.participant_key == "gemini":
+                result = await run_gemini_turn(
+                    request.message_text,
+                    destination_participant_key=participant_key,
+                    database_path=app.state.database_path,
+                    client_factory=app.state.gemini_client_factory,
+                    dotenv_path=app.state.dotenv_path,
+                )
+            else:  # The static registry is intentionally exhaustive.
+                raise TurnServiceError(
+                    status_code=409,
+                    code="participant_destination_unavailable",
+                    message="The selected participant destination is unavailable.",
+                )
         return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
     except TurnServiceError as error:
         return JSONResponse(
@@ -202,6 +234,8 @@ def main() -> None:
             "migrate-database",
             "store-message",
             "import-seed-memories",
+            "install-gemini",
+            "publish-gemini-welcome",
             "serve",
         ),
         help=(
@@ -230,6 +264,11 @@ def main() -> None:
     parser.add_argument(
         "--file",
         help="UTF-8 JSON manifest path (for import-seed-memories command).",
+    )
+    parser.add_argument(
+        "--owner-participant-key",
+        default="helios",
+        help="Stable AI owner key for import-seed-memories (default: helios).",
     )
     parser.add_argument(
         "--host",
@@ -291,8 +330,28 @@ def main() -> None:
             parser.error("--file is required for import-seed-memories command")
         try:
             manifest = load_seed_manifest(arguments.file)
-            report = import_seed_memories(arguments.database, manifest)
+            report = import_seed_memories(
+                arguments.database,
+                manifest,
+                owner_participant_key=arguments.owner_participant_key,
+            )
         except SeedMemoryError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            raise SystemExit(1) from None
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    elif arguments.command == "install-gemini":
+        try:
+            report = install_gemini(arguments.database)
+        except GeminiIdentityError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            raise SystemExit(1) from None
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    elif arguments.command == "publish-gemini-welcome":
+        try:
+            report = publish_gemini_welcome(arguments.database)
+        except GeminiIdentityError as error:
             print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
             raise SystemExit(1) from None
         print(json.dumps(report, indent=2, ensure_ascii=False))

@@ -93,14 +93,14 @@ class FreshSchemaAndAliasTests(IdentityFixture):
             )
             self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM message_routes").fetchone()[0], 0)
-            self.assertEqual(connection.execute("SELECT count(*) FROM participant_aliases").fetchone()[0], 3)
-            self.assertEqual(connection.execute("SELECT count(*) FROM participant_primary_aliases").fetchone()[0], 3)
+            self.assertEqual(connection.execute("SELECT count(*) FROM participant_aliases").fetchone()[0], 4)
+            self.assertEqual(connection.execute("SELECT count(*) FROM participant_primary_aliases").fetchone()[0], 4)
             events = connection.execute(
                 """SELECT event_type,room_id,actor_participant_id,subject_participant_id,
                           previous_alias_id,new_alias_id,canonical_message_id
                    FROM participant_name_events ORDER BY id"""
             ).fetchall()
-            self.assertEqual(len(events), 3)
+            self.assertEqual(len(events), 4)
             for event in events:
                 self.assertEqual(event["event_type"], "bootstrap")
                 self.assertIsNone(event["room_id"])
@@ -197,10 +197,11 @@ class DirectoryPostHistoryAndTraceTests(IdentityFixture):
         self.assertEqual(before, after)
         self.assertEqual(directory["directory_version"], 1)
         self.assertEqual(directory["destinations"][0], {"kind": "room", "label": "Room", "addressable": True})
-        self.assertEqual([item.get("participant_key") for item in directory["destinations"][1:]], ["helios", "peter"])
+        self.assertEqual([item.get("participant_key") for item in directory["destinations"][1:]], ["gemini", "helios", "peter"])
         self.assertNotIn("room-system", json.dumps(directory))
         self.assertTrue(directory["destinations"][1]["addressable"])
-        self.assertFalse(directory["destinations"][2]["addressable"])
+        self.assertTrue(directory["destinations"][2]["addressable"])
+        self.assertFalse(directory["destinations"][3]["addressable"])
 
         response = asyncio.run(self.request("GET", "/api/participants"))
         self.assertEqual(response.status_code, 200)

@@ -15,6 +15,7 @@ from .database import (
     store_message,
 )
 from .read_snapshot import ReadSnapshotError, run_read_snapshot
+from .participant_registry import is_addressable_ai
 from .schema_validation import SchemaValidationError, validate_v13_foundation
 
 
@@ -324,9 +325,8 @@ def _load_participant_directory_snapshot(
             row = primary[0]
             if row["participant_key"] == "room-system":
                 raise ValueError("room system cannot be a member")
-            addressable = (
-                row["participant_key"] == "helios"
-                and row["participant_type"] == "ai"
+            addressable = is_addressable_ai(
+                row["participant_key"], row["participant_type"]
             )
             entry = {
                 "kind": "participant",

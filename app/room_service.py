@@ -29,6 +29,7 @@ from .openai_client import (
     serialize_provider_response,
 )
 from .identity_service import current_alias, resolve_room_post_context
+from .provider_history import ProviderHistoryError, load_provider_history
 from .seed_memory import (
     RESULT_LIMIT as MEMORY_RESULT_LIMIT,
     TEXT_BUDGET_CHARS as MEMORY_TEXT_BUDGET_CHARS,
@@ -621,112 +622,20 @@ def _load_and_validate_history(
     room_id: int,
     boundary: int,
 ) -> list[dict[str, str]]:
-    rows = connection.execute(
-        """
-        SELECT m.id, m.message_type, m.message_text, p.participant_key,
-               p.participant_type, mr.routing_mode, mr.destination_kind,
-               rp.participant_key AS recipient_key,
-               sa.participant_id AS sender_alias_owner,
-               da.participant_id AS destination_alias_owner,
-               dap.participant_key AS destination_alias_owner_key,
-               da.alias_key AS destination_alias_key
-        FROM messages AS m
-        JOIN participants AS p ON p.id = m.participant_id
-        JOIN message_routes AS mr ON mr.message_id = m.id
-            AND mr.room_id = m.room_id
-            AND mr.sender_participant_id = m.participant_id
-        JOIN participant_aliases AS sa ON sa.id = mr.sender_alias_id
-            AND sa.participant_id = m.participant_id
-        JOIN participant_aliases AS da ON da.id = mr.destination_alias_id
-        JOIN participants AS dap ON dap.id = da.participant_id
-        LEFT JOIN participants AS rp ON rp.id = mr.recipient_participant_id
-        WHERE m.room_id = ? AND m.room_sequence_no <= ?
-        ORDER BY m.room_sequence_no
-        """,
-        (room_id, boundary),
-    ).fetchall()
-    expected_count = connection.execute(
-        "SELECT count(*) FROM messages WHERE room_id=? AND room_sequence_no<=?",
-        (room_id, boundary),
-    ).fetchone()[0]
-    if len(rows) != expected_count:
+    try:
+        projected = load_provider_history(
+            connection,
+            room_id=room_id,
+            boundary=boundary,
+            provider_participant_key=HELIOS_KEY,
+        )
+    except ProviderHistoryError as error:
         raise TurnServiceError(
             status_code=409,
-            code="unsupported_history_route",
-            message="Canonical history contains invalid routing data.",
-        )
-
-    provider_input: list[dict[str, str]] = []
-    for row in rows:
-        valid_room_destination = (
-            row["destination_kind"] == "room"
-            and row["recipient_key"] is None
-            and row["destination_alias_owner_key"] == "room-system"
-            and row["destination_alias_key"] == "room"
-        )
-        if row["message_type"] == "system":
-            if row["routing_mode"] == "legacy_implicit" and valid_room_destination:
-                bootstrap_count = connection.execute(
-                    """SELECT count(*)
-                       FROM participant_name_events AS pne
-                       JOIN message_routes AS mr ON mr.message_id=?
-                       WHERE pne.event_type='bootstrap'
-                         AND pne.subject_participant_id=mr.sender_participant_id
-                         AND pne.new_alias_id=mr.sender_alias_id
-                         AND pne.room_id IS NULL
-                         AND pne.previous_alias_id IS NULL
-                         AND pne.canonical_message_id IS NULL""",
-                    (row["id"],),
-                ).fetchone()[0]
-                if bootstrap_count == 1:
-                    continue
-            if (
-                row["routing_mode"] == "explicit"
-                and row["participant_key"] == "room-system"
-                and row["participant_type"] == "system"
-                and valid_room_destination
-            ):
-                event_count = connection.execute(
-                    """SELECT count(*) FROM participant_name_events
-                       WHERE event_type='adopted' AND canonical_message_id=?
-                         AND room_id=?""",
-                    (row["id"], room_id),
-                ).fetchone()[0]
-                if event_count == 1:
-                    continue
-            raise TurnServiceError(
-                status_code=409,
-                code="unsupported_history_message_type",
-                message="Canonical history contains an unsupported system message.",
-            )
-        if row["message_type"] != "chat":
-            raise TurnServiceError(
-                status_code=409,
-                code="unsupported_history_message_type",
-                message="Canonical history contains an unsupported message type.",
-            )
-        if (
-            row["participant_key"] == PETER_KEY
-            and (
-                (row["destination_kind"] == "participant" and row["recipient_key"] == HELIOS_KEY)
-                or valid_room_destination
-            )
-        ):
-            role = "user"
-        elif (
-            row["participant_key"] == HELIOS_KEY
-            and row["destination_kind"] == "participant"
-            and row["recipient_key"] == PETER_KEY
-        ):
-            role = "assistant"
-        else:
-            raise TurnServiceError(
-                status_code=409,
-                code="unsupported_history_participant",
-                message="Canonical history contains an unsupported participant.",
-            )
-        provider_input.append({"role": role, "content": row["message_text"]})
-    return provider_input
+            code=error.code,
+            message=error.message,
+        ) from error
+    return projected
 
 
 def _finalize_success(

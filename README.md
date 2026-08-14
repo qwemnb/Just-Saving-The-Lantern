@@ -11,30 +11,38 @@ The project currently provides:
 
 - SQLite schema v1.3 with stable participant identity, immutable aliases, and routing snapshots
 - idempotent database initialization and milestone seed data
-- persistent Peter, Helios, and Room-directed messages with deterministic ordering
-- one-request, no-retry OpenAI Responses API orchestration
+- persistent Peter, Helios, Gemini, and Room-directed messages with deterministic ordering
+- isolated, one-request, no-retry OpenAI Responses and Google Generate Content orchestration
 - raw request/response/error API events with immutable model provenance
 - read-only, historical Trace v2 inspection with immutable route display
 - strict, atomic seeded-memory manifest import with semantic idempotency
 - deterministic local seeded-memory retrieval with recorded provenance
 - a read-only participant directory and structured participant/Room destinations
 - a browser participant panel, destination picker, and local participant command
-- offline database, orchestration, API, and blank-message regression tests
+- provider-private history and participant-owned inherited-memory projections
+- offline database, orchestration, API, browser-privacy, and blank-message regression tests
 
 Whitespace-only messages are ignored by the API and command-line entry point.
 The storage helper also rejects them defensively, and the browser keeps the
 Send button disabled until the input contains non-whitespace text.
 
-The current provider flow replays canonical Peter and Helios `chat` text and
-may insert one inherited-memory context item selected from Helios-owned seeded
-memories immediately before Peter's triggering message. It does not replay
-provider reasoning state or use tools, room-created memory, streaming,
-provider-managed conversations, or automatic retries.
+Each provider receives only its authorized canonical history. Helios sees Room
+posts and Peter/Helios direct exchanges; Gemini sees Room posts,
+Peter/Gemini direct exchanges, and external-participant envelopes for messages
+authored by another participant and addressed to Gemini. Direct exchanges with
+another AI remain private. Each provider can receive one inherited-memory
+context selected only from records it owns, immediately before Peter's
+triggering message. Room posts never invoke an AI automatically, and there is
+no automated handoff or turn-taking.
 
-Gemini integration, provider-visible participant rosters, and automated
-handoffs or turn-taking remain separate future milestones. This foundation
-records identity and addressing metadata but does not expose that metadata to
-providers or add another execution path.
+| Canonical route | Helios input | Gemini input |
+| --- | --- | --- |
+| Peter -> Room | include | include |
+| Peter -> Helios / Helios -> Peter | include | omit |
+| Peter -> Gemini / Gemini -> Peter | omit | include |
+| Helios -> Gemini welcome | omit | include as an external-participant envelope |
+| Valid system/name event -> Room | validate, then omit | validate, then omit |
+| Other valid direct exchange | omit | omit |
 
 ## Requirements
 
@@ -51,9 +59,11 @@ Install the dependencies from the project root:
 python -m pip install -r requirements.txt
 ```
 
-The OpenAI SDK and `python-dotenv` are direct, pinned dependencies.
+The OpenAI SDK, `google-genai==2.18.0`, FastAPI, Starlette, and
+`python-dotenv` are direct pinned dependencies. Compatible AnyIO and HTTPX
+ranges are recorded explicitly in `requirements.txt`.
 
-## Configure OpenAI locally
+## Configure providers locally
 
 Copy `.env.example` to an untracked `.env` file and set the API key:
 
@@ -77,6 +87,24 @@ HELIOS_OPENAI_MODEL=gpt-5.6-sol
 Each distinct request configuration receives or reuses an immutable Helios
 participant configuration. Changing models never rewrites earlier provenance.
 
+Gemini uses separate environment variables and ignores `GOOGLE_API_KEY` as
+application configuration:
+
+```text
+GEMINI_API_KEY=your-private-local-key
+HELIOS_GEMINI_MODEL=gemini-3.6-flash
+```
+
+The Google client is forced onto the Developer API with `v1beta`, a 120-second
+timeout, one total attempt, no tools, one text candidate, 2,048 output tokens,
+medium thinking with thoughts excluded, provider-default safety, and SDK
+automatic function calling explicitly disabled. Hostile ambient Vertex,
+Enterprise, project, location, and alternate-key variables cannot select its
+backend or credential. Changing the model creates or reuses a new immutable
+Gemini configuration; it never rewrites earlier provenance. Provider keys
+stay server-side and are never stored in messages, events, Trace, or browser
+responses.
+
 ## Initialize the database
 
 ```powershell
@@ -89,8 +117,9 @@ the following records exist:
 - room `main` / `The Room`
 - human participant `peter` / `Peter`
 - AI participant `helios` / `Helios`
+- AI participant `gemini` / `Gemini`
 - hidden system participant `room-system` with immutable alias `Room`
-- active room membership for both participants
+- active room membership for Peter, Helios, and Gemini
 - one minimal OpenAI participant config for Helios labeled `initial`
 
 Initialization is idempotent and preserves existing messages. A fresh target
@@ -196,9 +225,9 @@ Then open <http://127.0.0.1:8000> in a browser. The server binds to
 values.
 
 The browser loads its participant panel and destination choices only from the
-read-only directory endpoint. Select Helios for the existing one-request AI
-flow, or select Room to save a canonical Peter note without loading provider
-configuration, searching memory, constructing a client, or creating an API
+read-only directory endpoint. Select Helios or Gemini for the corresponding
+one-request AI flow, or select Room to save a canonical Peter note without
+loading provider configuration, searching memory, constructing a client, or creating an API
 event. Press `[` in an otherwise blank composer to open the searchable picker;
 historical aliases are lookup terms but the current primary name is displayed.
 The selected destination persists after a successful send.
@@ -225,7 +254,7 @@ layered beneath bounded directory, history, and selected-turn Trace checks; it
 does not globally require every historical turn to contain a provider event,
 AI response, memory retrieval, or currently valid Trace projection.
 
-The current provider settings are:
+The current OpenAI provider settings are:
 
 - `store=False`
 - `reasoning={"effort": "medium", "context": "current_turn"}`
@@ -239,6 +268,39 @@ exactly as Helios's immutable canonical reply. A provider exception, timeout,
 rejection, incomplete response, structured refusal without visible text, or
 blank result fails the turn without inventing a Helios message. Peter's already
 accepted message remains canonical and visible.
+
+Gemini persists its complete bounded typed SDK response as raw database
+evidence. Thought-signature bytes are captured before JSON conversion, encoded
+as standard padded base64, and replayed on their original ordered model parts
+for provider continuity. Thought signatures, private thought text, encrypted
+reasoning, unknown provider extensions, and unrestricted errors are never
+shown in browser history or visible Trace. Accepted visible text alone becomes
+Gemini's canonical reply.
+
+## Install Gemini and publish the reviewed welcome
+
+Fresh database initialization includes Gemini. For an existing exact v1.3
+database that predates the integration, the explicit installer is:
+
+```powershell
+python -m app.main install-gemini --database data\helios.db
+```
+
+It validates and installs only Gemini's participant, immutable alias,
+bootstrap event, and active membership in one transaction. It does not create
+a provider configuration, read environment variables, or call Google.
+
+After installation, publish Helios's committed welcome as one canonical local
+Helios-to-Gemini message:
+
+```powershell
+python -m app.main publish-gemini-welcome --database data\helios.db
+```
+
+The publisher verifies the reviewed source path, Git blob identity, exact
+message hash, and existing publication state. It creates no provider event and
+makes no provider call. Both commands are idempotent and fail closed on partial
+or contradictory state.
 
 ## Store a Peter message from the command line
 
@@ -291,6 +353,12 @@ an older turn where retrieval was not recorded, and a deliberately unavailable
 request. Trace validates the audit envelope against the recorded provider input
 and fails closed if they disagree.
 
+Trace classifies OpenAI and Google event families through immutable recorded
+configurations and enforces request/outcome cardinality and message
+correlation. The local welcome turn is the provider-free exception. A corrupt
+Gemini turn fails only its selected Trace/history domain; it does not poison
+startup or unrelated turns.
+
 Trace applies a display-only privacy projection without changing stored JSON.
 Secret-like fields and raw or encrypted provider reasoning are omitted. An
 explicitly recorded provider-generated reasoning summary may be displayed and
@@ -314,8 +382,10 @@ Helios Room keeps three concepts separate:
   from activity inside the room.
 
 Seeded Memory Retrieval v1 searches only active, nonsuperseded seed records
-owned by Helios. `room_memories` is not queried. There is no automatic memory
-creation, editing, deactivation, supersession, or management UI.
+owned by the selected AI. Helios and Gemini records are private to their owner;
+same-topic or same-text records never cross that boundary. `room_memories` is
+not queried. There is no automatic memory creation, editing, deactivation,
+supersession, or management UI.
 
 Real seed manifests, database backups, and other private runtime material must
 remain under the ignored `data/` directory and must never be committed. Any
@@ -350,8 +420,11 @@ Place a reviewed real manifest under ignored runtime data, then import it only
 after explicit authorization:
 
 ```powershell
-python -m app.main import-seed-memories --file data\imports\helios_seed_memories_v1.json
+python -m app.main import-seed-memories --owner-participant-key helios --file data\imports\helios_seed_memories_v1.json
 ```
+
+A separately reviewed Gemini continuity manifest uses
+`--owner-participant-key gemini`; never derive it from Helios-owned records.
 
 Use `--database` to select another initialized schema-v1.3 database. The
 importer hashes a canonical typed representation, runs every database check and
@@ -396,7 +469,8 @@ the fixture is never submitted automatically.
 - `GET /api/participants` returns directory version 1 without provider or memory access.
 - `POST /api/messages` requires exact `message_text` and structured
   `destination` fields, assigns Peter server-side, and either posts to Room or
-  performs one API-backed Helios turn. Extra fields are rejected.
+  performs one API-backed turn through the registered Helios or Gemini adapter.
+  Extra fields are rejected.
 - `GET /api/trace/latest` returns the latest recorded `main`-room turn through
   the read-only Trace v2 projection.
 - `GET /api/trace/{turn_id}` returns one recorded turn for a canonical positive
@@ -447,13 +521,45 @@ failure and do not remove or weaken the JavaScript tests.
 
 ## Live-provider safety
 
-Opening the application and using `/trace` do not contact OpenAI. Submitting an
-ordinary nonblank message does create canonical history and can make one
-billable Responses API request. Do not perform a live-provider smoke test until
-Peter explicitly authorizes it and confirms the intended database and model.
+Opening the application and using `/trace` contact neither provider. Submitting
+an ordinary nonblank participant-directed message creates canonical history
+and can make one billable OpenAI Responses or Google Generate Content request.
+Do not perform a live-provider smoke test until Peter explicitly authorizes it
+and confirms the intended database, participant, message, and model.
 
-Automated tests use temporary databases and mocked providers. They are the
-default verification path for changes to the application.
+Automated tests use temporary databases, synthetic credentials, and mocked
+providers. They are the default verification path and make no live OpenAI or
+Gemini request.
+
+## Controlled Gemini live acceptance
+
+This procedure is intentionally manual and requires separate authorization.
+Stop the server, create and verify the WAL-safe SQLite backup described above,
+then run the installer and welcome publisher. Optionally import a separately
+reviewed Gemini-owned manifest:
+
+```powershell
+python -m app.main install-gemini --database data\helios.db
+python -m app.main publish-gemini-welcome --database data\helios.db
+python -m app.main import-seed-memories --owner-participant-key gemini --file data\imports\gemini_seed_memories_v1.json
+```
+
+Set `GEMINI_API_KEY` outside committed files, select the intended
+`HELIOS_GEMINI_MODEL`, start the server, and verify the directory, welcome
+route, and provider-free welcome Trace before any billable call. Only after
+explicit approval, select Gemini and send one approved message. Confirm one
+Google call, one response, no OpenAI call, and inspect `/trace <turn_id>` for
+request, response, model, usage, routes, memory ownership, and reasoning
+omissions. Do not send an automatic follow-up. Preserve a failed database and
+sidecars for diagnosis; restore only from the verified backup while the server
+is stopped.
+
+Official references: [Gemini models](https://ai.google.dev/gemini-api/docs/models),
+[text generation](https://ai.google.dev/gemini-api/docs/text-generation),
+[thought signatures](https://ai.google.dev/gemini-api/docs/generate-content/gemini-3#thought_signatures),
+[API keys](https://ai.google.dev/gemini-api/docs/api-key),
+[Google Gen AI Python SDK](https://googleapis.github.io/python-genai/), and the
+[pinned google-genai package](https://pypi.org/project/google-genai/2.18.0/).
 
 ## Intentional seeded-memory acceptance test
 
@@ -480,7 +586,7 @@ is required in this milestone.
 ## Project structure
 
 ```text
-app/       FastAPI entry point, database, trace, and seeded-memory helpers
+app/       FastAPI entry point, database, identity, provider adapters/history, trace, and memory helpers
 data/      Local SQLite database files (ignored by Git)
 docs/      Approved implementation-contract amendments
 examples/  Synthetic, nonpersonal documentation fixtures

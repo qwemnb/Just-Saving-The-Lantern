@@ -7,6 +7,17 @@ const PARTICIPANTS_PATTERN = /^\/participants\s*$/;
 const NETWORK_READ_ERROR = 'Cannot reach the Helios Room server.';
 const HISTORY_READ_FALLBACK = 'Failed to load messages. Please refresh.';
 const DIRECTORY_READ_FALLBACK = 'Participant directory unavailable.';
+const POST_ERROR_FALLBACK = 'Failed to send message. Please try again.';
+const POST_ERROR_LITERALS = Object.freeze({
+    participant_destination_unavailable: 'The destination changed. Select a destination and try again.',
+    missing_gemini_api_key: 'Gemini is not configured on this server.',
+    missing_gemini_model: 'Gemini is not configured on this server.',
+    gemini_provider_timeout: 'Gemini timed out. Your message was saved.',
+    gemini_provider_failure: 'Gemini could not respond. Your message was saved.',
+    gemini_provider_response_serialization_failed: "Gemini's response could not be recorded. Your message was saved.",
+    gemini_provider_unusable_response: 'Gemini returned no usable response. Your message was saved.',
+    turn_finalization_failed: 'The provider may have responded, but this turn requires manual reconciliation.'
+});
 const READ_ERROR_LITERALS = Object.freeze({
     message_history_invalid: 'The message history data is invalid.',
     message_history_unavailable: 'The message history is unavailable.',
@@ -133,18 +144,26 @@ function scrollToBottom(doc = document) {
 }
 
 async function sendMessage(messageText, destination, fetchImpl = fetch) {
-    const response = await fetchImpl(`${API_BASE}/messages`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            message_text: messageText,
-            destination: destination.kind === 'room'
-                ? { kind: 'room' }
-                : { kind: 'participant', participant_key: destination.participant_key }
-        })
-    });
+    let response;
+    try {
+        response = await fetchImpl(`${API_BASE}/messages`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                message_text: messageText,
+                destination: destination.kind === 'room'
+                    ? { kind: 'room' }
+                    : { kind: 'participant', participant_key: destination.participant_key }
+            })
+        });
+    } catch (_error) {
+        const error = new Error(POST_ERROR_FALLBACK);
+        error.postAccepted = false;
+        error.code = null;
+        throw error;
+    }
 
     let result = {};
     try {
@@ -154,9 +173,15 @@ async function sendMessage(messageText, destination, fetchImpl = fetch) {
     }
 
     if (!response.ok) {
-        const error = new Error(result.message || 'Failed to send message.');
-        error.postAccepted = Boolean(result.turn_id && result.peter_message_id);
-        error.code = result.error;
+        const code = result && typeof result.error === 'string' ? result.error : null;
+        const localMessage = code !== null
+            && Object.prototype.hasOwnProperty.call(POST_ERROR_LITERALS, code)
+            ? POST_ERROR_LITERALS[code]
+            : POST_ERROR_FALLBACK;
+        const error = new Error(localMessage);
+        error.postAccepted = Number.isSafeInteger(result.turn_id) && result.turn_id > 0
+            && Number.isSafeInteger(result.peter_message_id) && result.peter_message_id > 0;
+        error.code = code;
         throw error;
     }
 
@@ -673,6 +698,9 @@ if (typeof module !== 'undefined' && module.exports) {
         READ_ERROR_LITERALS,
         NETWORK_READ_ERROR,
         HISTORY_READ_FALLBACK,
-        DIRECTORY_READ_FALLBACK
+        DIRECTORY_READ_FALLBACK,
+        POST_ERROR_LITERALS,
+        POST_ERROR_FALLBACK,
+        sendMessage
     };
 }
