@@ -71,20 +71,19 @@ class SchemaPreflightTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, code)
         return raised.exception
 
-    def test_clean_fresh_and_migrated_v13_use_immutable_without_sidecars(self) -> None:
+    def test_clean_fresh_v14_uses_immutable_and_v12_requires_reset(self) -> None:
         self.make_v13()
         report = preflight_database(self.database_path)
-        self.assertEqual((report.schema_label, report.snapshot_branch), ("1.3", "immutable"))
+        self.assertEqual((report.schema_label, report.snapshot_branch), ("1.4", "immutable"))
         self.assertFalse(Path(f"{self.database_path}-wal").exists())
         self.assertFalse(Path(f"{self.database_path}-shm").exists())
 
         migrated = Path(self.temp.name) / "migrated.db"
         self.database_path = migrated
         self.make_v12()
-        from app.migration import migrate_database
-
-        migrate_database(migrated)
-        self.assertEqual(preflight_database(migrated).snapshot_branch, "immutable")
+        with self.assertRaises(DatabasePreflightError) as raised:
+            preflight_database(migrated)
+        self.assertEqual(raised.exception.code, "database_reset_required")
         self.assertFalse(Path(f"{migrated}-wal").exists())
         self.assertFalse(Path(f"{migrated}-shm").exists())
 
@@ -92,19 +91,30 @@ class SchemaPreflightTests(unittest.TestCase):
         from app import database, identity_service, migration, preflight, trace_service
         from app import schema_validation
 
-        self.assertIs(preflight.validate_v12_source, schema_validation.validate_v12_source)
-        self.assertIs(migration.validate_v12_source, schema_validation.validate_v12_source)
-        self.assertIs(preflight.validate_v13_foundation, schema_validation.validate_v13_foundation)
-        self.assertIs(database.validate_v13_foundation, schema_validation.validate_v13_foundation)
-        self.assertIs(identity_service.validate_v13_foundation, schema_validation.validate_v13_foundation)
-        self.assertIs(trace_service.validate_v13_foundation, schema_validation.validate_v13_foundation)
+        self.assertIs(
+            preflight.validate_legacy_reset_dispatch,
+            schema_validation.validate_legacy_reset_dispatch,
+        )
+        self.assertIs(
+            migration.validate_legacy_reset_dispatch,
+            schema_validation.validate_legacy_reset_dispatch,
+        )
+        self.assertIs(
+            database.validate_legacy_reset_dispatch,
+            schema_validation.validate_legacy_reset_dispatch,
+        )
+        for module in (preflight, migration, database):
+            self.assertFalse(hasattr(module, "validate_v12_source"))
+            self.assertFalse(hasattr(module, "validate_v13_foundation"))
+        self.assertIs(identity_service.validate_v14_foundation, schema_validation.validate_v14_foundation)
+        self.assertIs(trace_service.validate_v14_foundation, schema_validation.validate_v14_foundation)
 
-    def test_exact_v12_is_migration_required_but_spoof_is_incompatible(self) -> None:
+    def test_exact_v12_is_reset_required_but_spoof_is_incompatible(self) -> None:
         self.make_v12()
-        error = self.assert_preflight_error("database_migration_required")
+        error = self.assert_preflight_error("database_reset_required")
         self.assertEqual(
             error.message,
-            "Database schema 1.2 must be migrated to 1.3 before the server can start.",
+            "The existing Helios Room database must be retired and reinitialized before this version can run.",
         )
         spoof = Path(self.temp.name) / "spoof.db"
         self.database_path = spoof
@@ -304,7 +314,14 @@ class SchemaPreflightTests(unittest.TestCase):
         connection = connect_database(self.database_path)
         self.addCleanup(connection.close)
         connection.execute("BEGIN IMMEDIATE")
-        connection.execute("INSERT INTO rooms(room_key,name) VALUES ('extra','Extra')")
+        extra_room = connection.execute(
+            "INSERT INTO rooms(room_key,name) VALUES ('extra','Extra')"
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO room_history_visibility_events
+               (room_id,policy_version,effective_from_room_sequence_no)
+               VALUES (?,'room_shared_v1',1)""", (extra_room,)
+        )
         connection.commit()
         wal_path = Path(f"{self.database_path}-wal")
         shm_path = Path(f"{self.database_path}-shm")
@@ -403,7 +420,7 @@ class SchemaPreflightTests(unittest.TestCase):
 
         writer: sqlite3.Connection | None = None
         calls = 0
-        real_validate = preflight.validate_v13_foundation
+        real_validate = preflight.validate_v14_foundation
 
         def validate_then_write(connection: sqlite3.Connection) -> None:
             nonlocal writer, calls
@@ -419,7 +436,7 @@ class SchemaPreflightTests(unittest.TestCase):
         stderr = io.StringIO()
         try:
             with patch(
-                "app.preflight.validate_v13_foundation",
+                "app.preflight.validate_v14_foundation",
                 side_effect=validate_then_write,
             ), patch.object(
                 sys,
@@ -472,6 +489,11 @@ class SchemaPreflightTests(unittest.TestCase):
             extra_room = connection.execute(
                 "INSERT INTO rooms(room_key,name) VALUES ('studio','Studio')"
             ).lastrowid
+            connection.execute(
+                """INSERT INTO room_history_visibility_events
+                   (room_id,policy_version,effective_from_room_sequence_no)
+                   VALUES (?,'room_shared_v1',1)""", (extra_room,)
+            )
             extra_id = connection.execute(
                 """INSERT INTO participants(participant_key,name,participant_type)
                    VALUES ('observer','Observer','human')"""
@@ -506,7 +528,7 @@ class SchemaPreflightTests(unittest.TestCase):
                 (room_id, peter_id),
             )
             connection.commit()
-        self.assertEqual(preflight_database(self.database_path).schema_label, "1.3")
+        self.assertEqual(preflight_database(self.database_path).schema_label, "1.4")
         directory = load_participant_directory(self.database_path)
         peter = next(
             item for item in directory["destinations"]
@@ -645,7 +667,7 @@ class SchemaPreflightTests(unittest.TestCase):
             )
             connection.commit()
 
-        self.assertEqual(preflight_database(self.database_path).schema_label, "1.3")
+        self.assertEqual(preflight_database(self.database_path).schema_label, "1.4")
         self.assertTrue(load_participant_directory(self.database_path)["destinations"])
         self.assertEqual(len(load_message_history(self.database_path)), 2)
         self.assertEqual(
@@ -705,7 +727,7 @@ class SchemaPreflightTests(unittest.TestCase):
                 path = Path(self.temp.name) / f"replaced-{index_value}.db"
                 self.database_path = path
                 self.make_v13()
-                self.assertEqual(preflight_database(path).schema_label, "1.3")
+                self.assertEqual(preflight_database(path).schema_label, "1.4")
                 replace_with_incompatible(path)
                 with self.assertRaises(error_type):
                     call(path)
@@ -733,8 +755,8 @@ class SchemaPreflightTests(unittest.TestCase):
             ),
             (
                 v12,
-                "database_migration_required",
-                "Database schema 1.2 must be migrated to 1.3 before the server can start.",
+                "database_reset_required",
+                "The existing Helios Room database must be retired and reinitialized before this version can run.",
             ),
             (
                 incompatible,

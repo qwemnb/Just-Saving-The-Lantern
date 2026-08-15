@@ -7,11 +7,12 @@ import re
 import sqlite3
 from typing import Any
 
+from .database import has_exact_room_visibility_policy
 from .gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS,
     model_content_from_stored_response,
     recorded_settings,
-    validate_recorded_google_request_payload,
+    validate_recorded_google_shared_request_payload,
 )
 
 
@@ -49,6 +50,20 @@ def _gemini_history_error() -> ProviderHistoryError:
     )
 
 
+def _helios_history_error() -> ProviderHistoryError:
+    return ProviderHistoryError(
+        "unsupported_helios_provider_history",
+        "Helios provider history cannot be reconstructed safely.",
+    )
+
+
+def _policy_error() -> ProviderHistoryError:
+    return ProviderHistoryError(
+        "unsupported_history_visibility_policy",
+        "Canonical history visibility cannot be reconstructed safely.",
+    )
+
+
 def load_provider_history(
     connection: sqlite3.Connection,
     *,
@@ -60,9 +75,24 @@ def load_provider_history(
 
     if provider_participant_key not in {"helios", "gemini"}:
         raise _participant_error()
+    if type(boundary) is not int or boundary <= 0:
+        raise _policy_error()
+    if not has_exact_room_visibility_policy(connection):
+        raise _policy_error()
+    try:
+        policies = connection.execute(
+            """SELECT policy_version, effective_from_room_sequence_no
+               FROM room_history_visibility_events WHERE room_id=?""",
+            (room_id,),
+        ).fetchall()
+    except sqlite3.Error as exception:
+        raise _policy_error() from exception
+    if len(policies) != 1 or tuple(policies[0]) != ("room_shared_v1", 1):
+        raise _policy_error()
     rows = connection.execute(
         """
-        SELECT m.id, m.turn_id, m.message_type, m.message_text,
+        SELECT m.id, m.turn_id, m.room_id, m.room_sequence_no,
+               m.turn_sequence_no, m.reply_to_id, m.message_type, m.message_text,
                m.participant_id, m.participant_config_id,
                p.participant_key, p.participant_type,
                mr.routing_mode, mr.destination_kind,
@@ -73,7 +103,9 @@ def load_provider_history(
                da.participant_id AS destination_alias_owner,
                da.display_alias AS destination_display,
                da.alias_key AS destination_alias_key,
-               destination_owner.participant_key AS destination_alias_owner_key
+               destination_owner.participant_key AS destination_alias_owner_key,
+               pc.participant_id AS config_participant_id,
+               pc.provider AS config_provider
         FROM messages AS m
         JOIN participants AS p ON p.id=m.participant_id
         JOIN message_routes AS mr ON mr.message_id=m.id
@@ -83,6 +115,7 @@ def load_provider_history(
         JOIN participant_aliases AS da ON da.id=mr.destination_alias_id
         JOIN participants AS destination_owner ON destination_owner.id=da.participant_id
         LEFT JOIN participants AS recipient ON recipient.id=mr.recipient_participant_id
+        LEFT JOIN participant_configs AS pc ON pc.id=m.participant_config_id
         WHERE m.room_id=? AND m.room_sequence_no<=?
         ORDER BY m.room_sequence_no
         """,
@@ -105,44 +138,38 @@ def load_provider_history(
             raise _message_type_error()
         sender_key = row["participant_key"]
         recipient_key = row["recipient_key"]
+        if row["participant_type"] not in {"human", "ai"}:
+            raise _participant_error()
+        if row["participant_type"] == "ai" and (
+            row["participant_config_id"] is None
+            or row["config_participant_id"] != row["participant_id"]
+        ):
+            raise _participant_error()
 
         if provider_participant_key == "helios":
-            if destination == "room":
-                if sender_key == "peter":
-                    result.append({"role": "user", "content": row["message_text"]})
-                    continue
-                raise _participant_error()
             if sender_key == "peter" and recipient_key == "helios":
                 result.append({"role": "user", "content": row["message_text"]})
-            elif sender_key == "helios" and recipient_key == "peter":
-                result.append({"role": "assistant", "content": row["message_text"]})
+            elif sender_key == "peter" and destination == "room":
+                result.append({"role": "user", "content": row["message_text"]})
+            elif sender_key == "helios" and _is_native_candidate(row, "peter"):
+                result.append(_load_helios_native(connection, row, room_id))
             else:
-                # Every route was validated first; direct exchanges outside the
-                # selected provider's Peter dialogue are intentionally invisible.
-                continue
+                result.append(_openai_external_item(row, destination))
             continue
 
         # Gemini projection.
-        if destination == "room":
-            if sender_key == "peter":
-                result.append(_text_content("user", row["message_text"]))
-            elif sender_key == "gemini":
-                raise _participant_error()
-            else:
-                result.append(_external_content(row, destination_kind="room"))
-            continue
         if sender_key == "peter" and recipient_key == "gemini":
             result.append(_text_content("user", row["message_text"]))
-        elif sender_key == "gemini" and recipient_key == "peter":
+        elif sender_key == "peter" and destination == "room":
+            result.append(_text_content("user", row["message_text"]))
+        elif sender_key == "gemini" and _is_native_candidate(row, "peter"):
             result.append(
                 _load_gemini_replay(
                     connection, row, room_id, expected_contents=list(result)
                 )
             )
-        elif recipient_key == "gemini" and sender_key != "gemini":
-            result.append(_external_content(row, destination_kind="participant"))
         else:
-            continue
+            result.append(_external_content(row, destination_kind=destination))
     return result
 
 
@@ -210,6 +237,109 @@ def _text_content(role: str, text: str) -> dict[str, Any]:
     return {"role": role, "parts": [{"text": text}]}
 
 
+def _is_native_candidate(row: sqlite3.Row, peter_key: str) -> bool:
+    return (
+        row["destination_kind"] == "participant"
+        and row["recipient_key"] == peter_key
+        and (row["turn_id"] is not None or row["reply_to_id"] is not None)
+    )
+
+
+def _openai_external_item(row: sqlite3.Row, destination_kind: str) -> dict[str, str]:
+    content = _external_content(row, destination_kind=destination_kind)
+    return {"role": "user", "content": content["parts"][0]["text"]}
+
+
+def _load_helios_native(
+    connection: sqlite3.Connection, message: sqlite3.Row, room_id: int
+) -> dict[str, str]:
+    try:
+        _validate_native_pair(connection, message, room_id, "helios", "openai")
+        return {"role": "assistant", "content": message["message_text"]}
+    except (sqlite3.Error, TypeError, ValueError) as exception:
+        raise _helios_history_error() from exception
+
+
+def _validate_native_pair(
+    connection: sqlite3.Connection,
+    message: sqlite3.Row,
+    room_id: int,
+    provider_key: str,
+    provider_family: str,
+) -> sqlite3.Row:
+    if message["turn_id"] is None:
+        raise ValueError("native response has no turn")
+    turns = connection.execute(
+        """SELECT t.room_id, t.initiated_by_participant_id, t.status,
+                  p.participant_key AS initiator_key
+           FROM turns AS t
+           JOIN participants AS p ON p.id=t.initiated_by_participant_id
+           WHERE t.id=?""",
+        (message["turn_id"],),
+    ).fetchall()
+    rows = connection.execute(
+        """SELECT m.id, m.room_id, m.room_sequence_no, m.turn_sequence_no,
+                  m.participant_id, m.participant_config_id, m.reply_to_id,
+                  m.message_type, m.message_text, p.participant_key,
+                  mr.routing_mode, mr.destination_kind,
+                  mr.recipient_participant_id, recipient.participant_key AS recipient_key,
+                  mr.sender_participant_id, sa.participant_id AS sender_alias_owner,
+                  da.participant_id AS destination_alias_owner,
+                  pc.participant_id AS config_owner, pc.provider
+           FROM messages AS m
+           JOIN participants AS p ON p.id=m.participant_id
+           JOIN message_routes AS mr ON mr.message_id=m.id AND mr.room_id=m.room_id
+           JOIN participant_aliases AS sa ON sa.id=mr.sender_alias_id
+           JOIN participant_aliases AS da ON da.id=mr.destination_alias_id
+           LEFT JOIN participants AS recipient ON recipient.id=mr.recipient_participant_id
+           LEFT JOIN participant_configs AS pc ON pc.id=m.participant_config_id
+           WHERE m.turn_id=? ORDER BY m.turn_sequence_no""",
+        (message["turn_id"],),
+    ).fetchall()
+    if len(turns) != 1 or len(rows) != 2:
+        raise ValueError("invalid native turn cardinality")
+    turn = turns[0]
+    trigger, response = rows
+    if (
+        turn["room_id"] != room_id
+        or turn["initiator_key"] != "peter"
+        or turn["initiated_by_participant_id"] != trigger["participant_id"]
+        or turn["status"] != "completed"
+        or trigger["room_id"] != room_id
+        or trigger["turn_sequence_no"] != 1
+        or trigger["participant_key"] != "peter"
+        or trigger["participant_config_id"] is not None
+        or trigger["message_type"] != "chat"
+        or trigger["routing_mode"] != "explicit"
+        or trigger["destination_kind"] != "participant"
+        or trigger["recipient_key"] != provider_key
+        or trigger["sender_participant_id"] != trigger["participant_id"]
+        or trigger["sender_alias_owner"] != trigger["participant_id"]
+        or trigger["destination_alias_owner"] != trigger["recipient_participant_id"]
+        or response["id"] != message["id"]
+        or response["room_id"] != room_id
+        or response["room_sequence_no"] != message["room_sequence_no"]
+        or response["room_sequence_no"] <= trigger["room_sequence_no"]
+        or response["turn_sequence_no"] != 2
+        or response["participant_key"] != provider_key
+        or response["participant_id"] != message["participant_id"]
+        or response["participant_config_id"] != message["participant_config_id"]
+        or response["reply_to_id"] != trigger["id"]
+        or response["message_type"] != "chat"
+        or response["routing_mode"] != "explicit"
+        or response["destination_kind"] != "participant"
+        or response["recipient_key"] != "peter"
+        or response["sender_participant_id"] != response["participant_id"]
+        or response["sender_alias_owner"] != response["participant_id"]
+        or response["destination_alias_owner"] != trigger["participant_id"]
+        or response["config_owner"] != response["participant_id"]
+        or response["provider"] != provider_family
+        or response["message_text"] != message["message_text"]
+    ):
+        raise ValueError("invalid native response")
+    return trigger
+
+
 def _external_content(row: sqlite3.Row, *, destination_kind: str) -> dict[str, Any]:
     if destination_kind == "room":
         destination: dict[str, Any] = {"display_name": "Room", "kind": "room"}
@@ -242,6 +372,12 @@ def _load_gemini_replay(
     *,
     expected_contents: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    try:
+        native_trigger = _validate_native_pair(
+            connection, message, room_id, "gemini", "google"
+        )
+    except (sqlite3.Error, TypeError, ValueError) as exception:
+        raise _gemini_history_error() from exception
     events = connection.execute(
         """SELECT ae.sequence_no, ae.event_type, ae.participant_id,
                   ae.participant_config_id, ae.related_message_id,
@@ -252,18 +388,26 @@ def _load_gemini_replay(
            WHERE ae.turn_id=? ORDER BY ae.sequence_no""",
         (message["turn_id"],),
     ).fetchall()
-    requests = [row for row in events if row["event_type"] == "google.generate_content.request"]
-    responses = [row for row in events if row["event_type"] == "google.generate_content.response"]
-    other = [
+    request_events = [
         row for row in events
-        if row["event_type"] not in {
-            "google.generate_content.request", "google.generate_content.response"
+        if row["event_type"] in {
+            "google.generate_content.request", "openai.responses.request"
+        }
+    ]
+    requests = [row for row in request_events if row["event_type"] == "google.generate_content.request"]
+    responses = [row for row in events if row["event_type"] == "google.generate_content.response"]
+    terminals = [
+        row for row in events
+        if row["event_type"] in {
+            "google.generate_content.response", "google.generate_content.error",
+            "openai.responses.response", "openai.responses.error",
         }
     ]
     if (
         len(requests) != 1
+        or len(request_events) != 1
         or len(responses) != 1
-        or other
+        or len(terminals) != 1
         or requests[0]["sequence_no"] != 1
         or responses[0]["sequence_no"] != 2
         or requests[0]["participant_id"] != message["participant_id"]
@@ -284,44 +428,13 @@ def _load_gemini_replay(
     ):
         raise _gemini_history_error()
     try:
-        trigger_rows = connection.execute(
-            """SELECT m.id, m.turn_id, m.room_id, m.room_sequence_no,
-                      m.message_type, m.message_text, m.participant_config_id,
-                      p.id AS participant_id, p.participant_key,
-                      mr.sender_participant_id, mr.destination_kind,
-                      mr.recipient_participant_id, mr.routing_mode,
-                      sa.participant_id AS sender_alias_owner,
-                      da.participant_id AS destination_alias_owner,
-                      recipient.participant_key AS recipient_key
-               FROM messages AS m
-               JOIN participants AS p ON p.id=m.participant_id
-               JOIN message_routes AS mr ON mr.message_id=m.id
-                 AND mr.room_id=m.room_id
-               JOIN participant_aliases AS sa ON sa.id=mr.sender_alias_id
-               JOIN participant_aliases AS da ON da.id=mr.destination_alias_id
-               LEFT JOIN participants AS recipient ON recipient.id=mr.recipient_participant_id
-               WHERE m.id=?""",
-            (requests[0]["related_message_id"],),
-        ).fetchall()
-        trigger = trigger_rows[0] if len(trigger_rows) == 1 else None
+        trigger = native_trigger
         if (
-            trigger is None
-            or trigger["turn_id"] != message["turn_id"]
-            or trigger["room_id"] != room_id
-            or trigger["message_type"] != "chat"
-            or trigger["participant_key"] != "peter"
-            or trigger["participant_config_id"] is not None
-            or trigger["sender_participant_id"] != trigger["participant_id"]
-            or trigger["sender_alias_owner"] != trigger["participant_id"]
-            or trigger["destination_kind"] != "participant"
-            or trigger["recipient_key"] != "gemini"
-            or trigger["recipient_participant_id"] != message["participant_id"]
-            or trigger["destination_alias_owner"] != message["participant_id"]
-            or trigger["routing_mode"] != "explicit"
+            requests[0]["related_message_id"] != trigger["id"]
         ):
             raise ValueError("invalid request correlation")
         request_payload = json.loads(requests[0]["payload_json"])
-        validate_recorded_google_request_payload(request_payload)
+        validate_recorded_google_shared_request_payload(request_payload)
         config_rows = connection.execute(
             """SELECT pc.id, pc.participant_id, pc.provider, pc.model,
                       pc.config_label, pc.system_instructions,

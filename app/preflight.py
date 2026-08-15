@@ -15,11 +15,13 @@ from .schema_validation import (
     SchemaValidationError,
     V12_HISTORY,
     V13_HISTORY,
+    V14_HISTORY,
     schema_history,
     validate_database_integrity,
-    validate_v12_source,
-    validate_v13_foundation,
+    validate_legacy_reset_dispatch,
+    validate_v14_foundation,
 )
+from .maintenance_lock import MaintenanceLockError, ResetRecoveryRequiredError
 
 
 @dataclass
@@ -48,10 +50,10 @@ def _missing() -> DatabasePreflightError:
     )
 
 
-def _migration_required() -> DatabasePreflightError:
+def _reset_required() -> DatabasePreflightError:
     return DatabasePreflightError(
-        "database_migration_required",
-        "Database schema 1.2 must be migrated to 1.3 before the server can start.",
+        "database_reset_required",
+        "The existing Helios Room database must be retired and reinitialized before this version can run.",
     )
 
 
@@ -63,18 +65,18 @@ def _incompatible() -> DatabasePreflightError:
 
 
 def preflight_database(database_path: Path | str) -> DatabasePreflightReport:
-    """Accept only one complete, unchanged schema-v1.3 read snapshot."""
+    """Accept only one complete, unchanged schema-v1.4 read snapshot."""
 
     def validate(connection: sqlite3.Connection) -> str:
         history = schema_history(connection)
-        if history == V12_HISTORY:
-            validate_v12_source(connection)
+        if history == V12_HISTORY or history == V13_HISTORY:
+            validate_legacy_reset_dispatch(connection, history)
             raise _MigrationRequired()
-        if history != V13_HISTORY:
+        if history != V14_HISTORY:
             raise SchemaValidationError("unsupported schema history")
-        validate_v13_foundation(connection)
+        validate_v14_foundation(connection)
         validate_database_integrity(connection)
-        return "1.3"
+        return "1.4"
 
     try:
         result = run_read_snapshot(
@@ -82,10 +84,17 @@ def preflight_database(database_path: Path | str) -> DatabasePreflightReport:
             validate,
             allow_wal_retry=False,
         )
+    except ResetRecoveryRequiredError as error:
+        raise DatabasePreflightError(error.code, error.message) from None
+    except MaintenanceLockError as error:
+        raise DatabasePreflightError(
+            "database_maintenance_in_progress",
+            "The Helios Room database is unavailable during maintenance.",
+        ) from error
     except ReadSnapshotMissingError as error:
         raise _missing() from error
     except _MigrationRequired as error:
-        raise _migration_required() from error
+        raise _reset_required() from error
     except (
         OSError,
         sqlite3.Error,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import unicodedata
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,10 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 V12_SCHEMA_PATH = PROJECT_ROOT / "schema" / "helios_room_schema_v1_2.sql"
 V13_SCHEMA_PATH = PROJECT_ROOT / "schema" / "helios_room_schema_v1_3.sql"
+V14_SCHEMA_PATH = PROJECT_ROOT / "schema" / "helios_room_schema_v1_4.sql"
 V12_HISTORY = [(1, "1.2")]
 V13_HISTORY = [(1, "1.2"), (2, "1.3")]
+V14_HISTORY = [(1, "1.2"), (2, "1.3"), (3, "1.4")]
 RESERVED_ALIAS_KEYS = frozenset(
     {"all", "everyone", "system", "participants", "room"}
 )
@@ -30,11 +33,15 @@ class SchemaValidationError(RuntimeError):
     """Raised when an observed snapshot is not a supported Helios schema."""
 
 
+class VisibilityPolicyValidationError(SchemaValidationError):
+    """Raised after schema validation isolates shared-policy row corruption."""
+
+
 def _normalized_sql(sql: str) -> str:
     return " ".join(sql.strip().rstrip(";").split()).casefold()
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def _required_schema_objects(schema_path: str) -> dict[tuple[str, str], str]:
     """Parse explicit CREATE statements without executing the schema.
 
@@ -199,7 +206,7 @@ def _validate_core_memberships(
             raise SchemaValidationError("room-system cannot have active membership")
 
 
-def validate_v12_source(connection: sqlite3.Connection) -> None:
+def _validate_v12_source_contract(connection: sqlite3.Connection) -> None:
     """Validate the complete mature v1.2 migration source condition."""
 
     if schema_history(connection) != V12_HISTORY:
@@ -446,7 +453,7 @@ def _validate_message_routes(
             raise SchemaValidationError("route destination kind is invalid")
 
 
-def validate_v13_foundation(connection: sqlite3.Connection) -> None:
+def _validate_v13_foundation_contract(connection: sqlite3.Connection) -> None:
     """Validate schema v1.3 and its mature identity/routing foundation only."""
 
     if schema_history(connection) != V13_HISTORY:
@@ -468,3 +475,109 @@ def validate_v13_foundation(connection: sqlite3.Connection) -> None:
     _validate_message_routes(
         connection, room_system[0], room_alias[0], aliases
     )
+
+
+# The exported legacy names are reserved for the guarded reset source/backup
+# path. Ordinary v1.4 dispatch uses the classifier below and never calls them.
+validate_v12_source = _validate_v12_source_contract
+validate_v13_foundation = _validate_v13_foundation_contract
+
+
+def validate_legacy_reset_dispatch(
+    connection: sqlite3.Connection, history: list[tuple[int, str]]
+) -> None:
+    """Classify an exact retired schema without invoking a reset operation."""
+
+    if history == V12_HISTORY:
+        _validate_v12_source_contract(connection)
+    elif history == V13_HISTORY:
+        _validate_v13_foundation_contract(connection)
+        validate_database_integrity(connection)
+    else:
+        raise SchemaValidationError("schema history is not a retired exact schema")
+
+
+def _validate_policy_timestamp(connection: sqlite3.Connection, value: Any) -> None:
+    if not isinstance(value, str):
+        raise VisibilityPolicyValidationError("visibility policy timestamp is invalid")
+    try:
+        canonical = (
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+            .replace(tzinfo=timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+    except ValueError as error:
+        raise VisibilityPolicyValidationError("visibility policy timestamp is invalid") from error
+    if canonical != value:
+        raise VisibilityPolicyValidationError("visibility policy timestamp is invalid")
+    round_trip = connection.execute(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?)", (value,)
+    ).fetchone()[0]
+    if round_trip != value:
+        raise VisibilityPolicyValidationError("visibility policy timestamp is invalid")
+
+
+def validate_v14_foundation(connection: sqlite3.Connection) -> None:
+    """Validate the complete mature room-shared schema v1.4 foundation."""
+
+    if schema_history(connection) != V14_HISTORY:
+        raise SchemaValidationError("schema history is not exact v1.4")
+    _validate_schema_objects(connection, V14_SCHEMA_PATH)
+    room = _main_room(connection)
+    peter = _required_participant(connection, "peter", "Peter", "human")
+    helios = _required_participant(connection, "helios", "Helios", "ai")
+    gemini = _required_participant(connection, "gemini", "Gemini", "ai")
+    room_system = _required_participant(
+        connection, "room-system", "Room", "system"
+    )
+    _validate_core_memberships(
+        connection, room[0], peter[0], helios[0], room_system[0]
+    )
+    gemini_membership = connection.execute(
+        """SELECT count(*) FROM room_participants
+           WHERE room_id=? AND participant_id=? AND left_at IS NULL""",
+        (room[0], gemini[0]),
+    ).fetchone()[0]
+    if gemini_membership != 1:
+        raise SchemaValidationError("required Gemini membership is invalid")
+    aliases, room_alias = _validated_aliases(connection, room_system[0])
+    _validate_name_lineage(
+        connection, room[0], room_system[0], room_alias, aliases
+    )
+    _validate_message_routes(connection, room_system[0], room_alias[0], aliases)
+
+    initial = connection.execute(
+        """SELECT pc.provider, pc.model, pc.system_instructions,
+                  pc.settings_json, pc.tools_json
+           FROM participant_configs AS pc
+           WHERE pc.participant_id=? AND pc.config_label='initial'""",
+        (helios[0],),
+    ).fetchall()
+    if len(initial) != 1 or tuple(initial[0]) != ("openai", None, None, "{}", "[]"):
+        raise SchemaValidationError("initial Helios configuration is invalid")
+
+    rooms = connection.execute("SELECT id FROM rooms ORDER BY id").fetchall()
+    events = connection.execute(
+        """SELECT room_id, policy_version, effective_from_room_sequence_no, created_at
+           FROM room_history_visibility_events ORDER BY room_id, id"""
+    ).fetchall()
+    by_room: dict[int, list[sqlite3.Row]] = {row[0]: [] for row in rooms}
+    for event in events:
+        if event[0] not in by_room:
+            raise VisibilityPolicyValidationError("visibility policy room is invalid")
+        by_room[event[0]].append(event)
+    for room_id, room_events in by_room.items():
+        if len(room_events) != 1:
+            raise VisibilityPolicyValidationError("visibility policy cardinality is invalid")
+        event = room_events[0]
+        if event[1] != "room_shared_v1" or event[2] != 1:
+            raise VisibilityPolicyValidationError("visibility policy value is invalid")
+        _validate_policy_timestamp(connection, event[3])
+        uncovered = connection.execute(
+            """SELECT count(*) FROM messages
+               WHERE room_id=? AND room_sequence_no < 1""",
+            (room_id,),
+        ).fetchone()[0]
+        if uncovered:
+            raise VisibilityPolicyValidationError("message visibility coverage is invalid")

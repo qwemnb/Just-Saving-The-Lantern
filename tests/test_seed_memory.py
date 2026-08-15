@@ -1586,7 +1586,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         self.assertEqual(json.loads(body)["error"], "trace_data_invalid")
         self.assertEqual(
             preflight_database(self.database_path).schema_label,
-            "1.3",
+            "1.4",
         )
         with closing(connect_database(self.database_path)) as connection:
             after = self._conversation_rows(connection)

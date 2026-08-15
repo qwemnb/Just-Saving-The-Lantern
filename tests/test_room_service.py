@@ -295,7 +295,7 @@ class RoomServiceTests(unittest.TestCase):
             {
                 key: value
                 for key, value in request_event["local_context"].items()
-                if key != "memory_retrieval"
+                if key not in {"memory_retrieval", "history_visibility"}
             },
             {
                 "provider": "openai",
@@ -304,6 +304,14 @@ class RoomServiceTests(unittest.TestCase):
                 "room_sequence_boundary": 1,
                 "timeout_seconds": 120,
                 "max_retries": 0,
+            },
+        )
+        self.assertEqual(
+            request_event["local_context"]["history_visibility"],
+            {
+                "active_policy_version": "room_shared_v1",
+                "effective_from_room_sequence_no": 1,
+                "projection_version": "provider_history_v2",
             },
         )
         self.assertEqual(
@@ -495,7 +503,7 @@ class RoomServiceTests(unittest.TestCase):
             ["Trigger boundary", "Later concurrent message", "Helios reply"],
         )
 
-    def test_unsupported_history_participant_rolls_back_phase_a(self) -> None:
+    def test_additional_human_history_is_shared_as_external_context(self) -> None:
         with closing(connect_database(self.database_path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             room_id = connection.execute(
@@ -540,15 +548,17 @@ class RoomServiceTests(unittest.TestCase):
             )
             connection.commit()
 
-        before = self._counts(self.database_path)
         factory = self._factory(self._success_response())
-        with self.assertRaises(TurnServiceError) as caught:
-            self._run(factory)
-
-        self.assertEqual(caught.exception.code, "unsupported_history_participant")
-        self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(factory.api_keys, [])
-        self.assertEqual(self._counts(self.database_path), before)
+        result = self._run(factory)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(factory.api_keys, [SENTINEL_API_KEY])
+        request = factory.client.responses.calls[0]
+        self.assertTrue(request["input"][0]["content"].startswith(
+            "ROOM_PARTICIPANT_MESSAGE\n"
+        ))
+        self.assertIn(
+            "Unsupported participant history", request["input"][0]["content"]
+        )
 
     def test_unsupported_history_message_types_roll_back_phase_a(self) -> None:
         for message_type in ("system", "correction", "retraction"):

@@ -44,6 +44,7 @@ from app.gemini_client import (
     safe_gemini_exception_diagnostics,
     serialize_and_evaluate_response,
     validate_recorded_google_request_payload,
+    validate_recorded_google_shared_request_payload,
     validate_stored_success_response,
 )
 from app.gemini_identity import (
@@ -915,24 +916,7 @@ class GeminiIntegrationTests(unittest.TestCase):
 
     def test_installer_and_welcome_are_transactional_provider_free_and_idempotent(self) -> None:
         existing = Path(self.temp.name) / "existing.db"
-        connection = connect_database(existing)
-        try:
-            connection.executescript(DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8"))
-            connection.execute("BEGIN IMMEDIATE")
-            room_id = _ensure_room(connection)
-            peter_id = _ensure_participant(connection, "peter", "Peter", "human")
-            helios_id = _ensure_participant(connection, "helios", "Helios", "ai")
-            system_id = _ensure_participant(connection, "room-system", "Room", "system")
-            for participant_id, alias in (
-                (peter_id, "Peter"), (helios_id, "Helios"), (system_id, "Room")
-            ):
-                _ensure_identity_bootstrap(connection, participant_id, alias)
-            _ensure_active_membership(connection, room_id, peter_id)
-            _ensure_active_membership(connection, room_id, helios_id)
-            _ensure_initial_helios_config(connection, helios_id)
-            connection.commit()
-        finally:
-            connection.close()
+        initialize_database(existing)
         watched_environment = {
             "GEMINI_API_KEY",
             "HELIOS_GEMINI_MODEL",
@@ -1061,7 +1045,7 @@ class GeminiIntegrationTests(unittest.TestCase):
             "connect",
             side_effect=fail_fast("socket connection"),
         ) as socket_connection:
-            self.assertEqual(install_gemini(existing)["status"], "installed")
+            self.assertEqual(install_gemini(existing)["status"], "already_installed")
             before = existing.read_bytes()
             self.assertEqual(install_gemini(existing)["status"], "already_installed")
             self.assertEqual(existing.read_bytes(), before)
@@ -1191,17 +1175,16 @@ class GeminiIntegrationTests(unittest.TestCase):
                 provider_participant_key="gemini",
             )
 
-        self.assertEqual(helios, [
-            {"role": "user", "content": "shared room note"},
-            {"role": "user", "content": "private for Helios"},
-            {"role": "assistant", "content": "private Helios reply"},
-        ])
+        self.assertEqual(len(helios), 6)
+        self.assertEqual(helios[1], {"role": "user", "content": "shared room note"})
+        self.assertEqual(helios[2], {"role": "user", "content": "private for Helios"})
+        self.assertEqual(helios[3], {"role": "assistant", "content": "private Helios reply"})
         gemini_text = [part["text"] for content in gemini for part in content["parts"]]
-        self.assertEqual(gemini_text[1:], [
-            "shared room note",
-            "private for Gemini",
-            "private thought",
-            "private Gemini reply",
+        self.assertEqual(gemini_text[1], "shared room note")
+        self.assertIn("private for Helios", gemini_text[2])
+        self.assertIn("private Helios reply", gemini_text[3])
+        self.assertEqual(gemini_text[4:], [
+            "private for Gemini", "private thought", "private Gemini reply"
         ])
         self.assertTrue(gemini_text[0].startswith("ROOM_PARTICIPANT_MESSAGE\n"))
         welcome_envelope = json.loads(gemini_text[0].split("\n", 1)[1])
@@ -1211,8 +1194,8 @@ class GeminiIntegrationTests(unittest.TestCase):
         self.assertEqual(welcome_envelope["destination"], {
             "display_name": "Gemini", "kind": "participant", "participant_key": "gemini"
         })
-        self.assertNotIn("private for Helios", json.dumps(gemini))
-        self.assertNotIn("private Gemini", json.dumps(helios))
+        self.assertIn("private for Helios", json.dumps(gemini))
+        self.assertIn("private Gemini", json.dumps(helios))
 
     def test_fixed_exception_diagnostics_never_use_exception_class(self) -> None:
         class AttackerNamedError(RuntimeError):
@@ -1681,7 +1664,7 @@ class GeminiIntegrationTests(unittest.TestCase):
             payload = json.loads(json.dumps(valid))
             mutate(payload)
             with self.subTest(name=name), self.assertRaises(ValueError):
-                validate_recorded_google_request_payload(payload)
+                validate_recorded_google_shared_request_payload(payload)
 
     def test_historical_event_metadata_and_mixed_families_fail_before_provider(self) -> None:
         def fail_fast(label: str) -> Any:

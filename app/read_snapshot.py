@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Generic, TypeVar
 
+from .maintenance_lock import acquire_database_lease
+
 
 BUSY_TIMEOUT_MS = 5_000
 T = TypeVar("T")
@@ -134,9 +136,18 @@ def run_read_snapshot(
     fails closed instead of accepting a different snapshot.
     """
 
-    return _run_read_snapshot(
-        database_path, operation, allow_wal_retry=allow_wal_retry
-    )
+    # Keep the cooperative shared lease for the complete SQLite snapshot and
+    # every post-close identity check.  A WAL retry reuses this same lease.
+    # Establish missing/non-file semantics before lock lookup; ordinary reads
+    # must never create a coordination directory for a missing database.
+    path = _canonical_file(database_path)
+    lease = acquire_database_lease(path, shared=True)
+    try:
+        return _run_read_snapshot(
+            path, operation, allow_wal_retry=allow_wal_retry
+        )
+    finally:
+        lease.close()
 
 
 def _run_read_snapshot(

@@ -20,6 +20,7 @@ from .commands import classify_local_command, is_reserved_local_command
 from .database import (
     DEFAULT_DATABASE_PATH,
     DatabaseInitializationError,
+    MessageVisibilityGuardError,
     initialize_database,
     is_blank_message,
 )
@@ -37,11 +38,22 @@ from .gemini_identity import (
 )
 from .gemini_service import run_gemini_turn
 from .migration import DatabaseMigrationError, migrate_database
+from .maintenance_lock import (
+    MaintenanceLockError,
+    ResetRecoveryRequiredError,
+    acquire_database_lease,
+)
 from .models import MessageRequest
 from .openai_client import create_openai_client
 from .participant_registry import registration_for
 from .preflight import DatabasePreflightError, preflight_database
 from .room_service import TurnServiceError, run_helios_turn
+from .reset_database import (
+    DatabaseResetError,
+    execute_database_reset,
+    plan_database_reset,
+    recover_database_reset,
+)
 from .seed_memory import SeedMemoryError, import_seed_memories, load_seed_manifest
 from .trace_service import TraceServiceError, load_trace
 
@@ -236,6 +248,7 @@ def main() -> None:
             "import-seed-memories",
             "install-gemini",
             "publish-gemini-welcome",
+            "reset-database",
             "serve",
         ),
         help=(
@@ -281,6 +294,15 @@ def main() -> None:
         default=8000,
         help="Port to bind the web server to (for serve command).",
     )
+    parser.add_argument("--plan", action="store_true")
+    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--recover", action="store_true")
+    parser.add_argument("--expected-plan-token")
+    parser.add_argument("--expected-backup-path")
+    parser.add_argument("--expected-audit-path")
+    parser.add_argument("--confirm-destroy-canonical-history", action="store_true")
+    parser.add_argument("--action", choices=("restore-source", "complete-fresh"))
+    parser.add_argument("--confirm-reset-recovery", action="store_true")
     arguments = parser.parse_args()
 
     if arguments.command == "init-db":
@@ -321,7 +343,10 @@ def main() -> None:
         try:
             result = post_room_message(arguments.message, arguments.database)
         except IdentityServiceError as error:
-            print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
+            print(
+                json.dumps(error.as_payload(), sort_keys=True, separators=(",", ":")),
+                file=sys.stderr,
+            )
             raise SystemExit(1) from None
         print(json.dumps(result, indent=2))
 
@@ -351,20 +376,81 @@ def main() -> None:
     elif arguments.command == "publish-gemini-welcome":
         try:
             report = publish_gemini_welcome(arguments.database)
+        except MessageVisibilityGuardError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True, separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(1) from None
         except GeminiIdentityError as error:
             print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
             raise SystemExit(1) from None
         print(json.dumps(report, indent=2, ensure_ascii=False))
 
-    elif arguments.command == "serve":
+    elif arguments.command == "reset-database":
+        modes = sum((arguments.plan, arguments.execute, arguments.recover))
+        if modes != 1:
+            error = DatabaseResetError(
+                "reset_confirmation_required",
+                "Reset execution requires the exact reviewed plan and explicit confirmation.",
+                exit_code=2,
+            )
+            print(json.dumps(error.as_payload(), sort_keys=True, separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(error.exit_code) from None
         try:
+            if arguments.plan:
+                report = plan_database_reset(arguments.database)
+            elif arguments.execute:
+                report = execute_database_reset(
+                    arguments.database,
+                    expected_plan_token=arguments.expected_plan_token,
+                    expected_backup_path=arguments.expected_backup_path,
+                    expected_audit_path=arguments.expected_audit_path,
+                    confirm_destroy_canonical_history=arguments.confirm_destroy_canonical_history,
+                )
+            else:
+                report = recover_database_reset(
+                    arguments.database,
+                    expected_plan_token=arguments.expected_plan_token,
+                    action=arguments.action,
+                    confirm_reset_recovery=arguments.confirm_reset_recovery,
+                )
+        except DatabaseResetError as error:
+            print(json.dumps(error.as_payload(), sort_keys=True, separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(error.exit_code) from None
+        print(json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+    elif arguments.command == "serve":
+        server_lease = None
+        try:
+            if Path(arguments.database).is_file():
+                server_lease = acquire_database_lease(arguments.database, shared=True)
             preflight_database(arguments.database)
+        except ResetRecoveryRequiredError as error:
+            if server_lease is not None:
+                server_lease.close()
+            print(json.dumps({
+                "error": error.code,
+                "message": error.message,
+            }, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(1) from None
+        except MaintenanceLockError:
+            if server_lease is not None:
+                server_lease.close()
+            print(json.dumps({
+                "error": "database_maintenance_in_progress",
+                "message": "The Helios Room database is unavailable during maintenance.",
+            }, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+            raise SystemExit(1) from None
         except DatabasePreflightError as error:
+            if server_lease is not None:
+                server_lease.close()
             print(json.dumps(error.as_payload(), sort_keys=True), file=sys.stderr)
             raise SystemExit(1) from None
         app.state.database_path = Path(arguments.database).expanduser().resolve()
         print(f"Starting Helios Room web server on http://{arguments.host}:{arguments.port}")
-        uvicorn.run(app, host=arguments.host, port=arguments.port)
+        try:
+            uvicorn.run(app, host=arguments.host, port=arguments.port)
+        finally:
+            if server_lease is not None:
+                server_lease.close()
 
 
 if __name__ == "__main__":

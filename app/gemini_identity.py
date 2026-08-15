@@ -8,9 +8,19 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .database import connect_database, create_turn, store_message
+from .database import (
+    MessageVisibilityGuardError,
+    connect_database,
+    create_turn,
+    store_message,
+)
 from .identity_service import current_alias
-from .schema_validation import validate_database_integrity, validate_v13_foundation
+from .maintenance_lock import ResetRecoveryRequiredError
+from .schema_validation import (
+    VisibilityPolicyValidationError,
+    validate_database_integrity,
+    validate_v14_foundation,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -56,12 +66,14 @@ def install_gemini(database_path: Path | str) -> dict[str, str]:
         raise _install_unavailable()
     try:
         connection = connect_database(path)
+    except ResetRecoveryRequiredError as exception:
+        raise GeminiIdentityError(exception.code, exception.message) from None
     except (OSError, sqlite3.Error) as exception:
         raise _install_unavailable() from exception
     try:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            validate_v13_foundation(connection)
+            validate_v14_foundation(connection)
             validate_database_integrity(connection)
         except Exception as exception:
             raise _install_incompatible() from exception
@@ -163,7 +175,7 @@ def install_gemini(database_path: Path | str) -> dict[str, str]:
             raise _install_incompatible()
 
         try:
-            validate_v13_foundation(connection)
+            validate_v14_foundation(connection)
             validate_database_integrity(connection)
         except Exception as exception:
             raise _install_incompatible() from exception
@@ -171,8 +183,12 @@ def install_gemini(database_path: Path | str) -> dict[str, str]:
         return {
             "status": status,
             "participant_key": "gemini",
-            "schema_label": "1.3",
+            "schema_label": "1.4",
         }
+    except MessageVisibilityGuardError:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     except GeminiIdentityError:
         if connection.in_transaction:
             connection.rollback()
@@ -181,6 +197,8 @@ def install_gemini(database_path: Path | str) -> dict[str, str]:
         if connection.in_transaction:
             connection.rollback()
         raise _install_incompatible() from exception
+    except ResetRecoveryRequiredError as exception:
+        raise GeminiIdentityError(exception.code, exception.message) from None
     except (OSError, sqlite3.Error) as exception:
         if connection.in_transaction:
             connection.rollback()
@@ -270,8 +288,10 @@ def publish_gemini_welcome(database_path: Path | str) -> dict[str, Any]:
     try:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            validate_v13_foundation(connection)
+            validate_v14_foundation(connection)
             validate_database_integrity(connection)
+        except VisibilityPolicyValidationError as exception:
+            raise MessageVisibilityGuardError() from exception
         except Exception as exception:
             raise _welcome_incompatible() from exception
         room = connection.execute(
@@ -411,7 +431,7 @@ def publish_gemini_welcome(database_path: Path | str) -> dict[str, Any]:
                WHERE id=? AND status='open'""",
             (turn_id,),
         )
-        validate_v13_foundation(connection)
+        validate_v14_foundation(connection)
         validate_database_integrity(connection)
         connection.commit()
         return {
@@ -420,6 +440,10 @@ def publish_gemini_welcome(database_path: Path | str) -> dict[str, Any]:
             "recipient": "gemini",
             "message_id": message_id,
         }
+    except MessageVisibilityGuardError:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     except GeminiIdentityError:
         if connection.in_transaction:
             connection.rollback()

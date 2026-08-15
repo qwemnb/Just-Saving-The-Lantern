@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .database import EXPECTED_SCHEMA_MIGRATIONS, connect_database
+from .maintenance_lock import ResetRecoveryRequiredError
 from .participant_registry import registration_for
-from .schema_validation import validate_database_integrity, validate_v13_foundation
+from .schema_validation import validate_database_integrity, validate_v14_foundation
 
 
 RETRIEVER_VERSION = "seed-fts-topic-v1"
@@ -347,6 +348,8 @@ def import_seed_memories(
         )
     try:
         connection = connect_database(path)
+    except ResetRecoveryRequiredError as exception:
+        raise SeedMemoryError(exception.code, exception.message) from None
     except (OSError, sqlite3.Error) as exception:
         raise SeedMemoryError(
             "seed_database_unavailable",
@@ -356,7 +359,7 @@ def import_seed_memories(
         connection.execute("BEGIN IMMEDIATE")
         _validate_schema(connection)
         try:
-            validate_v13_foundation(connection)
+            validate_v14_foundation(connection)
             validate_database_integrity(connection)
         except Exception as exception:
             raise SeedMemoryError(

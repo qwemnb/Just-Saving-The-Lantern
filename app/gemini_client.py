@@ -20,6 +20,11 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+from .request_validation import (
+    validate_history_visibility,
+    validate_memory_retrieval_evidence,
+)
+
 
 GEMINI_TIMEOUT_MILLISECONDS = 120_000
 GEMINI_TIMEOUT_SECONDS = 120
@@ -282,6 +287,24 @@ def validate_recorded_google_request_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(contents, list) or not contents:
         raise ValueError("invalid recorded Google request contents")
     contents_from_recorded(contents)
+    return payload
+
+
+def validate_recorded_google_shared_request_payload(payload: Any) -> dict[str, Any]:
+    """Validate the closed room-shared Google request envelope."""
+
+    if not isinstance(payload, dict) or set(payload) != {"local_context", "request"}:
+        raise ValueError("invalid recorded Google shared request envelope")
+    local = payload.get("local_context")
+    if not isinstance(local, dict) or "history_visibility" not in local:
+        raise ValueError("missing Google history visibility evidence")
+    validate_history_visibility(local["history_visibility"])
+    legacy_local = dict(local)
+    del legacy_local["history_visibility"]
+    validate_recorded_google_request_payload(
+        {"local_context": legacy_local, "request": payload["request"]}
+    )
+    validate_memory_retrieval_evidence(local["memory_retrieval"])
     return payload
 
 

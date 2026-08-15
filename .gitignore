@@ -189,3 +189,13 @@ data/
 *.db-shm
 *.db-journal
 *.sqlite*
+
+# Helios Room database and reset artifacts
+/backups/
+/data/helios.db
+/data/helios.db-wal
+/data/helios.db-shm
+/data/.helios-room-database.lock
+/data/.helios-room-reset-state.json
+/data/.helios-room-reset-state.json.next
+/data/.helios*.reset-*

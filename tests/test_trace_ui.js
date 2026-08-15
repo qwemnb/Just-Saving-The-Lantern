@@ -225,7 +225,7 @@ function response(ok, payload, status = 200) {
 
 function minimalTrace(overrides = {}) {
     return {
-        trace_version: 2,
+        trace_version: 3,
         turn: {
             id: 17,
             status: 'open',
@@ -391,6 +391,46 @@ test('trace rendering handles empty/open data and future recorded memory generic
     const text = allText(doc.getElementById('trace-body'));
     assert.match(text, /<b>text only<\/b>/);
     assert.doesNotMatch(text, new RegExp(NO_MEMORY_RETRIEVAL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+});
+
+
+test('Trace v3 renders room-wide visibility and redaction without private labels', () => {
+    const doc = makeDocument();
+    renderTrace(minimalTrace({
+        recorded_request: {
+            is_redacted: false,
+            request: {},
+            local_context: {
+                history_visibility: {
+                    active_policy_version: 'room_shared_v1',
+                    effective_from_room_sequence_no: 1,
+                    projection_version: 'provider_history_v2'
+                }
+            }
+        }
+    }), doc);
+    let text = allText(doc.getElementById('trace-body'));
+    assert.match(text, /Room-wide history/);
+    assert.match(text, /room_shared_v1/);
+    assert.match(text, /provider_history_v2/);
+    assert.doesNotMatch(text, /private/i);
+
+    renderTrace(minimalTrace({
+        recorded_request: {
+            is_redacted: true,
+            request: null,
+            local_context: null
+        }
+    }), doc);
+    text = allText(doc.getElementById('trace-body'));
+    assert.match(text, /Room-wide history; request details redacted/);
+});
+
+
+test('Trace dialog uses a local inspection warning without a private label', () => {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'static', 'index.html'), 'utf8');
+    assert.match(html, /Local inspection:/);
+    assert.doesNotMatch(html, /Private local inspection:/i);
 });
 
 

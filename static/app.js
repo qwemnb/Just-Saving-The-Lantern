@@ -295,6 +295,22 @@ function renderTrace(trace, doc = document) {
         appendPre(doc, requestSection, trace.recorded_request);
     }
 
+    const visibilitySection = createSection(doc, body, 'Room-wide history');
+    const recorded = trace.recorded_request;
+    const visibility = recorded && recorded.local_context
+        ? recorded.local_context.history_visibility
+        : null;
+    if (recorded && recorded.is_redacted) {
+        appendText(doc, visibilitySection, 'Visibility', 'Room-wide history; request details redacted');
+    } else if (visibility) {
+        appendText(doc, visibilitySection, 'Visibility', 'Room-wide history');
+        appendText(doc, visibilitySection, 'Policy version', visibility.active_policy_version);
+        appendText(doc, visibilitySection, 'Effective sequence', visibility.effective_from_room_sequence_no);
+        appendText(doc, visibilitySection, 'Projection version', visibility.projection_version);
+    } else {
+        appendText(doc, visibilitySection, 'Visibility', 'Room-wide history');
+    }
+
     const outcomeSection = createSection(doc, body, 'Provider outcome');
     if (trace.provider_outcome === null || trace.provider_outcome === undefined) {
         appendText(doc, outcomeSection, 'Outcome', 'None recorded');

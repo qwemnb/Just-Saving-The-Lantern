@@ -18,7 +18,7 @@ class DatabaseInitializationTests(unittest.TestCase):
     def test_initializes_schema_and_milestone_records(self) -> None:
         report = initialize_database(self.database_path)
 
-        self.assertEqual(report.schema_label, "1.3")
+        self.assertEqual(report.schema_label, "1.4")
         self.assertEqual(report.room_count, 1)
         self.assertEqual(report.participant_count, 4)
         self.assertEqual(report.active_membership_count, 3)
@@ -51,6 +51,10 @@ class DatabaseInitializationTests(unittest.TestCase):
                 JOIN participants AS p ON p.id = pc.participant_id
                 """
             ).fetchone()
+            policy = connection.execute(
+                """SELECT policy_version,effective_from_room_sequence_no
+                   FROM room_history_visibility_events"""
+            ).fetchone()
 
         self.assertEqual(tuple(room), ("main", "The Room"))
         self.assertEqual(
@@ -66,6 +70,7 @@ class DatabaseInitializationTests(unittest.TestCase):
             tuple(config),
             ("helios", "openai", None, "initial", None, "{}", "[]"),
         )
+        self.assertEqual(tuple(policy), ("room_shared_v1", 1))
 
     def test_initialization_is_idempotent(self) -> None:
         initialize_database(self.database_path)

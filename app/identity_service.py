@@ -9,14 +9,20 @@ from typing import Any
 
 from .commands import classify_local_command, is_reserved_local_command
 from .database import (
+    MessageVisibilityGuardError,
     connect_database,
     create_turn,
     is_blank_message,
     store_message,
 )
 from .read_snapshot import ReadSnapshotError, run_read_snapshot
+from .maintenance_lock import MaintenanceLockError, ResetRecoveryRequiredError
 from .participant_registry import is_addressable_ai
-from .schema_validation import SchemaValidationError, validate_v13_foundation
+from .schema_validation import (
+    SchemaValidationError,
+    VisibilityPolicyValidationError,
+    validate_v14_foundation,
+)
 
 
 RESERVED_ALIAS_KEYS = frozenset({"all", "everyone", "system", "participants"})
@@ -237,24 +243,14 @@ def adopt_participant_name(
     if system_alias["alias_key"] != "room":
         raise RuntimeError("room alias invalid")
 
-    # All validation and conflict reads above intentionally precede the first write.
-    if collision is None:
-        cursor = connection.execute(
-            """INSERT INTO participant_aliases
-               (participant_id, display_alias, alias_key) VALUES (?, ?, ?)""",
-            (subject_id, display_alias, normalized),
-        )
-        new_alias_id = cursor.lastrowid
-    else:
-        new_alias_id = collision["id"]
+    if collision is not None:
         display_alias = connection.execute(
             "SELECT display_alias FROM participant_aliases WHERE id = ?",
-            (new_alias_id,),
+            (collision["id"],),
         ).fetchone()[0]
-    connection.execute(
-        "UPDATE participant_primary_aliases SET alias_id = ? WHERE participant_id = ?",
-        (new_alias_id, subject_id),
-    )
+
+    # Publish while the mature pre-adoption foundation is still exact.  The
+    # alias/event graph is then advanced atomically around this message ID.
     message_id = store_message(
         connection,
         room_id=room_id,
@@ -265,6 +261,19 @@ def adopt_participant_name(
         destination_kind="room",
         destination_alias_id=system_alias["id"],
         recipient_participant_id=None,
+    )
+    if collision is None:
+        cursor = connection.execute(
+            """INSERT INTO participant_aliases
+               (participant_id, display_alias, alias_key) VALUES (?, ?, ?)""",
+            (subject_id, display_alias, normalized),
+        )
+        new_alias_id = cursor.lastrowid
+    else:
+        new_alias_id = collision["id"]
+    connection.execute(
+        "UPDATE participant_primary_aliases SET alias_id = ? WHERE participant_id = ?",
+        (new_alias_id, subject_id),
     )
     connection.execute(
         """
@@ -288,15 +297,15 @@ def adopt_participant_name(
 def _load_participant_directory_snapshot(
     connection: sqlite3.Connection,
 ) -> dict[str, Any]:
-        validate_v13_foundation(connection)
-        room_rows = connection.execute(
-            "SELECT id, name FROM rooms WHERE room_key = 'main'"
-        ).fetchall()
-        if len(room_rows) != 1 or room_rows[0]["name"] != "The Room":
-            raise ValueError("invalid room")
-        room_id = room_rows[0]["id"]
-        rows = connection.execute(
-            """
+    validate_v14_foundation(connection)
+    room_rows = connection.execute(
+        "SELECT id, name FROM rooms WHERE room_key = 'main'"
+    ).fetchall()
+    if len(room_rows) != 1 or room_rows[0]["name"] != "The Room":
+        raise ValueError("invalid room")
+    room_id = room_rows[0]["id"]
+    rows = connection.execute(
+        """
             SELECT p.id, p.participant_key, p.participant_type,
                    pa.id AS alias_id, pa.display_alias, pa.alias_key,
                    CASE WHEN ppa.alias_id = pa.id THEN 1 ELSE 0 END AS is_primary
@@ -306,46 +315,46 @@ def _load_participant_directory_snapshot(
             JOIN participant_primary_aliases AS ppa ON ppa.participant_id = p.id
             WHERE rp.room_id = ? AND rp.left_at IS NULL
             ORDER BY p.id, is_primary DESC, pa.id
-            """,
-            (room_id,),
-        ).fetchall()
-        grouped: dict[int, list[sqlite3.Row]] = {}
-        for row in rows:
-            _validate_stored_alias(row["display_alias"], row["alias_key"])
-            grouped.setdefault(row["id"], []).append(row)
-        destinations: list[dict[str, Any]] = [
-            {"kind": "room", "label": "Room", "addressable": True}
-        ]
-        participants: list[tuple[str, str, dict[str, Any]]] = []
-        for participant_id, aliases in grouped.items():
-            del participant_id
-            primary = [row for row in aliases if row["is_primary"] == 1]
-            if len(primary) != 1 or aliases[0] is not primary[0]:
-                raise ValueError("invalid primary alias")
-            row = primary[0]
-            if row["participant_key"] == "room-system":
-                raise ValueError("room system cannot be a member")
-            addressable = is_addressable_ai(
-                row["participant_key"], row["participant_type"]
-            )
-            entry = {
-                "kind": "participant",
-                "participant_key": row["participant_key"],
-                "primary_name": row["display_alias"],
-                "aliases": [alias["display_alias"] for alias in aliases],
-                "participant_type": row["participant_type"],
-                "addressable": addressable,
-            }
-            participants.append((row["alias_key"], row["participant_key"], entry))
-        if not any(entry[2]["participant_key"] == "peter" for entry in participants):
-            raise ValueError("Peter missing")
-        participants.sort(key=lambda item: (item[0], item[1]))
-        destinations.extend(entry for _, _, entry in participants)
-        return {
-            "directory_version": 1,
-            "room": {"room_key": "main", "name": "The Room"},
-            "destinations": destinations,
+        """,
+        (room_id,),
+    ).fetchall()
+    grouped: dict[int, list[sqlite3.Row]] = {}
+    for row in rows:
+        _validate_stored_alias(row["display_alias"], row["alias_key"])
+        grouped.setdefault(row["id"], []).append(row)
+    destinations: list[dict[str, Any]] = [
+        {"kind": "room", "label": "Room", "addressable": True}
+    ]
+    participants: list[tuple[str, str, dict[str, Any]]] = []
+    for participant_id, aliases in grouped.items():
+        del participant_id
+        primary = [row for row in aliases if row["is_primary"] == 1]
+        if len(primary) != 1 or aliases[0] is not primary[0]:
+            raise ValueError("invalid primary alias")
+        row = primary[0]
+        if row["participant_key"] == "room-system":
+            raise ValueError("room system cannot be a member")
+        addressable = is_addressable_ai(
+            row["participant_key"], row["participant_type"]
+        )
+        entry = {
+            "kind": "participant",
+            "participant_key": row["participant_key"],
+            "primary_name": row["display_alias"],
+            "aliases": [alias["display_alias"] for alias in aliases],
+            "participant_type": row["participant_type"],
+            "addressable": addressable,
         }
+        participants.append((row["alias_key"], row["participant_key"], entry))
+    if not any(entry[2]["participant_key"] == "peter" for entry in participants):
+        raise ValueError("Peter missing")
+    participants.sort(key=lambda item: (item[0], item[1]))
+    destinations.extend(entry for _, _, entry in participants)
+    return {
+        "directory_version": 1,
+        "room": {"room_key": "main", "name": "The Room"},
+        "destinations": destinations,
+    }
 
 
 def load_participant_directory(database_path: Path | str) -> dict[str, Any]:
@@ -355,6 +364,13 @@ def load_participant_directory(database_path: Path | str) -> dict[str, Any]:
             _load_participant_directory_snapshot,
             allow_wal_retry=True,
         ).value
+    except ResetRecoveryRequiredError as error:
+        raise IdentityServiceError(503, error.code, error.message) from None
+    except MaintenanceLockError as error:
+        raise IdentityServiceError(
+            503, "database_maintenance_in_progress",
+            "The Helios Room database is unavailable during maintenance.",
+        ) from error
     except (sqlite3.OperationalError, ReadSnapshotError) as error:
         raise IdentityServiceError(
             503,
@@ -377,7 +393,7 @@ def load_participant_directory(database_path: Path | str) -> dict[str, Any]:
 def _load_message_history_snapshot(
     connection: sqlite3.Connection,
 ) -> list[dict[str, Any]]:
-        validate_v13_foundation(connection)
+        validate_v14_foundation(connection)
         rows = connection.execute(
             """
             SELECT m.id, m.message_text, m.created_at, m.room_sequence_no,
@@ -477,6 +493,13 @@ def load_message_history(database_path: Path | str) -> list[dict[str, Any]]:
             _load_message_history_snapshot,
             allow_wal_retry=True,
         ).value
+    except ResetRecoveryRequiredError as error:
+        raise IdentityServiceError(503, error.code, error.message) from None
+    except MaintenanceLockError as error:
+        raise IdentityServiceError(
+            503, "database_maintenance_in_progress",
+            "The Helios Room database is unavailable during maintenance.",
+        ) from error
     except (sqlite3.OperationalError, ReadSnapshotError) as error:
         raise IdentityServiceError(
             503,
@@ -507,13 +530,23 @@ def post_room_message(message_text: str, database_path: Path | str) -> dict[str,
         )
     try:
         connection = connect_database(database_path)
+    except ResetRecoveryRequiredError as error:
+        raise IdentityServiceError(503, error.code, error.message) from None
+    except MaintenanceLockError as error:
+        raise IdentityServiceError(
+            503, "database_maintenance_in_progress",
+            "The Helios Room database is unavailable during maintenance.",
+        ) from error
     except Exception as error:
         raise IdentityServiceError(
             500, "room_post_failed", "The Room message could not be saved."
         ) from error
     try:
         connection.execute("BEGIN IMMEDIATE")
-        validate_v13_foundation(connection)
+        try:
+            validate_v14_foundation(connection)
+        except VisibilityPolicyValidationError:
+            raise MessageVisibilityGuardError() from None
         context = resolve_room_post_context(connection)
         peter = context["peter"]
         turn_id = create_turn(connection, context["room_id"], peter["id"])
@@ -541,6 +574,11 @@ def post_room_message(message_text: str, database_path: Path | str) -> dict[str,
             "message_id": message_id,
             "destination": {"kind": "room"},
         }
+    except MessageVisibilityGuardError as error:
+        connection.rollback()
+        raise IdentityServiceError(
+            error.status_code, error.code, error.message
+        ) from None
     except IdentityServiceError:
         connection.rollback()
         raise

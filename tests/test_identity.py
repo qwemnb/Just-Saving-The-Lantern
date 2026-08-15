@@ -73,7 +73,7 @@ class FreshSchemaAndAliasTests(IdentityFixture):
                 [tuple(row) for row in connection.execute(
                     "SELECT migration_no,schema_label FROM schema_migrations ORDER BY migration_no"
                 )],
-                [(1, "1.2"), (2, "1.3")],
+                [(1, "1.2"), (2, "1.3"), (3, "1.4")],
             )
             room_id, peter_id, helios_id, room_system_id = self.ids(connection)
             del room_id, peter_id, helios_id
@@ -207,7 +207,7 @@ class DirectoryPostHistoryAndTraceTests(IdentityFixture):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
 
-    def test_room_post_is_atomic_provider_free_and_trace_v2(self) -> None:
+    def test_room_post_is_atomic_provider_free_and_trace_v3(self) -> None:
         sentinel = "  exact Room note  "
         with patch("app.room_service.load_openai_environment", side_effect=AssertionError("no env")):
             response = asyncio.run(self.request(
@@ -226,7 +226,7 @@ class DirectoryPostHistoryAndTraceTests(IdentityFixture):
         self.assertEqual(history[0]["routing"]["sender"]["display_name"], "Peter")
         self.assertEqual(history[0]["routing"]["destination"], {"kind": "room", "display_name": "Room"})
         trace = load_trace(self.database_path, response.json()["turn_id"])
-        self.assertEqual(trace["trace_version"], 2)
+        self.assertEqual(trace["trace_version"], 3)
         self.assertIsNone(trace["recorded_request"])
         self.assertIsNone(trace["provider_outcome"])
         self.assertEqual(trace["api_events"], [])
@@ -327,7 +327,7 @@ class DirectoryPostHistoryAndTraceTests(IdentityFixture):
                 "POST", "/api/messages",
                 json={"message_text": "hello", "destination": {"kind": "participant", "participant_key": "helios"}},
             ))
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 503)
         with closing(connect_database(self.database_path)) as connection:
             for table in ("turns", "messages", "message_routes", "api_events"):
                 self.assertEqual(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
@@ -476,26 +476,16 @@ class MigrationTests(unittest.TestCase):
         connection.commit()
         connection.close()
 
-    def test_migration_backfills_exact_graph_and_is_idempotent(self) -> None:
+    def test_old_database_requires_reset_without_migration_writes(self) -> None:
         self.make_v12()
-        with self.assertRaises(DatabaseInitializationError):
+        with self.assertRaises(DatabaseInitializationError) as init_error:
             initialize_database(self.path)
-        first = migrate_database(self.path)
-        self.assertEqual((first.status, first.migrated_message_count), ("migrated", 1))
         before = self.path.read_bytes()
-        second = migrate_database(self.path)
-        self.assertEqual(second.status, "already_current")
+        with self.assertRaises(DatabaseMigrationError) as migration_error:
+            migrate_database(self.path)
+        self.assertEqual(init_error.exception.code, "database_reset_required")
+        self.assertEqual(migration_error.exception.code, "database_reset_required")
         self.assertEqual(before, self.path.read_bytes())
-        with closing(connect_database(self.path)) as connection:
-            self.assertEqual(
-                [tuple(row) for row in connection.execute("SELECT migration_no,schema_label FROM schema_migrations ORDER BY migration_no")],
-                [(1, "1.2"), (2, "1.3")],
-            )
-            route = connection.execute("SELECT destination_kind,routing_mode FROM message_routes").fetchone()
-            self.assertEqual(tuple(route), ("participant", "legacy_implicit"))
-            self.assertEqual(connection.execute("SELECT message_text FROM messages").fetchone()[0], "exact legacy text")
-            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_collision_failure_is_atomic_exact_v12(self) -> None:
         self.make_v12(second_name="Ｐｅｔｅｒ")

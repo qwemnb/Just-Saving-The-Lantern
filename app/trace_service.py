@@ -1,4 +1,4 @@
-"""Read-only, historical Trace v2 snapshots for the main Helios room."""
+"""Read-only, historical Trace v3 snapshots for the main Helios room."""
 
 from __future__ import annotations
 
@@ -21,11 +21,19 @@ from .gemini_client import (
     content_from_recorded,
     recorded_settings as gemini_recorded_settings,
     validate_bounded_stored_response,
-    validate_recorded_google_request_payload,
+    validate_recorded_google_shared_request_payload,
     validate_stored_success_response,
 )
 from .read_snapshot import ReadSnapshotError, run_read_snapshot
-from .schema_validation import SchemaValidationError, validate_v13_foundation
+from .maintenance_lock import MaintenanceLockError, ResetRecoveryRequiredError
+from .provider_history import ProviderHistoryError, load_provider_history
+from .request_validation import validate_recorded_openai_shared_request_payload
+from .request_validation import (
+    OPENAI_RESPONSE_SETTINGS,
+    OPENAI_RESPONSE_TOOLS,
+    OPENAI_SYSTEM_INSTRUCTIONS,
+)
+from .schema_validation import SchemaValidationError, validate_v14_foundation
 from .seed_memory import (
     INHERITED_MEMORY_HEADER,
     INHERITED_MEMORY_PROVENANCE,
@@ -110,10 +118,10 @@ def _data_invalid() -> TraceServiceError:
 
 
 def load_trace(database_path: Path | str, turn_id: int | None = None) -> dict[str, Any]:
-    """Load one deterministic Trace v2 document from a single snapshot."""
+    """Load one deterministic Trace v3 document from a single snapshot."""
 
     def load(connection: sqlite3.Connection) -> dict[str, Any]:
-        validate_v13_foundation(connection)
+        validate_v14_foundation(connection)
         return _load_snapshot(connection, turn_id)
 
     try:
@@ -124,6 +132,13 @@ def load_trace(database_path: Path | str, turn_id: int | None = None) -> dict[st
         ).value
     except TraceServiceError:
         raise
+    except ResetRecoveryRequiredError as exception:
+        raise TraceServiceError(503, exception.code, exception.message) from None
+    except MaintenanceLockError as exception:
+        raise TraceServiceError(
+            503, "database_maintenance_in_progress",
+            "The Helios Room database is unavailable during maintenance.",
+        ) from exception
     except ReadSnapshotError as exception:
         raise _database_unavailable() from exception
     except SchemaValidationError as exception:
@@ -173,7 +188,7 @@ def _load_snapshot(
     _validate_configuration_references(
         messages, events, configurations_by_id
     )
-    _validate_event_family(turn, messages, events, configurations_by_id)
+    _validate_event_family(connection, turn, messages, events, configurations_by_id)
 
     projected_events = [_project_event(event) for event in events]
     request_events = [event for event in projected_events if event["event_type"] in REQUEST_EVENTS]
@@ -209,7 +224,7 @@ def _load_snapshot(
         }
 
     return {
-        "trace_version": 2,
+        "trace_version": 3,
         "turn": {
             "id": selected_turn_id,
             "status": turn["status"],
@@ -630,6 +645,7 @@ def _validate_configuration_references(
 
 
 def _validate_event_family(
+    connection: sqlite3.Connection,
     turn: sqlite3.Row,
     messages: list[dict[str, Any]],
     events: list[dict[str, Any]],
@@ -660,10 +676,7 @@ def _validate_event_family(
             raise _data_invalid()
     else:
         raise _data_invalid()
-    # Redacted events remain cardinality evidence, but cannot establish the
-    # payload-dependent replay and message-correlation facts below.
-    if any(event["is_redacted"] for event in recognized):
-        return
+    redacted = any(event["is_redacted"] for event in recognized)
     expected_key = "gemini" if family == "google" else "helios"
     config = configurations.get(request[0]["participant_config_id"])
     peter_messages = [
@@ -680,6 +693,76 @@ def _validate_event_family(
         or request[0]["related_message_turn_id"] != turn["id"]
     ):
         raise _data_invalid()
+    peter_route = peter_messages[0]["routing"]
+    peter_destination = peter_route["destination"]
+    if (
+        peter_messages[0]["turn_sequence_no"] != 1
+        or peter_messages[0]["participant_config_id"] is not None
+        or peter_route["routing_mode"] != "explicit"
+        or peter_destination.get("kind") != "participant"
+        or peter_destination.get("participant_key") != expected_key
+    ):
+        raise _data_invalid()
+    if redacted:
+        if status == "open":
+            return
+        if (
+            terminal[0]["participant_key"] != expected_key
+            or terminal[0]["participant_config_id"] != request[0]["participant_config_id"]
+        ):
+            raise _data_invalid()
+        if status == "completed":
+            ai_messages = [
+                message for message in messages
+                if message["participant_key"] == expected_key
+                and message["message_type"] == "chat"
+            ]
+            if (
+                terminal[0]["event_type"] not in RESPONSE_EVENTS
+                or len(ai_messages) != 1
+                or terminal[0]["related_message_id"] != ai_messages[0]["id"]
+            ):
+                raise _data_invalid()
+            response = ai_messages[0]
+            destination = response["routing"]["destination"]
+            if (
+                response["turn_sequence_no"] != 2
+                or response["reply_to_id"] != peter_messages[0]["id"]
+                or response["routing"]["routing_mode"] != "explicit"
+                or destination.get("kind") != "participant"
+                or destination.get("participant_key") != "peter"
+                or response["participant_config_id"] != request[0]["participant_config_id"]
+            ):
+                raise _data_invalid()
+        elif status == "failed" and (
+            terminal[0]["event_type"] not in ERROR_EVENTS
+            or terminal[0]["related_message_id"] != peter_messages[0]["id"]
+        ):
+            raise _data_invalid()
+        return
+    request_payload = request[0]["raw_payload"]
+    try:
+        if family == "google":
+            validate_recorded_google_shared_request_payload(request_payload)
+        else:
+            validate_recorded_openai_shared_request_payload(request_payload)
+        boundary = request_payload["local_context"]["room_sequence_boundary"]
+        expected_history = load_provider_history(
+            connection,
+            room_id=turn["room_id"],
+            boundary=boundary,
+            provider_participant_key=expected_key,
+        )
+        actual_history = list(
+            request_payload["request"]["contents" if family == "google" else "input"]
+        )
+        selected = request_payload["local_context"]["memory_retrieval"]["selected"]
+        if selected:
+            del actual_history[-2]
+        if actual_history != expected_history:
+            raise ValueError("recorded provider history mismatch")
+    except (ProviderHistoryError, TypeError, ValueError, IndexError) as exception:
+        raise _data_invalid() from exception
     if family == "google":
         model = request[0]["raw_payload"]["request"].get("model")
         slug = (
@@ -694,6 +777,23 @@ def _validate_event_family(
             or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS
             or config["settings"] != gemini_recorded_settings()
             or config["tools"] != []
+            or not isinstance(label, str)
+            or not label.startswith(prefix)
+            or not label[len(prefix):].isdigit()
+            or int(label[len(prefix):]) <= 0
+        ):
+            raise _data_invalid()
+    else:
+        model = request[0]["raw_payload"]["request"].get("model")
+        label = config["config_label"]
+        role = model.removeprefix("gpt-5.6-") if isinstance(model, str) else ""
+        role = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "model"
+        prefix = f"seed-memory-openai-{role}-v"
+        if (
+            config["model"] != model
+            or config["system_instructions"] != OPENAI_SYSTEM_INSTRUCTIONS
+            or config["settings"] != OPENAI_RESPONSE_SETTINGS
+            or config["tools"] != OPENAI_RESPONSE_TOOLS
             or not isinstance(label, str)
             or not label.startswith(prefix)
             or not label[len(prefix):].isdigit()
@@ -718,6 +818,17 @@ def _validate_event_family(
             or terminal[0]["related_message_id"] != ai_messages[0]["id"]
         ):
             raise _data_invalid()
+        response = ai_messages[0]
+        destination = response["routing"]["destination"]
+        if (
+            response["turn_sequence_no"] != 2
+            or response["reply_to_id"] != peter_messages[0]["id"]
+            or response["routing"]["routing_mode"] != "explicit"
+            or destination.get("kind") != "participant"
+            or destination.get("participant_key") != "peter"
+            or response["participant_config_id"] != request[0]["participant_config_id"]
+        ):
+            raise _data_invalid()
     elif status == "failed":
         if (
             terminal[0]["event_type"] not in ERROR_EVENTS
@@ -732,7 +843,9 @@ def _project_event(event: dict[str, Any]) -> dict[str, Any]:
     raw_payload = event["raw_payload"]
     event_type = event["event_type"]
     redacted = event["is_redacted"]
-    if not redacted:
+    if redacted:
+        payload, omissions = None, [""]
+    else:
         _validate_recognized_payload(event_type, raw_payload)
 
     if event_type == GOOGLE_RESPONSE_EVENT and not redacted:
@@ -741,7 +854,7 @@ def _project_event(event: dict[str, Any]) -> dict[str, Any]:
         payload, omissions = _project_google_error_payload(raw_payload)
     elif event_type in ERROR_EVENTS and not redacted:
         payload, omissions = _project_error_payload(raw_payload)
-    else:
+    elif not redacted:
         payload, omissions = project_trace_json(raw_payload)
 
     return {
@@ -768,12 +881,10 @@ def _project_event(event: dict[str, Any]) -> dict[str, Any]:
 
 def _validate_recognized_payload(event_type: str, payload: Any) -> None:
     if event_type == REQUEST_EVENT:
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("request"), dict)
-            or not isinstance(payload.get("local_context"), dict)
-        ):
-            raise _data_invalid()
+        try:
+            validate_recorded_openai_shared_request_payload(payload)
+        except (TypeError, ValueError) as exception:
+            raise _data_invalid() from exception
     elif event_type == RESPONSE_EVENT:
         if not isinstance(payload, dict) or not isinstance(payload.get("response"), dict):
             raise _data_invalid()
@@ -801,7 +912,7 @@ def _validate_recognized_payload(event_type: str, payload: Any) -> None:
 
 def _validate_google_request_payload(payload: Any) -> None:
     try:
-        validate_recorded_google_request_payload(payload)
+        validate_recorded_google_shared_request_payload(payload)
     except (TypeError, ValueError) as exception:
         raise _data_invalid() from exception
 
@@ -1186,7 +1297,7 @@ def _validate_raw_inherited_memory(
     if request_event["is_redacted"]:
         return
     payload = request_event["raw_payload"]
-    _validate_recognized_payload(REQUEST_EVENT, payload)
+    _validate_recognized_payload(request_event["event_type"], payload)
     local_context = payload["local_context"]
     if "memory_retrieval" not in local_context:
         return

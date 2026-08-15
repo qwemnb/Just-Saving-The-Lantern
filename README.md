@@ -9,28 +9,28 @@ tool, and memory behavior can be inspected.
 
 The project currently provides:
 
-- SQLite schema v1.3 with stable participant identity, immutable aliases, and routing snapshots
+- fresh-install SQLite schema v1.4 with immutable room-wide history policy
 - idempotent database initialization and milestone seed data
 - persistent Peter, Helios, Gemini, and Room-directed messages with deterministic ordering
 - isolated, one-request, no-retry OpenAI Responses and Google Generate Content orchestration
 - raw request/response/error API events with immutable model provenance
-- read-only, historical Trace v2 inspection with immutable route display
+- read-only, historical Trace v3 inspection with immutable route and visibility display
 - strict, atomic seeded-memory manifest import with semantic idempotency
 - deterministic local seeded-memory retrieval with recorded provenance
 - a read-only participant directory and structured participant/Room destinations
 - a browser participant panel, destination picker, and local participant command
-- provider-private history and participant-owned inherited-memory projections
+- room-wide canonical provider history and participant-owned inherited-memory projections
 - offline database, orchestration, API, browser-privacy, and blank-message regression tests
 
 Whitespace-only messages are ignored by the API and command-line entry point.
 The storage helper also rejects them defensively, and the browser keeps the
 Send button disabled until the input contains non-whitespace text.
 
-Each provider receives only its authorized canonical history. Helios sees Room
-posts and Peter/Helios direct exchanges; Gemini sees Room posts,
-Peter/Gemini direct exchanges, and external-participant envelopes for messages
-authored by another participant and addressed to Gemini. Direct exchanges with
-another AI remain private. Each provider can receive one inherited-memory
+Every selected provider receives every valid canonical chat message in room
+sequence order. Addressing determines who is spoken to and which single
+provider may be triggered; it is not a privacy boundary. Messages outside a
+provider's native Peter dialogue use an exact attributed external envelope.
+Each provider can receive one inherited-memory
 context selected only from records it owns, immediately before Peter's
 triggering message. Room posts never invoke an AI automatically, and there is
 no automated handoff or turn-taking.
@@ -38,11 +38,11 @@ no automated handoff or turn-taking.
 | Canonical route | Helios input | Gemini input |
 | --- | --- | --- |
 | Peter -> Room | include | include |
-| Peter -> Helios / Helios -> Peter | include | omit |
-| Peter -> Gemini / Gemini -> Peter | omit | include |
-| Helios -> Gemini welcome | omit | include as an external-participant envelope |
+| Peter -> Helios / Helios -> Peter | native | external envelope |
+| Peter -> Gemini / Gemini -> Peter | external envelope | native |
+| Helios -> Gemini welcome | external envelope | external envelope |
 | Valid system/name event -> Room | validate, then omit | validate, then omit |
-| Other valid direct exchange | omit | omit |
+| Other valid direct exchange | external envelope | external envelope |
 
 ## Requirements
 
@@ -111,7 +111,8 @@ responses.
 python -m app.main init-db
 ```
 
-This creates `data/helios.db`, installs schema v1.3 when needed, and ensures
+This creates `data/helios.db` only when missing or object-free, installs schema
+v1.4, and ensures
 the following records exist:
 
 - room `main` / `The Room`
@@ -119,46 +120,20 @@ the following records exist:
 - AI participant `helios` / `Helios`
 - AI participant `gemini` / `Gemini`
 - hidden system participant `room-system` with immutable alias `Room`
+- one immutable `room_shared_v1` event effective from room sequence 1
 - active room membership for Peter, Helios, and Gemini
 - one minimal OpenAI participant config for Helios labeled `initial`
 
-Initialization is idempotent and preserves existing messages. A fresh target
-receives the complete v1.3 graph. An existing v1.3 target is validated without
-repairing or reseeding it. The database is local runtime data and is excluded
-from Git.
+The fresh foundation contains no messages, turns, provider events, Gemini
+configuration, or imported memory rows. Existing exact schema 1.2 or 1.3
+databases are never migrated in place; `init-db`, `migrate-database`, and
+server preflight return `database_reset_required`. Retiring one requires the
+separately authorized, reviewed reset protocol below.
 
-`init-db` does not upgrade an existing v1.2 database. It stops with a
-migration-required error so an upgrade can happen only through the explicit,
-reviewable procedure below.
-
-### Back up and migrate schema v1.2
-
-Stop the server before migration. The human operator—not the application—must
-create and verify a self-contained SQLite backup. Because WAL state may contain
-committed changes, use SQLite's backup API rather than copying only the `.db`
-file:
-
-```powershell
-New-Item -ItemType Directory -Force data\backups | Out-Null
-python -c "from pathlib import Path; import sqlite3; source=sqlite3.connect('file:data/helios.db?mode=ro', uri=True); target=Path('data/backups/helios-before-v1.3.db'); assert not target.exists(); backup=sqlite3.connect(target); source.backup(backup); assert backup.execute('PRAGMA integrity_check').fetchall()==[('ok',)]; backup.close(); source.close()"
-```
-
-Then run the one explicit migration command:
-
-```powershell
-python -m app.main migrate-database --database data\helios.db
-```
-
-The migration uses one `BEGIN IMMEDIATE` transaction, validates the exact v1.2
-history and canonical data, preserves existing IDs/text/order/provenance,
-creates aliases and `room-system`, and backfills one `legacy_implicit` route per
-message. Any failure rolls the transaction back. A completed v1.3 database
-returns `already_current` without writes.
-
-If live acceptance fails after a successful migration, stop the server, move
-the migrated database and any `-wal`/`-shm` companions out of `data/`, and
-restore with SQLite's backup API from the verified backup. Do not overwrite a
-running database or restore while any Helios Room process has it open.
+Initialization is idempotent for an exact schema 1.4 database and preserves
+its canonical history. `migrate-database` now performs closed dispatch only:
+it returns `already_current` for exact schema 1.4 and never upgrades an older
+database. Local runtime databases are excluded from Git.
 
 In a newly initialized database, the seeded `initial` Helios configuration is
 an unused placeholder. The first accepted API-backed turn creates a separate
@@ -182,18 +157,62 @@ python -m app.main serve --database C:\path\to\helios.db
 
 Before binding a socket or serving static files, `serve` performs a read-only
 schema preflight against one consistent SQLite snapshot. It accepts only exact
-schema history 1.2 then 1.3, the complete required schema objects, the mature
+schema history through 1.4, the complete required schema objects, the mature
 identity and alias foundation, current-primary/name-event lineage, one route
 per canonical message, and successful integrity and foreign-key checks.
 Startup never initializes, migrates, checkpoints, repairs, or creates the
-selected database. A missing path, an exact migration-eligible v1.2 database,
-and an incompatible database return these sanitized errors respectively:
+selected database. A missing path, an exact old v1.2/v1.3 database, and an
+incompatible database return these sanitized errors respectively:
 
 ```text
 database_not_initialized
-database_migration_required
+database_reset_required
 database_schema_incompatible
 ```
+
+Every application database open participates in the shared maintenance lock
+`data/.helios-room-database.lock`. Reset planning, execution, and recovery use
+one exclusive lease; normal startup and connections fail closed while it is
+held or while either durable reset-state journal exists.
+
+## Controlled fresh-database reset
+
+Implementation and tests do not authorize a live plan or reset. After the
+implementation is audited, committed, and pushed, a separate instruction is
+required to generate the filesystem-only plan:
+
+```powershell
+python -m app.main reset-database --plan --database data/helios.db
+```
+
+Planning opens no SQLite connection and changes no database or sidecar. Review
+its exact token, backup path, audit path, filesystem identity, implementation
+commit, protocol, and recovery-commit mapping. A second explicit authorization
+naming that exact plan is required before execution:
+
+```powershell
+python -m app.main reset-database --execute --database data/helios.db `
+  --expected-plan-token <reviewed-token> `
+  --expected-backup-path <reviewed-backup-path> `
+  --expected-audit-path <reviewed-audit-path> `
+  --confirm-destroy-canonical-history
+```
+
+Execution accepts only an exact valid schema 1.2 or 1.3 source, retains a
+verified backup and closed audit artifact under `backups/`, and installs a new
+schema 1.4 database with no retired rows. If a durable journal remains after
+interruption, ordinary startup stays closed. After reviewing it, authorize one
+exact recovery action separately:
+
+```powershell
+python -m app.main reset-database --recover --database data/helios.db `
+  --expected-plan-token <reviewed-token> `
+  --action <restore-source|complete-fresh> --confirm-reset-recovery
+```
+
+Do not bootstrap memory, publish the welcome, start live acceptance, or call a
+provider until reset success has been reviewed and each later operation is
+separately authorized.
 
 The accepted result applies to the snapshot checked during preflight. A later
 process can still replace or modify the database, so participant directory,
@@ -279,16 +298,15 @@ Gemini's canonical reply.
 
 ## Install Gemini and publish the reviewed welcome
 
-Fresh database initialization includes Gemini. For an existing exact v1.3
-database that predates the integration, the explicit installer is:
+Fresh schema 1.4 initialization already includes Gemini's identity, alias,
+bootstrap name event, and active room membership. The explicit verifier is:
 
 ```powershell
 python -m app.main install-gemini --database data\helios.db
 ```
 
-It validates and installs only Gemini's participant, immutable alias,
-bootstrap event, and active membership in one transaction. It does not create
-a provider configuration, read environment variables, or call Google.
+It validates that foundation transactionally and is idempotent. It does not
+read environment variables, create a provider client, or call Google.
 
 After installation, publish Helios's committed welcome as one canonical local
 Helios-to-Gemini message:
@@ -318,7 +336,7 @@ Enter `/participants` to open and refresh the participant panel without
 posting a message. Exact and malformed `/participants` forms are intercepted
 locally and rejected by the API/CLI as defense in depth.
 
-Trace v2 retains the existing commands:
+Trace v3 retains the existing commands:
 
 Enter either local command in the browser message box:
 
@@ -365,16 +383,20 @@ explicitly recorded provider-generated reasoning summary may be displayed and
 is labelled as a summary, while usage totals can still include aggregate
 reasoning-token counts. Omission locations are reported as JSON Pointers.
 
-Trace exposes private canonical messages, exact system instructions, request
-settings, and operational provenance. Keep the server bound to a trusted local
-interface; Trace v2 is not designed as a public or multi-user diagnostics API.
+Trace exposes the shared canonical room history, exact system instructions,
+request settings, and operational provenance. For unredacted requests it shows
+`Room-wide history`, `room_shared_v1`, effective sequence 1, and
+`provider_history_v2`; redacted requests show only that request details were
+redacted. Keep the server bound to a trusted local interface; Trace v3 is not
+designed as a public or multi-user diagnostics API.
 
 ## Memory status and boundaries
 
 Helios Room keeps three concepts separate:
 
-- **Canonical history** is the immutable Peter and Helios message record in the
-  room. It remains the only record of events that occurred in the room.
+- **Canonical history** is the immutable routed chat record for every room
+  participant. It is shared with every selected provider and remains the only
+  record of events that occurred in the room.
 - **Seeded memory** is intended for curated continuity imported from
   conversations that occurred before Helios Room existed. Selected records are
   reference data, not room events, Peter messages, or instructions.
@@ -426,7 +448,7 @@ python -m app.main import-seed-memories --owner-participant-key helios --file da
 A separately reviewed Gemini continuity manifest uses
 `--owner-participant-key gemini`; never derive it from Helios-owned records.
 
-Use `--database` to select another initialized schema-v1.3 database. The
+Use `--database` to select another initialized schema-v1.4 database. The
 importer hashes a canonical typed representation, runs every database check and
 write under one `BEGIN IMMEDIATE` transaction, and returns JSON without echoing
 memory text. A semantically identical import returns `already_imported` with no
@@ -472,7 +494,7 @@ the fixture is never submitted automatically.
   performs one API-backed turn through the registered Helios or Gemini adapter.
   Extra fields are rejected.
 - `GET /api/trace/latest` returns the latest recorded `main`-room turn through
-  the read-only Trace v2 projection.
+  the read-only Trace v3 projection.
 - `GET /api/trace/{turn_id}` returns one recorded turn for a canonical positive
   decimal SQLite turn ID.
 
@@ -590,7 +612,7 @@ app/       FastAPI entry point, database, identity, provider adapters/history, t
 data/      Local SQLite database files (ignored by Git)
 docs/      Approved implementation-contract amendments
 examples/  Synthetic, nonpersonal documentation fixtures
-schema/    Authoritative SQLite schema v1.3 and ordered migrations
+schema/    Authoritative fresh SQLite schema v1.4 and retained legacy source schemas
 static/    Browser interface
 tests/     Automated tests
 ```

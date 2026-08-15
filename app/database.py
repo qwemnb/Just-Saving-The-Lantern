@@ -9,20 +9,24 @@ from pathlib import Path
 
 from .schema_validation import (
     SchemaValidationError,
+    VisibilityPolicyValidationError,
     V12_HISTORY,
     V13_HISTORY,
+    V14_HISTORY,
     schema_history,
     validate_database_integrity,
-    validate_v12_source,
-    validate_v13_foundation,
+    validate_legacy_reset_dispatch,
+    validate_v14_foundation,
+    _validate_policy_timestamp,
 )
+from .maintenance_lock import ResetRecoveryRequiredError, acquire_database_lease
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "schema" / "helios_room_schema_v1_3.sql"
+DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "schema" / "helios_room_schema_v1_4.sql"
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "helios.db"
 
-EXPECTED_SCHEMA_MIGRATIONS = ((1, "1.2"), (2, "1.3"))
+EXPECTED_SCHEMA_MIGRATIONS = ((1, "1.2"), (2, "1.3"), (3, "1.4"))
 # Kept as the current marker for modules that need only the current label.
 EXPECTED_SCHEMA_MIGRATION = EXPECTED_SCHEMA_MIGRATIONS[-1]
 BUSY_TIMEOUT_MS = 5_000
@@ -38,6 +42,55 @@ class DatabaseInitializationError(RuntimeError):
 
     def as_payload(self) -> dict[str, str]:
         return {"error": self.code, "message": self.message}
+
+
+class MessageVisibilityGuardError(RuntimeError):
+    code = "message_visibility_policy_unavailable"
+    status_code = 409
+    message = "The room history visibility policy does not permit this message to be stored."
+
+    def __init__(self) -> None:
+        super().__init__(self.message)
+
+    def as_payload(self) -> dict[str, str]:
+        return {"error": self.code, "message": self.message}
+
+
+class LockedConnection(sqlite3.Connection):
+    _maintenance_lease: object | None = None
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            lease = self._maintenance_lease
+            self._maintenance_lease = None
+            if lease is not None:
+                lease.close()
+
+
+def has_exact_room_visibility_policy(connection: sqlite3.Connection) -> bool:
+    """Return whether every current room has its sole shared sequence-1 event."""
+    try:
+        if schema_history(connection) != V14_HISTORY:
+            return False
+        if connection.execute(
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='room_history_visibility_events'"
+        ).fetchone()[0] != 1:
+            return False
+        rooms = connection.execute("SELECT id FROM rooms").fetchall()
+        for room in rooms:
+            rows = connection.execute(
+                """SELECT policy_version,effective_from_room_sequence_no,created_at
+                   FROM room_history_visibility_events WHERE room_id=?""",
+                (room[0],),
+            ).fetchall()
+            if len(rows) != 1 or tuple(rows[0][:2]) != ("room_shared_v1", 1):
+                return False
+            _validate_policy_timestamp(connection, rows[0][2])
+        return True
+    except (sqlite3.Error, SchemaValidationError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -62,9 +115,17 @@ def connect_database(database_path: Path | str = DEFAULT_DATABASE_PATH) -> sqlit
     """
 
     path = Path(database_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    connection = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1_000)
+    lease = acquire_database_lease(path, shared=True)
+    try:
+        connection = sqlite3.connect(
+            path,
+            timeout=BUSY_TIMEOUT_MS / 1_000,
+            factory=LockedConnection,
+        )
+    except Exception:
+        lease.close()
+        raise
+    connection._maintenance_lease = lease
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
@@ -75,7 +136,7 @@ def initialize_database(
     database_path: Path | str = DEFAULT_DATABASE_PATH,
     schema_path: Path | str = DEFAULT_SCHEMA_PATH,
 ) -> InitializationReport:
-    """Install schema v1.3 when needed and ensure milestone seed records exist.
+    """Install schema v1.4 when needed and ensure milestone seed records exist.
 
     The schema is executed only for a database with no user-defined objects.
     Seed creation is idempotent and runs under ``BEGIN IMMEDIATE`` so two local
@@ -84,23 +145,26 @@ def initialize_database(
 
     database_path = Path(database_path)
     schema_path = Path(schema_path)
-    connection = connect_database(database_path)
+    try:
+        connection = connect_database(database_path)
+    except ResetRecoveryRequiredError as error:
+        raise DatabaseInitializationError(error.message, code=error.code) from None
     try:
         if _table_exists(connection, "schema_migrations"):
             connection.execute("BEGIN")
             try:
                 history = schema_history(connection)
-                if history == V12_HISTORY:
-                    validate_v12_source(connection)
+                if history == V12_HISTORY or history == V13_HISTORY:
+                    validate_legacy_reset_dispatch(connection, history)
                     raise DatabaseInitializationError(
-                        "Database schema v1.2 requires the explicit migrate-database command.",
-                        code="database_migration_required",
+                        "The existing Helios Room database must be retired and reinitialized before this version can run.",
+                        code="database_reset_required",
                     )
-                if history != V13_HISTORY:
+                if history != V14_HISTORY:
                     raise DatabaseInitializationError(
                         "The existing database schema is incompatible."
                     )
-                validate_v13_foundation(connection)
+                validate_v14_foundation(connection)
                 validate_database_integrity(connection)
                 report = _build_report(connection, database_path)
             except (SchemaValidationError, sqlite3.Error, TypeError, ValueError) as error:
@@ -127,7 +191,7 @@ def initialize_database(
         _seed_initial_room(connection)
         connection.execute("BEGIN")
         try:
-            validate_v13_foundation(connection)
+            validate_v14_foundation(connection)
             validate_database_integrity(connection)
             report = _build_report(connection, database_path)
         except (SchemaValidationError, sqlite3.Error, TypeError, ValueError) as error:
@@ -158,6 +222,7 @@ def _seed_initial_room(connection: sqlite3.Connection) -> None:
     connection.execute("BEGIN IMMEDIATE")
     try:
         room_id = _ensure_room(connection)
+        _ensure_room_history_visibility(connection, room_id)
         peter_id = _ensure_participant(connection, "peter", "Peter", "human")
         helios_id = _ensure_participant(connection, "helios", "Helios", "ai")
         gemini_id = _ensure_participant(connection, "gemini", "Gemini", "ai")
@@ -181,6 +246,24 @@ def _seed_initial_room(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
+def _ensure_room_history_visibility(connection: sqlite3.Connection, room_id: int) -> None:
+    rows = connection.execute(
+        """SELECT policy_version, effective_from_room_sequence_no
+           FROM room_history_visibility_events WHERE room_id=? ORDER BY id""",
+        (room_id,),
+    ).fetchall()
+    if not rows:
+        connection.execute(
+            """INSERT INTO room_history_visibility_events
+               (room_id, policy_version, effective_from_room_sequence_no)
+               VALUES (?, 'room_shared_v1', 1)""",
+            (room_id,),
+        )
+        return
+    if len(rows) != 1 or tuple(rows[0]) != ("room_shared_v1", 1):
+        raise DatabaseInitializationError("Room history visibility foundation is invalid.")
+
+
 def _ensure_room(connection: sqlite3.Connection) -> int:
     connection.execute(
         """
@@ -199,6 +282,17 @@ def _ensure_room(connection: sqlite3.Connection) -> int:
             "The room key 'main' already exists with unexpected data."
         )
     return row["id"]
+
+
+def create_room(connection: sqlite3.Connection, room_key: str, name: str) -> int:
+    """Create a future room and its sequence-1 shared policy atomically."""
+    if not connection.in_transaction:
+        raise RuntimeError("room creation requires an active transaction")
+    room_id = connection.execute(
+        "INSERT INTO rooms (room_key,name) VALUES (?,?)", (room_key, name)
+    ).lastrowid
+    _ensure_room_history_visibility(connection, room_id)
+    return room_id
 
 
 def _ensure_participant(
@@ -546,6 +640,18 @@ def store_message(
             recipient_participant_id = None
             destination_alias_id = room_alias["alias_id"]
 
+    try:
+        validate_v14_foundation(connection)
+        policy_rows = connection.execute(
+            """SELECT policy_version, effective_from_room_sequence_no
+               FROM room_history_visibility_events WHERE room_id=?""",
+            (room_id,),
+        ).fetchall()
+        if len(policy_rows) != 1 or tuple(policy_rows[0]) != ("room_shared_v1", 1):
+            raise MessageVisibilityGuardError()
+    except VisibilityPolicyValidationError:
+        raise MessageVisibilityGuardError() from None
+
     room_sequence_no = allocate_next_room_sequence_no(connection, room_id)
 
     turn_sequence_no = None
@@ -560,52 +666,57 @@ def store_message(
         ).fetchone()
         turn_sequence_no = row[0]
 
-    cursor = connection.execute(
-        """
-        INSERT INTO messages (
-            turn_id,
-            room_id,
-            room_sequence_no,
-            turn_sequence_no,
-            participant_id,
-            participant_config_id,
-            reply_to_id,
-            message_type,
-            message_text
+    try:
+        cursor = connection.execute(
+            """
+            INSERT INTO messages (
+                turn_id,
+                room_id,
+                room_sequence_no,
+                turn_sequence_no,
+                participant_id,
+                participant_config_id,
+                reply_to_id,
+                message_type,
+                message_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                turn_id,
+                room_id,
+                room_sequence_no,
+                turn_sequence_no,
+                participant_id,
+                participant_config_id,
+                reply_to_id,
+                message_type,
+                message_text,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            turn_id,
-            room_id,
-            room_sequence_no,
-            turn_sequence_no,
-            participant_id,
-            participant_config_id,
-            reply_to_id,
-            message_type,
-            message_text,
-        ),
-    )
-    message_id = cursor.lastrowid
-    connection.execute(
-        """
-        INSERT INTO message_routes (
-            message_id, room_id, sender_participant_id, sender_alias_id,
-            destination_kind, recipient_participant_id,
-            destination_alias_id, routing_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            message_id,
-            room_id,
-            participant_id,
-            sender_alias_id,
-            destination_kind,
-            recipient_participant_id,
-            destination_alias_id,
-            routing_mode,
-        ),
-    )
+        message_id = cursor.lastrowid
+        connection.execute(
+            """
+            INSERT INTO message_routes (
+                message_id, room_id, sender_participant_id, sender_alias_id,
+                destination_kind, recipient_participant_id,
+                destination_alias_id, routing_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                room_id,
+                participant_id,
+                sender_alias_id,
+                destination_kind,
+                recipient_participant_id,
+                destination_alias_id,
+                routing_mode,
+            ),
+        )
+    except sqlite3.IntegrityError as error:
+        if str(error) == "message_visibility_guard":
+            raise MessageVisibilityGuardError() from None
+        raise
     return message_id
 

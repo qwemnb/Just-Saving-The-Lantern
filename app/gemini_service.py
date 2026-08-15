@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .commands import classify_local_command, is_reserved_local_command
-from .database import DEFAULT_DATABASE_PATH, connect_database, create_turn, is_blank_message, store_message
+from .database import (
+    DEFAULT_DATABASE_PATH,
+    MessageVisibilityGuardError,
+    connect_database,
+    create_turn,
+    is_blank_message,
+    store_message,
+)
 from .gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS,
     GEMINI_TIMEOUT_SECONDS,
@@ -27,19 +34,21 @@ from .gemini_client import (
     recorded_settings,
     safe_gemini_exception_diagnostics,
     serialize_and_evaluate_response,
-    validate_recorded_google_request_payload,
+    validate_recorded_google_shared_request_payload,
 )
 from .identity_service import current_alias, resolve_room_post_context
 from .participant_registry import registration_for
 from .provider_history import ProviderHistoryError, load_provider_history
-from .room_service import TurnServiceError, canonical_json
-from .schema_validation import validate_database_integrity, validate_v13_foundation
+from .request_validation import HISTORY_VISIBILITY
+from .room_service import TurnServiceError, canonical_json, validate_phase_a_foundation
+from .schema_validation import validate_database_integrity, validate_v14_foundation
 from .seed_memory import (
     RESULT_LIMIT as MEMORY_RESULT_LIMIT,
     TEXT_BUDGET_CHARS as MEMORY_TEXT_BUDGET_CHARS,
     search_seeded_memories,
     serialize_inherited_memory_context,
 )
+from .maintenance_lock import MaintenanceLockError, ResetRecoveryRequiredError
 
 
 GEMINI_KEY = "gemini"
@@ -126,6 +135,8 @@ async def run_gemini_turn(
             response,
             provider_exception,
         )
+    except TurnServiceError:
+        raise
     except Exception as exception:
         raise _stranded_error(accepted) from exception
     if finalization.status != "completed":
@@ -159,6 +170,15 @@ def _accept_gemini_turn(
 ) -> AcceptedGeminiTurn:
     try:
         connection = connect_database(database_path)
+    except ResetRecoveryRequiredError as exception:
+        raise TurnServiceError(
+            status_code=503, code=exception.code, message=exception.message,
+        ) from None
+    except MaintenanceLockError as exception:
+        raise TurnServiceError(
+            status_code=503, code="database_maintenance_in_progress",
+            message="The Helios Room database is unavailable during maintenance.",
+        ) from exception
     except (OSError, sqlite3.Error) as exception:
         raise TurnServiceError(
             status_code=503,
@@ -168,8 +188,10 @@ def _accept_gemini_turn(
     try:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            validate_v13_foundation(connection)
+            validate_phase_a_foundation(connection)
             context = resolve_room_post_context(connection)
+        except TurnServiceError:
+            raise
         except Exception as exception:
             raise TurnServiceError(
                 status_code=503,
@@ -204,23 +226,6 @@ def _accept_gemini_turn(
                 message="The selected participant destination is unavailable.",
             )
 
-        environment = load_gemini_environment(dotenv_path)
-        if environment.api_key is None or not environment.api_key.strip():
-            raise TurnServiceError(
-                status_code=503,
-                code="missing_gemini_api_key",
-                message="GEMINI_API_KEY is missing or blank.",
-            )
-        if environment.model is None or not environment.model.strip():
-            raise TurnServiceError(
-                status_code=503,
-                code="missing_gemini_model",
-                message="HELIOS_GEMINI_MODEL is missing or blank.",
-            )
-        model = environment.model
-        config_id = find_or_create_gemini_configuration(
-            connection, gemini_id=destination["id"], model=model
-        )
         turn_id = create_turn(connection, context["room_id"], context["peter"]["id"])
         peter_message_id = store_message(
             connection,
@@ -282,6 +287,23 @@ def _accept_gemini_turn(
                 code="memory_retrieval_failed",
                 message="Seeded memory retrieval failed before the provider call.",
             ) from exception
+        environment = load_gemini_environment(dotenv_path)
+        if environment.api_key is None or not environment.api_key.strip():
+            raise TurnServiceError(
+                status_code=503,
+                code="missing_gemini_api_key",
+                message="GEMINI_API_KEY is missing or blank.",
+            )
+        if environment.model is None or not environment.model.strip():
+            raise TurnServiceError(
+                status_code=503,
+                code="missing_gemini_model",
+                message="HELIOS_GEMINI_MODEL is missing or blank.",
+            )
+        model = environment.model
+        config_id = find_or_create_gemini_configuration(
+            connection, gemini_id=destination["id"], model=model
+        )
         # Typed conversion is part of Phase A validation, before durable acceptance.
         contents_from_recorded(contents)
         request = {
@@ -303,10 +325,11 @@ def _accept_gemini_turn(
                 "timeout_seconds": GEMINI_TIMEOUT_SECONDS,
                 "total_attempts": GEMINI_TOTAL_ATTEMPTS,
                 "trigger_message_id": peter_message_id,
+                "history_visibility": dict(HISTORY_VISIBILITY),
             },
             "request": request,
         }
-        validate_recorded_google_request_payload(request_payload)
+        validate_recorded_google_shared_request_payload(request_payload)
         request_event_id = _insert_event(
             connection,
             accepted_ids=(turn_id, context["room_id"], destination["id"], config_id),
@@ -331,6 +354,13 @@ def _accept_gemini_turn(
             request_payload_json=canonical_json(request_payload),
             api_key=environment.api_key,
         )
+    except MessageVisibilityGuardError:
+        connection.rollback()
+        raise TurnServiceError(
+            status_code=409,
+            code="unsupported_history_visibility_policy",
+            message="Canonical history visibility cannot be reconstructed safely.",
+        ) from None
     except Exception:
         connection.rollback()
         raise
@@ -412,7 +442,7 @@ def _finalize_phase_c(
     connection = connect_database(database_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        validate_v13_foundation(connection)
+        validate_phase_a_foundation(connection)
         validate_database_integrity(connection)
         _assert_accepted_evidence(connection, accepted)
 
@@ -497,10 +527,19 @@ def _finalize_phase_c(
                     )
                     _set_terminal(connection, accepted.turn_id, "completed")
                     result = GeminiFinalizationResult("completed", message_id)
-        validate_v13_foundation(connection)
+        validate_v14_foundation(connection)
         validate_database_integrity(connection)
         connection.commit()
         return result
+    except MessageVisibilityGuardError:
+        connection.rollback()
+        raise TurnServiceError(
+            status_code=409,
+            code="unsupported_history_visibility_policy",
+            message="Canonical history visibility cannot be reconstructed safely.",
+            turn_id=accepted.turn_id,
+            peter_message_id=accepted.peter_message_id,
+        ) from None
     except Exception:
         connection.rollback()
         raise
@@ -599,7 +638,7 @@ def _assert_accepted_evidence(
         or event["is_redacted"]
     ):
         raise RuntimeError("Gemini request evidence changed")
-    validate_recorded_google_request_payload(json.loads(event["payload_json"]))
+    validate_recorded_google_shared_request_payload(json.loads(event["payload_json"]))
     config_rows = connection.execute(
         """SELECT participant_id, provider, model, config_label,
                   system_instructions, settings_json, tools_json

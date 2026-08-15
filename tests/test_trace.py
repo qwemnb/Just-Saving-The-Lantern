@@ -16,7 +16,14 @@ from unittest.mock import patch
 from app import main
 from app.commands import LocalCommandKind, classify_local_command
 from app.database import connect_database, initialize_database
-from app.room_service import TurnServiceError, run_helios_turn
+from app.room_service import (
+    RESPONSE_SETTINGS,
+    RESPONSE_TOOLS,
+    SYSTEM_INSTRUCTIONS,
+    TurnServiceError,
+    run_helios_turn,
+)
+from app.seed_memory import build_fts_query, tokenize_memory_query
 from app.trace_service import (
     TraceServiceError,
     load_trace,
@@ -45,6 +52,44 @@ class TraceFixture(unittest.TestCase):
                 (self.helios_id,),
             ).fetchone()[0]
 
+    def shared_openai_request(
+        self, message_id: int, text: str, boundary: int,
+        *, model: str = "historical-request-model",
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, object]:
+        terms = tokenize_memory_query(text)
+        return {
+            "request": {
+                "model": model,
+                "instructions": SYSTEM_INSTRUCTIONS,
+                "input": history or [{"role": "user", "content": text}],
+                "store": RESPONSE_SETTINGS["store"],
+                "reasoning": dict(RESPONSE_SETTINGS["reasoning"]),
+                "max_output_tokens": RESPONSE_SETTINGS["max_output_tokens"],
+                "tools": list(RESPONSE_TOOLS),
+            },
+            "local_context": {
+                "provider": "openai", "operation": "responses.create",
+                "trigger_message_id": message_id,
+                "room_sequence_boundary": boundary,
+                "timeout_seconds": 120, "max_retries": 0,
+                "memory_retrieval": {
+                    "retriever_version": "seed-fts-topic-v1",
+                    "owner_participant_id": self.helios_id,
+                    "query_source_message_id": message_id,
+                    "query_terms": terms,
+                    "fts_query": build_fts_query(terms),
+                    "result_limit": 5, "text_budget_chars": 8000,
+                    "omitted_for_budget": 0, "selected": [],
+                },
+                "history_visibility": {
+                    "active_policy_version": "room_shared_v1",
+                    "effective_from_room_sequence_no": 1,
+                    "projection_version": "provider_history_v2",
+                },
+            },
+        }
+
     def add_turn(
         self,
         *,
@@ -71,10 +116,11 @@ class TraceFixture(unittest.TestCase):
     def add_config(
         self,
         *,
-        settings_json: str = "{}",
+        settings_json: str = json.dumps(RESPONSE_SETTINGS, sort_keys=True, separators=(",", ":")),
         tools_json: str = "[]",
         model: str | None = "historical-model",
     ) -> int:
+        slug = model or "model"
         with closing(connect_database(self.database_path)) as connection:
             cursor = connection.execute(
                 """
@@ -83,10 +129,13 @@ class TraceFixture(unittest.TestCase):
                     system_instructions, settings_json, tools_json,
                     created_at
                 )
-                VALUES (?, 'openai', ?, 'trace-test', 'Exact instructions\n  indented',
+                VALUES (?, 'openai', ?, ?, ?,
                         ?, ?, '2026-08-11T22:59:59.000Z')
                 """,
-                (self.helios_id, model, settings_json, tools_json),
+                (
+                    self.helios_id, model, f"seed-memory-openai-{slug}-v1",
+                    SYSTEM_INSTRUCTIONS, settings_json, tools_json,
+                ),
             )
             connection.commit()
             return cursor.lastrowid
@@ -203,15 +252,9 @@ class TraceFixture(unittest.TestCase):
             "  Exact Peter text\nnext line  ",
             reply_to_id=earlier_message,
         )
-        settings = json.dumps(
-            {
-                "safe": True,
-                "apiKey": "configuration-secret",
-                "a/b": {"token": "hidden"},
-                "a~b": [{"clientSecret": "hidden"}],
-            }
+        config_id = self.add_config(
+            model="historical-request-model"
         )
-        config_id = self.add_config(settings_json=settings)
         helios_message = self.add_message(
             turn_id,
             "Visible Helios output",
@@ -223,21 +266,13 @@ class TraceFixture(unittest.TestCase):
             turn_id,
             1,
             "openai.responses.request",
-            {
-                "request": {
-                    "model": "historical-request-model",
-                    "instructions": "Recorded instructions",
-                    "input": [{"role": "user", "content": "ordered input"}],
-                    "headers": {"Authorization": "Bearer secret"},
-                    "reasoning": {"effort": "low"},
-                },
-                "local_context": {
-                    "provider": "openai",
-                    "max_retries": 0,
-                    "trigger_message_id": peter_message,
-                    "room_sequence_boundary": 2,
-                },
-            },
+            self.shared_openai_request(
+                peter_message, "  Exact Peter text\nnext line  ", 2,
+                history=[
+                    {"role": "user", "content": "Earlier target"},
+                    {"role": "user", "content": "  Exact Peter text\nnext line  "},
+                ],
+            ),
             config_id=config_id,
             participant_id=self.helios_id,
             related_message_id=peter_message,
@@ -437,7 +472,7 @@ class TraceProjectionTests(TraceFixture):
 
         trace = load_trace(self.database_path, turn_id)
 
-        self.assertEqual(trace["trace_version"], 2)
+        self.assertEqual(trace["trace_version"], 3)
         self.assertEqual(trace["turn"]["id"], turn_id)
         self.assertEqual(trace["turn"]["initiated_by"]["participant_key"], "peter")
         self.assertEqual(
@@ -450,24 +485,19 @@ class TraceProjectionTests(TraceFixture):
         self.assertEqual(trace["messages"][1]["reply_to_turn_id"], turn_id)
         self.assertEqual([item["id"] for item in trace["configurations"]], [config_id])
         config = trace["configurations"][0]
-        self.assertEqual(config["system_instructions"], "Exact instructions\n  indented")
-        self.assertEqual(config["settings"], {"safe": True, "a/b": {}, "a~b": [{}]})
-        self.assertEqual(
-            config["omitted_json_pointers"],
-            [
-                "/settings/apiKey",
-                "/settings/a~0b/0/clientSecret",
-                "/settings/a~1b/token",
-            ],
-        )
+        self.assertEqual(config["system_instructions"], SYSTEM_INSTRUCTIONS)
+        self.assertEqual(config["settings"], RESPONSE_SETTINGS)
+        self.assertEqual(config["omitted_json_pointers"], [])
         self.assertEqual([event["sequence_no"] for event in trace["api_events"]], [1, 2, 3])
         self.assertEqual(trace["api_events"][2]["payload"], 17)
         self.assertEqual(trace["api_events"][2]["related_message_outside_selected_turn"], True)
         self.assertNotEqual(trace["api_events"][2]["related_message_turn_id"], turn_id)
         request = trace["recorded_request"]
         self.assertEqual(request["request"]["model"], "historical-request-model")
-        self.assertNotIn("headers", request["request"])
-        self.assertIn("/request/headers", request["omitted_json_pointers"])
+        self.assertEqual(
+            request["local_context"]["history_visibility"]["projection_version"],
+            "provider_history_v2",
+        )
         outcome = trace["provider_outcome"]
         self.assertEqual(outcome["response_id"], "resp_recorded")
         self.assertEqual(outcome["requested_model"], "historical-request-model")
@@ -501,7 +531,10 @@ class TraceProjectionTests(TraceFixture):
         after_later_history = load_trace(self.database_path, turn_id)
         self.assertEqual(
             after_later_history["recorded_request"]["request"]["input"],
-            [{"role": "user", "content": "ordered input"}],
+            [
+                {"role": "user", "content": "Earlier target"},
+                {"role": "user", "content": "  Exact Peter text\nnext line  "},
+            ],
         )
 
     def test_null_initiator_human_only_open_and_cancelled_turns(self) -> None:
@@ -537,11 +570,16 @@ class TraceProjectionTests(TraceFixture):
 
     def test_redacted_recognized_events_are_honest_and_count_for_cardinality(self) -> None:
         turn_id = self.add_turn(status="failed")
+        peter_message = self.add_message(turn_id, "Redacted request")
+        config_id = self.add_config(model="redacted-model")
         self.add_event(
             turn_id,
             1,
             "openai.responses.request",
             None,
+            config_id=config_id,
+            participant_id=self.helios_id,
+            related_message_id=peter_message,
             redacted=True,
         )
         self.add_event(
@@ -549,6 +587,9 @@ class TraceProjectionTests(TraceFixture):
             2,
             "openai.responses.error",
             "removed",
+            config_id=config_id,
+            participant_id=self.helios_id,
+            related_message_id=peter_message,
             redacted=True,
         )
         trace = load_trace(self.database_path, turn_id)
@@ -567,15 +608,14 @@ class TraceProjectionTests(TraceFixture):
     def test_open_stranded_request_does_not_invent_an_outcome(self) -> None:
         turn_id = self.add_turn()
         peter_message = self.add_message(turn_id, "Accepted before interruption")
-        config_id = self.add_config()
+        config_id = self.add_config(model="recorded")
         self.add_event(
             turn_id,
             1,
             "openai.responses.request",
-            {
-                "request": {"model": "recorded", "input": []},
-                "local_context": {"trigger_message_id": peter_message},
-            },
+            self.shared_openai_request(
+                peter_message, "Accepted before interruption", 1, model="recorded"
+            ),
             participant_id=self.helios_id,
             config_id=config_id,
             related_message_id=peter_message,
@@ -589,15 +629,14 @@ class TraceProjectionTests(TraceFixture):
     def test_terminal_without_request_and_error_allowlist(self) -> None:
         turn_id = self.add_turn(status="failed")
         peter_message = self.add_message(turn_id, "Accepted request")
-        config_id = self.add_config()
+        config_id = self.add_config(model="recorded")
         self.add_event(
             turn_id,
             1,
             "openai.responses.request",
-            {
-                "request": {"model": "recorded", "input": []},
-                "local_context": {"trigger_message_id": peter_message},
-            },
+            self.shared_openai_request(
+                peter_message, "Accepted request", 1, model="recorded"
+            ),
             participant_id=self.helios_id,
             config_id=config_id,
             related_message_id=peter_message,
@@ -637,15 +676,14 @@ class TraceProjectionTests(TraceFixture):
     def test_unusable_response_error_shape_is_allowlisted(self) -> None:
         turn_id = self.add_turn(status="failed")
         peter_message = self.add_message(turn_id, "Accepted request")
-        config_id = self.add_config()
+        config_id = self.add_config(model="recorded")
         self.add_event(
             turn_id,
             1,
             "openai.responses.request",
-            {
-                "request": {"model": "recorded", "input": []},
-                "local_context": {"trigger_message_id": peter_message},
-            },
+            self.shared_openai_request(
+                peter_message, "Accepted request", 1, model="recorded"
+            ),
             participant_id=self.helios_id,
             config_id=config_id,
             related_message_id=peter_message,
@@ -793,6 +831,12 @@ class TraceRouteAndReadOnlyTests(TraceFixture):
             other_room = connection.execute(
                 "INSERT INTO rooms (room_key, name) VALUES ('other', 'Other')"
             ).lastrowid
+            connection.execute(
+                """INSERT INTO room_history_visibility_events
+                   (room_id,policy_version,effective_from_room_sequence_no)
+                   VALUES (?,'room_shared_v1',1)""",
+                (other_room,),
+            )
             other_turn = connection.execute(
                 "INSERT INTO turns (room_id, status) VALUES (?, 'open')",
                 (other_room,),
