@@ -198,4 +198,6 @@ data/
 /data/.helios-room-database.lock
 /data/.helios-room-reset-state.json
 /data/.helios-room-reset-state.json.next
+/data/.helios-room-reset-state.*.json
+/data/.helios-room-reset-state.*.json.partial
 /data/.helios*.reset-*

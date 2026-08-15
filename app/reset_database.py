@@ -43,7 +43,8 @@ from .schema_validation import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RESET_PROTOCOL_VERSION = "room_shared_reset_v1"
+LEGACY_RESET_PROTOCOL_VERSION = "room_shared_reset_v1"
+RESET_PROTOCOL_VERSION = LEGACY_RESET_PROTOCOL_VERSION
 RECOVERY_COMMIT_BY_SCHEMA = {
     "1.2": "d9d9717b4e882c19ef41e44a6f0c63fc062de41a",
     "1.3": "d9d9717b4e882c19ef41e44a6f0c63fc062de41a",
@@ -56,6 +57,8 @@ IGNORE_BLOCK = """# Helios Room database and reset artifacts
 /data/.helios-room-database.lock
 /data/.helios-room-reset-state.json
 /data/.helios-room-reset-state.json.next
+/data/.helios-room-reset-state.*.json
+/data/.helios-room-reset-state.*.json.partial
 /data/.helios*.reset-*
 """
 STAGES = (
@@ -105,6 +108,8 @@ def _error(code: str) -> DatabaseResetError:
         "database_reset_recovery_required": ("The Helios Room database requires reset recovery before it can be opened.", 1),
         "reset_recovery_invalid": ("The database reset recovery state could not be verified safely.", 1),
         "reset_failed": ("The database reset did not complete safely.", 1),
+        "reset_platform_unsupported": ("Database reset planning, execution, and recovery are supported only on Windows.", 1),
+        "reset_durability_unsupported": ("The Windows filesystem cannot provide the required database reset durability guarantees.", 1),
     }
     message, exit_code = values[code]
     return DatabaseResetError(code, message, exit_code=exit_code)
@@ -183,26 +188,11 @@ def _descriptor_identity(descriptor: int, info: os.stat_result) -> str:
 def _path_identity(path: Path) -> str:
     if os.name != "nt":
         return _identity(path.lstat())
-    import ctypes
-    from ctypes import wintypes
-
-    create_file = ctypes.windll.kernel32.CreateFileW
-    create_file.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    create_file.restype = wintypes.HANDLE
-    handle = create_file(
-        str(path), 0, 0x1 | 0x2 | 0x4, None, 3,
-        0x02000000 | 0x00200000, None,
-    )
-    invalid = ctypes.c_void_p(-1).value
-    if handle in (None, invalid):
-        raise _error("reset_path_unsafe")
+    handle = _windows_open_path_no_follow(path)
     try:
-        return _windows_handle_identity(int(handle))
+        return _windows_handle_identity(handle)
     finally:
-        ctypes.windll.kernel32.CloseHandle(handle)
+        _windows_close_handle(handle)
 
 
 def _safe_regular(path: Path) -> os.stat_result:
@@ -219,6 +209,9 @@ def _safe_regular(path: Path) -> os.stat_result:
         or attributes & reparse
     ):
         raise _error("reset_path_unsafe")
+    if os.name == "nt":
+        handle = _windows_open_path_no_follow(path, expect_directory=False)
+        _windows_close_handle(handle)
     return info
 
 
@@ -233,6 +226,9 @@ def _safe_directory(path: Path, *, required: bool = True) -> os.stat_result | No
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     if not stat.S_ISDIR(info.st_mode) or path.is_symlink() or attributes & reparse:
         raise _error("reset_path_unsafe")
+    if os.name == "nt":
+        handle = _windows_open_directory_chain(path)
+        _windows_close_handle(handle)
     return info
 
 
@@ -496,7 +492,7 @@ def _validate_journal(
         or type(value["journal_sequence"]) is not int
         or value["journal_sequence"] <= 0
         or value["stage"] not in STAGES
-        or value["reset_protocol_version"] != RESET_PROTOCOL_VERSION
+        or value["reset_protocol_version"] != LEGACY_RESET_PROTOCOL_VERSION
         or value["plan_token"] != expected_token
         or value["plan_manifest_sha256"] != expected_token
         or value["database_path"] != "data/helios.db"
@@ -617,7 +613,7 @@ def _validate_audit(value: Any, journal: dict[str, Any]) -> dict[str, Any]:
             for key, item in journal["quarantine"].items()
         },
         "recovery_commit": journal["recovery_commit"],
-        "reset_protocol_version": RESET_PROTOCOL_VERSION,
+        "reset_protocol_version": LEGACY_RESET_PROTOCOL_VERSION,
         "source_observations": journal["source_observations"],
         "source_schema_label": journal["source_schema_label"],
         "terminal_schema_label": terminal,
@@ -764,7 +760,9 @@ def _reserve_regular(path: Path) -> str:
         os.close(descriptor)
 
 
-def _windows_open_handle(path: Path, access: int, flags: int) -> int:
+def _windows_open_handle(
+    path: Path, access: int, flags: int, *, share_access: int = 0x1 | 0x2 | 0x4
+) -> int:
     import ctypes
     from ctypes import wintypes
 
@@ -774,11 +772,187 @@ def _windows_open_handle(path: Path, access: int, flags: int) -> int:
         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
     ]
     create_file.restype = wintypes.HANDLE
-    handle = create_file(str(path), access, 0x1 | 0x2 | 0x4, None, 3, flags, None)
+    handle = create_file(str(path), access, share_access, None, 3, flags, None)
     invalid = ctypes.c_void_p(-1).value
     if handle in (None, invalid):
         raise _error("reset_path_unsafe")
     return int(handle)
+
+
+def _windows_close_handle(handle: int) -> None:
+    import ctypes
+
+    if not ctypes.windll.kernel32.CloseHandle(handle):
+        raise _error("reset_path_unsafe")
+
+
+def _windows_close_after_mutation(handle: int) -> None:
+    try:
+        _windows_close_handle(handle)
+    except DatabaseResetError as error:
+        raise _error("reset_failed") from error
+
+
+def _windows_handle_snapshot(handle: int) -> dict[str, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("ReparseTag", wintypes.DWORD),
+        ]
+
+    class FILE_STANDARD_INFO(ctypes.Structure):
+        _fields_ = [
+            ("AllocationSize", ctypes.c_longlong),
+            ("EndOfFile", ctypes.c_longlong),
+            ("NumberOfLinks", wintypes.DWORD),
+            ("DeletePending", wintypes.BOOLEAN),
+            ("Directory", wintypes.BOOLEAN),
+        ]
+
+    class FILE_BASIC_INFO(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+        ]
+
+    query = ctypes.windll.kernel32.GetFileInformationByHandleEx
+    query.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    query.restype = wintypes.BOOL
+    attributes = FILE_ATTRIBUTE_TAG_INFO()
+    standard = FILE_STANDARD_INFO()
+    basic = FILE_BASIC_INFO()
+    if not query(
+        wintypes.HANDLE(handle), 9, ctypes.byref(attributes),
+        ctypes.sizeof(attributes),
+    ) or not query(
+        wintypes.HANDLE(handle), 1, ctypes.byref(standard),
+        ctypes.sizeof(standard),
+    ) or not query(
+        wintypes.HANDLE(handle), 0, ctypes.byref(basic), ctypes.sizeof(basic)
+    ):
+        raise _error("reset_path_unsafe")
+    return {
+        "allocation_size": int(standard.AllocationSize),
+        "change_time": int(basic.ChangeTime),
+        "creation_time": int(basic.CreationTime),
+        "delete_pending": bool(standard.DeletePending),
+        "directory": bool(standard.Directory),
+        "end_of_file": int(standard.EndOfFile),
+        "file_attributes": int(attributes.FileAttributes),
+        "file_id": _windows_handle_identity(handle),
+        "last_access_time": int(basic.LastAccessTime),
+        "last_write_time": int(basic.LastWriteTime),
+        "link_count": int(standard.NumberOfLinks),
+        "reparse_tag": int(attributes.ReparseTag),
+    }
+
+
+def _windows_validate_handle(handle: int, *, directory: bool) -> None:
+    snapshot = _windows_handle_snapshot(handle)
+    if (
+        snapshot["file_attributes"] & 0x400
+        or snapshot["directory"] is not directory
+        or snapshot["delete_pending"]
+        or (not directory and snapshot["link_count"] != 1)
+    ):
+        raise _error("reset_path_unsafe")
+
+
+def _windows_absolute_parts(path: Path) -> tuple[str, tuple[str, ...]]:
+    absolute = Path(os.path.abspath(path))
+    anchor = absolute.anchor
+    if re.fullmatch(r"[A-Za-z]:\\", anchor) is None:
+        raise _error("reset_path_unsafe")
+    relative = absolute.relative_to(anchor)
+    parts = relative.parts
+    if any(
+        not part
+        or part in {".", ".."}
+        or part.endswith((" ", "."))
+        or ":" in part
+        or "\\" in part
+        or "/" in part
+        for part in parts
+    ):
+        raise _error("reset_path_unsafe")
+    return anchor, parts
+
+
+def _windows_open_directory_chain(path: Path) -> int:
+    anchor, parts = _windows_absolute_parts(path)
+    handle = _windows_open_handle(
+        Path(anchor),
+        0x00100000 | 0x00000001 | 0x00000020 | 0x00000080,
+        0x02000000 | 0x00200000,
+    )
+    try:
+        _windows_validate_handle(handle, directory=True)
+        for part in parts:
+            child = _windows_create_relative(
+                handle,
+                part,
+                directory=True,
+                create_new=False,
+                desired_access=(
+                    0x00100000 | 0x00000001 | 0x00000020 | 0x00000080
+                ),
+            )
+            try:
+                _windows_validate_handle(child, directory=True)
+            except Exception:
+                _windows_close_handle(child)
+                raise
+            _windows_close_handle(handle)
+            handle = child
+        return handle
+    except Exception:
+        _windows_close_handle(handle)
+        raise
+
+
+def _windows_open_path_no_follow(
+    path: Path, *, expect_directory: bool | None = None
+) -> int:
+    absolute = Path(os.path.abspath(path))
+    if absolute == Path(absolute.anchor):
+        if expect_directory is False:
+            raise _error("reset_path_unsafe")
+        return _windows_open_directory_chain(absolute)
+    if expect_directory is None:
+        try:
+            info = absolute.lstat()
+        except OSError as error:
+            raise _error("reset_path_unsafe") from error
+        directory = stat.S_ISDIR(info.st_mode)
+    else:
+        directory = expect_directory
+    parent = _windows_open_directory_chain(absolute.parent)
+    try:
+        handle = _windows_create_relative(
+            parent,
+            absolute.name,
+            directory=directory,
+            create_new=False,
+            desired_access=(
+                0x00100000 | 0x00000001 | 0x00000020 | 0x00000080
+            ),
+        )
+        try:
+            _windows_validate_handle(handle, directory=directory)
+        except Exception:
+            _windows_close_handle(handle)
+            raise
+        return handle
+    finally:
+        _windows_close_handle(parent)
 
 
 @contextmanager
@@ -786,25 +960,23 @@ def _verified_parent(path: Path):
     """Hold the exact non-reparse parent while a destructive name change occurs."""
 
     parent = path.parent
-    _safe_directory(parent)
-    identity = _path_identity(parent)
     if os.name == "nt":
-        import ctypes
-
-        handle = _windows_open_handle(
-            parent,
-            0x00100000 | 0x00000001 | 0x00000080,
-            0x02000000 | 0x00200000,
-        )
+        handle = _windows_open_directory_chain(parent)
+        identity = _windows_handle_identity(handle)
         try:
-            if _windows_handle_identity(handle) != identity:
-                raise _error("reset_path_unsafe")
             yield handle, identity
-            if _path_identity(parent) != identity:
+            revalidated = _windows_open_directory_chain(parent)
+            try:
+                current_identity = _windows_handle_identity(revalidated)
+            finally:
+                _windows_close_handle(revalidated)
+            if current_identity != identity:
                 raise _error("reset_path_unsafe")
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            _windows_close_handle(handle)
         return
+    _safe_directory(parent)
+    identity = _path_identity(parent)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(parent, flags)
     try:
@@ -818,7 +990,15 @@ def _verified_parent(path: Path):
 
 
 def _revalidate_parent(path: Path, expected_identity: str) -> None:
-    if _path_identity(path.parent) != expected_identity:
+    if os.name == "nt":
+        handle = _windows_open_directory_chain(path.parent)
+        try:
+            identity = _windows_handle_identity(handle)
+        finally:
+            _windows_close_handle(handle)
+    else:
+        identity = _path_identity(path.parent)
+    if identity != expected_identity:
         raise _error("reset_path_unsafe")
 
 
@@ -829,6 +1009,7 @@ def _windows_create_relative(
     directory: bool,
     create_new: bool = True,
     desired_access: int | None = None,
+    share_access: int = 0x1 | 0x2 | 0x4,
 ) -> int:
     import ctypes
     from ctypes import wintypes
@@ -881,25 +1062,137 @@ def _windows_create_relative(
                 if directory else 0x00000001 | 0x00000002 | 0x00000004
             )
         )
-    options = 0x00000001 | 0x00004000 if directory else 0x00000040 | 0x00000020
+    options = (
+        0x00000001 | 0x00200000 | 0x00000020
+        if directory
+        else 0x00000040 | 0x00200000 | 0x00000020
+    )
+    if create_new and not directory:
+        options |= 0x00000002
     status = create(
         ctypes.byref(handle), desired_access, ctypes.byref(attributes),
         ctypes.byref(status_block), None, 0x10 if directory else 0x80,
-        0x1 | 0x2 | 0x4, 2 if create_new else 1, options, None, 0,
+        share_access, 2 if create_new else 1, options, None, 0,
     )
     if status < 0 or not handle.value:
         raise _error("reset_failed")
     return int(handle.value)
 
 
-def _open_new_regular(path: Path, *, read_write: bool) -> int:
+def _windows_enumerate_directory_handle(handle: int) -> list[str]:
+    """Enumerate names through an already verified directory handle."""
+
+    import ctypes
+    import struct
+    from ctypes import wintypes
+
+    class IO_STATUS_BLOCK(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    before = _windows_handle_snapshot(handle)
+    names: list[str] = []
+    query = ctypes.windll.ntdll.NtQueryDirectoryFile
+    query.argtypes = [
+        wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG,
+        wintypes.ULONG, wintypes.BOOLEAN, ctypes.c_void_p, wintypes.BOOLEAN,
+    ]
+    query.restype = ctypes.c_long
+    restart = True
+    while True:
+        buffer = ctypes.create_string_buffer(65_536)
+        status_block = IO_STATUS_BLOCK()
+        status = int(query(
+            wintypes.HANDLE(handle), None, None, None,
+            ctypes.byref(status_block), buffer, len(buffer), 12,
+            False, None, restart,
+        ))
+        restart = False
+        unsigned_status = status & 0xFFFFFFFF
+        if unsigned_status == 0x80000006:  # STATUS_NO_MORE_FILES
+            break
+        if status < 0 and unsigned_status != 0x80000005:
+            raise _error("reset_path_unsafe")
+        length = int(status_block.Information)
+        if length <= 0 or length > len(buffer):
+            raise _error("reset_path_unsafe")
+        raw = buffer.raw[:length]
+        offset = 0
+        while True:
+            if offset + 12 > length:
+                raise _error("reset_path_unsafe")
+            next_offset, _file_index, name_length = struct.unpack_from(
+                "<III", raw, offset
+            )
+            if (
+                name_length == 0
+                or name_length % 2
+                or offset + 12 + name_length > length
+            ):
+                raise _error("reset_path_unsafe")
+            try:
+                name = raw[offset + 12:offset + 12 + name_length].decode(
+                    "utf-16-le", errors="strict"
+                )
+            except UnicodeDecodeError as error:
+                raise _error("reset_path_unsafe") from error
+            if name not in {".", ".."}:
+                names.append(name)
+            if next_offset == 0:
+                break
+            if next_offset % 8 or next_offset < 12 or offset + next_offset >= length:
+                raise _error("reset_path_unsafe")
+            offset += next_offset
+    after = _windows_handle_snapshot(handle)
+    stable = {
+        "delete_pending", "directory", "file_attributes", "file_id",
+        "link_count", "reparse_tag",
+    }
+    if any(after[field] != before[field] for field in stable):
+        raise _error("reset_path_unsafe")
+    if len(names) != len(set(names)):
+        raise _error("reset_path_unsafe")
+    return names
+
+
+def _windows_enumerate_directory(path: Path) -> list[str]:
+    """Enumerate through a component-walked, verified directory handle."""
+
+    handle = _windows_open_directory_chain(path)
+    try:
+        return _windows_enumerate_directory_handle(handle)
+    finally:
+        _windows_close_handle(handle)
+
+
+def _windows_enumerate_directory_direct(path: Path) -> list[str]:
+    """Enumerate a configured runtime directory through its final no-follow handle."""
+
+    handle = _windows_open_handle(
+        path,
+        0x00100000 | 0x00000001 | 0x00000080,
+        0x02000000 | 0x00200000,
+    )
+    try:
+        _windows_validate_handle(handle, directory=True)
+        return _windows_enumerate_directory_handle(handle)
+    finally:
+        _windows_close_handle(handle)
+
+
+def _open_new_regular(
+    path: Path, *, read_write: bool, share_delete: bool = True
+) -> int:
     with _verified_parent(path) as (parent_handle, parent_identity):
         _revalidate_parent(path, parent_identity)
         if os.name == "nt":
             import msvcrt
 
             handle = _windows_create_relative(
-                parent_handle, path.name, directory=False
+                parent_handle,
+                path.name,
+                directory=False,
+                share_access=0x1 | 0x2 | (0x4 if share_delete else 0),
             )
             flags = getattr(os, "O_BINARY", 0) | (
                 os.O_RDWR if read_write else os.O_WRONLY
@@ -931,7 +1224,13 @@ def _open_new_regular(path: Path, *, read_write: bool) -> int:
 
 
 def _open_existing_regular(
-    path: Path, expected_identity: str, *, read_write: bool = False
+    path: Path,
+    expected_identity: str,
+    *,
+    read_write: bool = False,
+    share_write: bool = True,
+    delete_access: bool = False,
+    share_delete: bool = True,
 ) -> int:
     with _verified_parent(path) as (parent_handle, parent_identity):
         _revalidate_parent(path, parent_identity)
@@ -941,9 +1240,16 @@ def _open_existing_regular(
             access = 0x00100000 | 0x00000080 | 0x00000001
             if read_write:
                 access |= 0x00000002
+            if delete_access:
+                access |= 0x00010000
             handle = _windows_create_relative(
                 parent_handle, path.name, directory=False,
                 create_new=False, desired_access=access,
+                share_access=(
+                    0x1
+                    | (0x2 if share_write else 0)
+                    | (0x4 if share_delete else 0)
+                ),
             )
             flags = getattr(os, "O_BINARY", 0) | (
                 os.O_RDWR if read_write else os.O_RDONLY
@@ -980,10 +1286,8 @@ def _mkdir_verified(path: Path) -> None:
     with _verified_parent(path) as (parent_handle, parent_identity):
         _revalidate_parent(path, parent_identity)
         if os.name == "nt":
-            import ctypes
-
             handle = _windows_create_relative(parent_handle, path.name, directory=True)
-            ctypes.windll.kernel32.CloseHandle(handle)
+            _windows_close_after_mutation(handle)
         else:
             os.mkdir(path.name, 0o700, dir_fd=parent_handle)
         _revalidate_parent(path, parent_identity)
@@ -1093,8 +1397,8 @@ def _flush_directory(path: Path) -> None:
         identity = _path_identity(path)
         handle = _windows_open_handle(
             path,
-            0x00100000 | 0x00000001 | 0x00000080,
-            0x02000000 | 0x00200000,
+            0x80000000 | 0x40000000,
+            0x02000000 | 0x00200000 | 0x80000000,
         )
         try:
             if _windows_handle_identity(handle) != identity:
@@ -1103,17 +1407,12 @@ def _flush_directory(path: Path) -> None:
             flush.argtypes = [wintypes.HANDLE]
             flush.restype = wintypes.BOOL
             if not flush(wintypes.HANDLE(handle)):
-                # Windows does not consistently permit FlushFileBuffers on a
-                # directory handle.  Every renamed regular file is flushed by
-                # handle below; accepting only the documented handle/access
-                # failures keeps this branch explicit rather than a no-op.
                 error_code = ctypes.windll.kernel32.GetLastError()
-                if error_code not in {5, 6}:
-                    raise _error("reset_failed")
+                raise _error("reset_failed") from OSError(error_code, "FlushFileBuffers")
             if _path_identity(path) != identity:
                 raise _error("reset_path_unsafe")
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            _windows_close_after_mutation(handle)
         return
     with _verified_parent(path / ".directory-flush-sentinel") as (descriptor, identity):
         _revalidate_parent(path / ".directory-flush-sentinel", identity)
@@ -1158,6 +1457,7 @@ def _rename_verified(
     *,
     replace: bool,
     expected_target_identity: str | None = None,
+    flush_parent: bool = True,
 ) -> None:
     if source.parent != target.parent:
         raise _error("reset_path_unsafe")
@@ -1168,7 +1468,9 @@ def _rename_verified(
 
             source_handle = _windows_create_relative(
                 parent_handle, source.name, directory=False, create_new=False,
-                desired_access=0x00010000 | 0x00000080 | 0x00100000,
+                desired_access=(
+                    0x40000000 | 0x00010000 | 0x00000080 | 0x00100000
+                ),
             )
             if _windows_handle_identity(source_handle) != expected_identity:
                 ctypes.windll.kernel32.CloseHandle(source_handle)
@@ -1202,12 +1504,16 @@ def _rename_verified(
                 os.close(source_handle)
             raise _error("reset_failed")
         try:
+            mutation_completed = False
             _revalidate_parent(source, parent_identity)
             _revalidate_source_entry(source, parent_handle, expected_identity)
             if os.name == "nt":
                 _windows_rename(
                     source_handle, target, parent_handle, replace=replace
                 )
+                mutation_completed = True
+                if not ctypes.windll.kernel32.FlushFileBuffers(source_handle):
+                    raise _error("reset_failed")
             elif replace:
                 os.rename(
                     source.name, target.name,
@@ -1217,7 +1523,10 @@ def _rename_verified(
                 _posix_rename_no_replace(source.name, target.name, parent_handle)
         finally:
             if os.name == "nt":
-                ctypes.windll.kernel32.CloseHandle(source_handle)
+                if mutation_completed:
+                    _windows_close_after_mutation(source_handle)
+                else:
+                    _windows_close_handle(source_handle)
             else:
                 os.close(source_handle)
         _revalidate_parent(target, parent_identity)
@@ -1233,16 +1542,27 @@ def _rename_verified(
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-    _flush_directory(target.parent)
+    if flush_parent:
+        _flush_directory(target.parent)
 
 
-def _install_no_overwrite(staging: Path, target: Path) -> None:
+def _install_no_overwrite(
+    staging: Path, target: Path, *, flush_parent: bool = True
+) -> None:
     _safe_regular(staging)
-    _rename_verified(staging, target, _path_identity(staging), replace=False)
+    _rename_verified(
+        staging, target, _path_identity(staging), replace=False,
+        flush_parent=flush_parent,
+    )
 
 
-def _move_verified(source: Path, target: Path, expected_identity: str) -> None:
-    _rename_verified(source, target, expected_identity, replace=False)
+def _move_verified(
+    source: Path, target: Path, expected_identity: str, *, flush_parent: bool = True
+) -> None:
+    _rename_verified(
+        source, target, expected_identity, replace=False,
+        flush_parent=flush_parent,
+    )
 
 
 def _replace_verified(
@@ -1254,7 +1574,9 @@ def _replace_verified(
     )
 
 
-def _unlink_verified(path: Path, expected_identity: str) -> None:
+def _unlink_verified(
+    path: Path, expected_identity: str, *, flush_parent: bool = True
+) -> None:
     with _verified_parent(path) as (parent_handle, parent_identity):
         _revalidate_parent(path, parent_identity)
         if os.name == "nt":
@@ -1276,19 +1598,25 @@ def _unlink_verified(path: Path, expected_identity: str) -> None:
                 os.close(handle)
                 raise _error("reset_path_unsafe")
         try:
+            deletion_started = False
             _revalidate_parent(path, parent_identity)
             _revalidate_source_entry(path, parent_handle, expected_identity)
             if os.name == "nt":
                 _windows_unlink_handle(handle)
+                deletion_started = True
             else:
                 os.unlink(path.name, dir_fd=parent_handle)
         finally:
             if os.name == "nt":
-                ctypes.windll.kernel32.CloseHandle(handle)
+                if deletion_started:
+                    _windows_close_after_mutation(handle)
+                else:
+                    _windows_close_handle(handle)
             else:
                 os.close(handle)
         _revalidate_parent(path, parent_identity)
-    _flush_directory(path.parent)
+    if flush_parent:
+        _flush_directory(path.parent)
 
 
 def _unlink_existing(path: Path) -> None:
@@ -1297,15 +1625,15 @@ def _unlink_existing(path: Path) -> None:
         _unlink_verified(path, _path_identity(path))
 
 
-def _rmdir_verified(path: Path, expected_identity: str) -> None:
+def _rmdir_verified(
+    path: Path, expected_identity: str, *, flush_parent: bool = True
+) -> None:
     _safe_directory(path)
     with _verified_parent(path) as (parent_handle, parent_identity):
         _revalidate_parent(path, parent_identity)
         if _path_identity(path) != expected_identity:
             raise _error("reset_path_unsafe")
         if os.name == "nt":
-            import ctypes
-
             handle = _windows_create_relative(
                 parent_handle, path.name, directory=True, create_new=False,
                 desired_access=0x00010000 | 0x00000080 | 0x00100000,
@@ -1317,11 +1645,12 @@ def _rmdir_verified(path: Path, expected_identity: str) -> None:
                     raise _error("reset_path_unsafe")
                 _windows_unlink_handle(handle)
             finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                _windows_close_after_mutation(handle)
         else:
             os.rmdir(path.name, dir_fd=parent_handle)
         _revalidate_parent(path, parent_identity)
-    _flush_directory(path.parent)
+    if flush_parent:
+        _flush_directory(path.parent)
 
 
 def _copy_verified(
@@ -1329,6 +1658,8 @@ def _copy_verified(
     target: Path,
     expected_sha256: str,
     crash_checkpoint: Callable[[str], None] | None = None,
+    *,
+    flush_parent: bool = True,
 ) -> None:
     source_identity = _path_identity(source)
     if _stable_sha256(source) != expected_sha256:
@@ -1357,7 +1688,8 @@ def _copy_verified(
         os.close(source_descriptor)
     if _stable_sha256(target) != expected_sha256:
         raise _error("reset_recovery_invalid")
-    _flush_directory(target.parent)
+    if flush_parent:
+        _flush_directory(target.parent)
 
 
 def _journal_update(
@@ -1600,7 +1932,7 @@ def _audit_value(journal: dict[str, Any], outcome: str, terminal: str) -> dict[s
         "outcome": outcome, "plan_manifest_sha256": journal["plan_manifest_sha256"],
         "plan_token": journal["plan_token"],
         "quarantine_identities": {key: (None if value is None else value["identity"]) for key, value in journal["quarantine"].items()},
-        "recovery_commit": journal["recovery_commit"], "reset_protocol_version": RESET_PROTOCOL_VERSION,
+        "recovery_commit": journal["recovery_commit"], "reset_protocol_version": LEGACY_RESET_PROTOCOL_VERSION,
         "source_observations": journal["source_observations"], "source_schema_label": journal["source_schema_label"],
         "terminal_schema_label": terminal,
     }
@@ -1612,7 +1944,7 @@ def _reset_report(journal: dict[str, Any]) -> dict[str, Any]:
         "backup_sha256": journal["backup"]["sha256"], "foreign_key_violations": 0,
         "implementation_commit": journal["implementation_commit"], "integrity_check": "ok",
         "old_schema_label": journal["source_schema_label"], "plan_token": journal["plan_token"],
-        "recovery_commit": journal["recovery_commit"], "reset_protocol_version": RESET_PROTOCOL_VERSION,
+        "recovery_commit": journal["recovery_commit"], "reset_protocol_version": LEGACY_RESET_PROTOCOL_VERSION,
         "room_shared_effective_from_room_sequence_no": 1, "schema_label": "1.4", "status": "reset",
     }
 
@@ -1957,3 +2289,17 @@ def recover_database_reset(
         raise _error("reset_recovery_invalid") from exception
     finally:
         lease.close()
+
+
+# Revision 2.4 replaced only the reset-control protocol.  Keeping the reviewed
+# Revision 2.3 helpers above provides the closed legacy journal validator and
+# the already-audited SQLite backup/reset primitives, while every public reset
+# surface is routed through the Windows-only immutable implementation.
+from .reset_protocol_v2 import (  # noqa: E402
+    IGNORE_BLOCK as IGNORE_BLOCK,
+    execute_database_reset as execute_database_reset,
+    plan_database_reset as plan_database_reset,
+    recover_database_reset as recover_database_reset,
+)
+
+RESET_PROTOCOL_VERSION = "room_shared_reset_v2"

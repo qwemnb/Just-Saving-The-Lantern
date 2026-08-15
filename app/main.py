@@ -302,6 +302,7 @@ def main() -> None:
     parser.add_argument("--expected-audit-path")
     parser.add_argument("--confirm-destroy-canonical-history", action="store_true")
     parser.add_argument("--action", choices=("restore-source", "complete-fresh"))
+    parser.add_argument("--reviewed-plan-manifest")
     parser.add_argument("--confirm-reset-recovery", action="store_true")
     arguments = parser.parse_args()
 
@@ -410,6 +411,7 @@ def main() -> None:
                     arguments.database,
                     expected_plan_token=arguments.expected_plan_token,
                     action=arguments.action,
+                    reviewed_plan_manifest=arguments.reviewed_plan_manifest,
                     confirm_reset_recovery=arguments.confirm_reset_recovery,
                 )
         except DatabaseResetError as error:

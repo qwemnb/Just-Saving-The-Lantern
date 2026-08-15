@@ -173,11 +173,15 @@ database_schema_incompatible
 Every application database open participates in the shared maintenance lock
 `data/.helios-room-database.lock`. Reset planning, execution, and recovery use
 one exclusive lease; normal startup and connections fail closed while it is
-held or while either durable reset-state journal exists.
+held or while any legacy, immutable-generation, evidence-record, or partial
+reset-state control exists. Presence detection is platform-independent and
+malformed reserved-prefix names also block before SQLite opens.
 
 ## Controlled fresh-database reset
 
-Implementation and tests do not authorize a live plan or reset. After the
+Reset planning, execution, and recovery are Windows-only; unsupported systems
+fail before repository, lock, reset-artifact, or SQLite access. Implementation
+and tests do not authorize a live plan or reset. After the
 implementation is audited, committed, and pushed, a separate instruction is
 required to generate the filesystem-only plan:
 
@@ -185,10 +189,13 @@ required to generate the filesystem-only plan:
 python -m app.main reset-database --plan --database data/helios.db
 ```
 
-Planning opens no SQLite connection and changes no database or sidecar. Review
-its exact token, backup path, audit path, filesystem identity, implementation
-commit, protocol, and recovery-commit mapping. A second explicit authorization
-naming that exact plan is required before execution:
+Planning opens no SQLite connection and changes no database or sidecar. Its
+token binds the complete returned `reviewed_plan_manifest`, including Windows
+durability evidence, immutable-generation grammar, paths, filesystem
+identities, Git state, and recovery mapping. Save the exact canonical plan
+output outside the repository if interrupted-first-generation recovery may be
+needed. A second explicit authorization naming that exact plan is required
+before execution:
 
 ```powershell
 python -m app.main reset-database --execute --database data/helios.db `
@@ -200,15 +207,25 @@ python -m app.main reset-database --execute --database data/helios.db `
 
 Execution accepts only an exact valid schema 1.2 or 1.3 source, retains a
 verified backup and closed audit artifact under `backups/`, and installs a new
-schema 1.4 database with no retired rows. If a durable journal remains after
-interruption, ordinary startup stays closed. After reviewing it, authorize one
-exact recovery action separately:
+schema 1.4 database with no retired rows. Protected mutations are preceded by
+content-addressed, predecessor-bound immutable generations; a terminal audit
+binds the complete generation chain. Approved legacy v1 journals are converted
+through a content-addressed durability-evidence record without rewriting their
+historical bytes. If any reset control remains after interruption, ordinary
+startup stays closed. After reviewing it, authorize one exact recovery action
+separately:
 
 ```powershell
 python -m app.main reset-database --recover --database data/helios.db `
   --expected-plan-token <reviewed-token> `
-  --action <restore-source|complete-fresh> --confirm-reset-recovery
+  --action <restore-source|complete-fresh> `
+  [--reviewed-plan-manifest C:\absolute\path\to\saved-plan.json] `
+  --confirm-reset-recovery
 ```
+
+`--reviewed-plan-manifest` is required only to prove safe cleanup of an
+incomplete native generation 1. It is optional for a completed native chain
+and forbidden for legacy conversion state.
 
 Do not bootstrap memory, publish the welcome, start live acceptance, or call a
 provider until reset success has been reviewed and each later operation is

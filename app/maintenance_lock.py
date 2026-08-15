@@ -16,6 +16,7 @@ ACTIVE_DATABASE_PATH = Path(os.path.abspath(PROJECT_ROOT / "data" / "helios.db")
 ACTIVE_LOCK_PATH = PROJECT_ROOT / "data" / ".helios-room-database.lock"
 RESET_STATE_NAME = ".helios-room-reset-state.json"
 RESET_STATE_NEXT_NAME = ".helios-room-reset-state.json.next"
+RESET_STATE_PREFIX = ".helios-room-reset-state."
 
 
 class MaintenanceLockError(OSError):
@@ -81,10 +82,8 @@ def acquire_database_lease(
     lock_path, state_path, next_path = coordination_paths(database_path)
     if not lock_path.parent.is_dir():
         raise MaintenanceLockError("database maintenance directory is unavailable")
-    if not allow_recovery_state and (
-        os.path.lexists(state_path) or os.path.lexists(next_path)
-    ):
-        raise ResetRecoveryRequiredError()
+    if not allow_recovery_state:
+        _require_no_reset_state(lock_path.parent)
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -100,10 +99,47 @@ def acquire_database_lease(
             raise MaintenanceLockError("maintenance lock path is unsafe")
         lease = MaintenanceLease(lock_path, file, shared)
         _lock(lease)
+        if not allow_recovery_state:
+            try:
+                _require_no_reset_state(lock_path.parent)
+            except Exception:
+                lease.close()
+                raise
         return lease
     except Exception:
         file.close()
         raise
+
+
+def _require_no_reset_state(directory: Path) -> None:
+    try:
+        if os.name == "nt":
+            # Import lazily to keep normal lock-module import order acyclic.
+            from . import reset_database
+
+            names = reset_database._windows_enumerate_directory_direct(directory)
+        else:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(directory, flags)
+            try:
+                with os.scandir(descriptor) as entries:
+                    names = [entry.name for entry in entries]
+            finally:
+                os.close(descriptor)
+        for name in names:
+            if (
+                name in {RESET_STATE_NAME, RESET_STATE_NEXT_NAME}
+                or name.startswith(RESET_STATE_PREFIX)
+            ):
+                raise ResetRecoveryRequiredError()
+    except ResetRecoveryRequiredError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise ResetRecoveryRequiredError() from error
 
 
 @contextlib.contextmanager
