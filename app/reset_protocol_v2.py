@@ -1,4 +1,4 @@
-"""Windows-only immutable reset-control protocol (Revisions 2.4 through 2.9).
+"""Windows-only immutable reset-control protocol (Revisions 2.4 through 2.10).
 
 This module deliberately contains only reset planning/execution/recovery code.
 Ordinary runtime interlocking remains in :mod:`app.maintenance_lock` and is
@@ -182,15 +182,44 @@ def _read_exact_prefix(path: Path, expected: bytes) -> tuple[str, bytes]:
         os.close(descriptor)
 
 
-def _validate_file_prefix(path: Path, source: Path) -> str:
+def _validate_file_prefix(
+    path: Path,
+    source: Path,
+    *,
+    expected_source_identity: str,
+    expected_source_sha256: str,
+) -> str:
     """Validate an interrupted copy as an exact prefix of its bound source."""
 
-    source_info = legacy._safe_regular(source)
-    source_identity = legacy._path_identity(source)
-    source_descriptor = legacy._open_existing_regular(
-        source, source_identity, share_write=False
-    )
     try:
+        source_descriptor = legacy._open_existing_regular(
+            source,
+            expected_source_identity,
+            share_write=False,
+            share_delete=False,
+        )
+    except legacy.DatabaseResetError as error:
+        raise _error("reset_recovery_invalid") from error
+    try:
+        source_info = os.fstat(source_descriptor)
+
+        def source_digest() -> str:
+            os.lseek(source_descriptor, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            while True:
+                block = os.read(source_descriptor, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+            return digest.hexdigest()
+
+        if (
+            legacy._descriptor_identity(source_descriptor, source_info)
+            != expected_source_identity
+            or source_digest() != expected_source_sha256
+        ):
+            raise _error("reset_recovery_invalid")
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
         candidate_info = legacy._safe_regular(path)
         if candidate_info.st_size > source_info.st_size:
             raise _error("reset_recovery_invalid")
@@ -216,7 +245,8 @@ def _validate_file_prefix(path: Path, source: Path) -> str:
                 or legacy._descriptor_identity(candidate_descriptor, candidate_after)
                 != candidate_identity
                 or legacy._descriptor_identity(source_descriptor, source_after)
-                != source_identity
+                != expected_source_identity
+                or source_digest() != expected_source_sha256
             ):
                 raise _error("reset_recovery_invalid")
             return candidate_identity
@@ -737,6 +767,66 @@ def _verified_file_sha256(path: Path, expected_identity: str) -> str:
     finally:
         os.close(descriptor)
     return digest.hexdigest()
+
+
+@contextmanager
+def _hold_file_evidence(path: Path, expected: _FileEvidence):
+    descriptor = legacy._open_existing_regular(
+        path,
+        expected.identity,
+        share_write=False,
+        share_delete=False,
+    )
+    control = _ControlPartial(path, descriptor, 0, "", expected.identity)
+    try:
+        _require_control_evidence(control, expected)
+        yield control
+        _require_control_evidence(control, expected)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _hold_file_identity_hash(
+    path: Path, expected_identity: str, expected_sha256: str
+):
+    descriptor = legacy._open_existing_regular(
+        path,
+        expected_identity,
+        share_write=False,
+        share_delete=False,
+    )
+    control = _ControlPartial(path, descriptor, 0, "", expected_identity)
+    try:
+        evidence = _control_evidence(control)
+        if evidence.sha256 != expected_sha256:
+            raise _error("reset_recovery_invalid")
+        yield control, evidence
+        _require_control_evidence(control, evidence)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _hold_validated_sqlite_file(
+    path: Path, validator: Callable[[Path], None]
+):
+    identity = legacy._path_identity(path)
+    descriptor = legacy._open_existing_regular(
+        path,
+        identity,
+        share_write=False,
+        share_delete=False,
+    )
+    control = _ControlPartial(path, descriptor, 0, "", identity)
+    try:
+        evidence = _control_evidence(control)
+        validator(path)
+        _require_control_evidence(control, evidence)
+        yield control, evidence
+        _require_control_evidence(control, evidence)
+    finally:
+        os.close(descriptor)
 
 
 def _rmdir_verified(path: Path, identity: str) -> None:
@@ -1467,16 +1557,33 @@ class GenerationStore:
         return list(self.chain_hashes)
 
 
-def _read_generation(path: Path, *, partial: bool) -> Generation:
+def _generation_from_canonical(
+    path: Path,
+    *,
+    partial: bool,
+    value: Any,
+    raw: bytes,
+    identity: str,
+) -> Generation:
     base = path.name[:-len(GENERATION_PARTIAL_SUFFIX)] if partial else path.name
     match = GENERATION_RE.fullmatch(base)
     if match is None:
         raise _error("reset_recovery_invalid")
     token, sequence_text, digest = match.groups()
     sequence = int(sequence_text)
-    value, raw, identity = _read_canonical(path)
     _validate_envelope(value, token=token, content_hash=digest, sequence=sequence)
     return Generation(path, partial, token, sequence, digest, value, raw, identity)
+
+
+def _read_generation(path: Path, *, partial: bool) -> Generation:
+    value, raw, identity = _read_canonical(path)
+    return _generation_from_canonical(
+        path,
+        partial=partial,
+        value=value,
+        raw=raw,
+        identity=identity,
+    )
 
 
 def _discover_generations(root: Path, expected_token: str) -> tuple[list[Generation], list[Path], list[Path], list[Path]]:
@@ -1907,6 +2014,15 @@ def _control_bytes(control: _ControlPartial, *, maximum: int = 1_048_576) -> byt
     return b"".join(chunks)
 
 
+def _read_canonical_control(
+    control: _ControlPartial, *, maximum: int = 1_048_576
+) -> tuple[Any, bytes]:
+    """Read canonical JSON without releasing the authoritative source handle."""
+
+    raw = _control_bytes(control, maximum=maximum)
+    return _load_canonical(raw, maximum=maximum), raw
+
+
 def _control_sha256(control: _ControlPartial) -> str:
     os.lseek(control.descriptor, 0, os.SEEK_SET)
     digest = hashlib.sha256()
@@ -2007,18 +2123,21 @@ def _write_and_install_json(
     return raw, identity
 
 
-def _promote_existing_json_partial(
-    partial: Path,
+def _promote_validated_json_control(
+    control: _ControlPartial,
     final: Path,
     expected_raw: bytes,
-    expected_identity: str,
     authority: dict[str, Any],
 ) -> None:
-    with _open_control_partial(partial, create_new=False) as control:
-        if control.identity != expected_identity:
-            raise _error("reset_path_unsafe")
-        _promote_open_control(control, final, expected_raw)
+    _promote_open_control(control, final, expected_raw)
     _flush_namespace(authority, final.parent)
+
+
+@dataclass(frozen=True)
+class _FileEvidence:
+    identity: str
+    size: int
+    sha256: str
 
 
 @dataclass
@@ -2029,6 +2148,47 @@ class _SqliteStaging:
     guard_handle: int
     identity: str
     elevated: _ControlPartial | None = None
+
+
+_STABLE_FILE_SNAPSHOT_FIELDS = {
+    "allocation_size",
+    "delete_pending",
+    "directory",
+    "end_of_file",
+    "file_attributes",
+    "file_id",
+    "last_write_time",
+    "link_count",
+    "reparse_tag",
+}
+
+
+def _control_evidence(control: _ControlPartial) -> _FileEvidence:
+    before = legacy._windows_handle_snapshot(control.handle)
+    legacy._windows_validate_handle(control.handle, directory=False)
+    digest = _control_sha256(control)
+    after = legacy._windows_handle_snapshot(control.handle)
+    if (
+        any(before[key] != after[key] for key in _STABLE_FILE_SNAPSHOT_FIELDS)
+        or before["file_id"] != control.identity
+        or before["directory"]
+        or before["delete_pending"]
+        or before["link_count"] != 1
+        or before["reparse_tag"] != 0
+    ):
+        raise _error("reset_path_unsafe")
+    return _FileEvidence(
+        identity=control.identity,
+        size=int(before["end_of_file"]),
+        sha256=digest,
+    )
+
+
+def _require_control_evidence(
+    control: _ControlPartial, expected: _FileEvidence
+) -> None:
+    if _control_evidence(control) != expected:
+        raise _error("reset_path_unsafe")
 
 
 @contextmanager
@@ -2072,7 +2232,72 @@ def _open_sqlite_staging(path: Path):
                 )
 
 
-def _elevate_sqlite_staging(staging: _SqliteStaging) -> _ControlPartial:
+@contextmanager
+def _open_sqlite_validation_handle(staging: _SqliteStaging):
+    """Hold one read-only staging object against writes and namespace changes."""
+
+    import msvcrt
+
+    legacy._revalidate_parent(staging.path, staging.parent_identity)
+    if (
+        legacy._relative_entry_identity(staging.path, staging.parent_handle)
+        != staging.identity
+    ):
+        raise _error("reset_path_unsafe")
+    handle = legacy._windows_create_relative(
+        staging.parent_handle,
+        staging.path.name,
+        directory=False,
+        create_new=False,
+        desired_access=0x80000000 | 0x00100000 | 0x00000080,
+        share_access=0x1,
+    )
+    descriptor: int | None = None
+    try:
+        legacy._windows_validate_handle(handle, directory=False)
+        if legacy._windows_handle_identity(handle) != staging.identity:
+            raise _error("reset_path_unsafe")
+        descriptor = msvcrt.open_osfhandle(
+            handle, getattr(os, "O_BINARY", 0) | os.O_RDONLY
+        )
+        handle = 0
+        control = _ControlPartial(
+            staging.path,
+            descriptor,
+            staging.parent_handle,
+            staging.parent_identity,
+            staging.identity,
+        )
+        legacy._revalidate_parent(staging.path, staging.parent_identity)
+        if (
+            legacy._relative_entry_identity(
+                staging.path, staging.parent_handle
+            )
+            != staging.identity
+        ):
+            raise _error("reset_path_unsafe")
+        yield control
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        elif handle:
+            legacy._windows_close_handle(handle)
+
+
+def _validate_sqlite_staging(
+    staging: _SqliteStaging,
+    validator: Callable[[Path], None],
+) -> _FileEvidence:
+    with _open_sqlite_validation_handle(staging) as control:
+        before = _control_evidence(control)
+        validator(staging.path)
+        _require_control_evidence(control, before)
+        return before
+
+
+def _elevate_sqlite_staging(
+    staging: _SqliteStaging, expected: _FileEvidence
+) -> _ControlPartial:
     if staging.elevated is not None or not staging.guard_handle:
         raise _error("reset_path_unsafe")
     import msvcrt
@@ -2120,22 +2345,96 @@ def _elevate_sqlite_staging(staging: _SqliteStaging) -> _ControlPartial:
             elevated_handle, getattr(os, "O_BINARY", 0) | os.O_RDWR
         )
         elevated_handle = 0
-        legacy._windows_close_handle(staging.guard_handle)
-        staging.guard_handle = 0
-        staging.elevated = _ControlPartial(
+        control = _ControlPartial(
             staging.path,
             descriptor,
             staging.parent_handle,
             staging.parent_identity,
             staging.identity,
         )
-        return staging.elevated
+        _require_control_evidence(control, expected)
+        legacy._windows_close_handle(staging.guard_handle)
+        staging.guard_handle = 0
+        staging.elevated = control
+        return control
     except Exception:
         if descriptor is not None:
             os.close(descriptor)
         elif elevated_handle:
             legacy._windows_close_handle(elevated_handle)
         raise
+
+
+def _close_elevated_sqlite_staging(staging: _SqliteStaging) -> None:
+    if staging.elevated is None:
+        raise _error("reset_path_unsafe")
+    os.close(staging.elevated.descriptor)
+    staging.elevated = None
+
+
+def _verify_relative_file_evidence(
+    path: Path,
+    parent_handle: int,
+    parent_identity: str,
+    expected: _FileEvidence,
+) -> None:
+    import msvcrt
+
+    legacy._revalidate_parent(path, parent_identity)
+    handle = legacy._windows_create_relative(
+        parent_handle,
+        path.name,
+        directory=False,
+        create_new=False,
+        desired_access=0x80000000 | 0x00100000 | 0x00000080,
+        share_access=0x1,
+    )
+    descriptor: int | None = None
+    try:
+        legacy._windows_validate_handle(handle, directory=False)
+        if legacy._windows_handle_identity(handle) != expected.identity:
+            raise _error("reset_path_unsafe")
+        descriptor = msvcrt.open_osfhandle(
+            handle, getattr(os, "O_BINARY", 0) | os.O_RDONLY
+        )
+        handle = 0
+        control = _ControlPartial(
+            path, descriptor, parent_handle, parent_identity, expected.identity
+        )
+        _require_control_evidence(control, expected)
+        legacy._revalidate_parent(path, parent_identity)
+        if legacy._relative_entry_identity(path, parent_handle) != expected.identity:
+            raise _error("reset_path_unsafe")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        elif handle:
+            legacy._windows_close_handle(handle)
+
+
+def _promote_sqlite_staging(
+    staging: _SqliteStaging,
+    final: Path,
+    expected: _FileEvidence,
+    authority: dict[str, Any],
+) -> _FileEvidence:
+    control = _elevate_sqlite_staging(staging, expected)
+    _promote_open_control(
+        control,
+        final,
+        expected_raw=None,
+        expected_sha256=expected.sha256,
+    )
+    _require_control_evidence(control, expected)
+    _close_elevated_sqlite_staging(staging)
+    _flush_namespace(authority, final.parent)
+    _verify_relative_file_evidence(
+        final,
+        staging.parent_handle,
+        staging.parent_identity,
+        expected,
+    )
+    return expected
 
 
 def _native_audit_value(store: GenerationStore, journal: dict[str, Any], outcome: str, terminal: str) -> dict[str, Any]:
@@ -2207,30 +2506,32 @@ def _install_terminal_audit(
         return existing
     promoted = False
     if os.path.lexists(partial):
-        try:
-            partial_value, partial_raw, partial_identity = _read_canonical(partial)
-        except legacy.DatabaseResetError:
-            partial_identity = legacy._path_identity(partial)
-            _unlink_verified(partial, partial_identity)
-            _flush_namespace(store.authority, partial.parent)
-        else:
+        canonical_invalid = False
+        with _open_control_partial(partial, create_new=False) as control:
             try:
+                partial_value, partial_raw = _read_canonical_control(control)
+            except legacy.DatabaseResetError as error:
+                if error.code == "reset_path_unsafe":
+                    raise
+                canonical_invalid = True
+            else:
                 if store.origin == "native_v2":
                     _validate_native_audit(partial_value, store, journal)
                 else:
                     legacy._validate_audit(partial_value, journal)
-            except legacy.DatabaseResetError:
-                raise
-            if partial_value["outcome"] != outcome:
-                raise _error("reset_recovery_invalid")
-            _promote_existing_json_partial(
-                partial,
-                audit,
-                partial_raw,
-                partial_identity,
-                store.authority,
-            )
-            promoted = True
+                if partial_value["outcome"] != outcome:
+                    raise _error("reset_recovery_invalid")
+                _promote_validated_json_control(
+                    control,
+                    audit,
+                    partial_raw,
+                    store.authority,
+                )
+                promoted = True
+        if canonical_invalid:
+            partial_identity = legacy._path_identity(partial)
+            _unlink_verified(partial, partial_identity)
+            _flush_namespace(store.authority, partial.parent)
     if not promoted:
         _write_and_install_json(
             partial,
@@ -2409,26 +2710,23 @@ def execute_database_reset(
                 != backup_staging.identity
             ):
                 raise _error("reset_path_unsafe")
-            verified = legacy._open_connection(partial, immutable=True)
-            try:
-                backup_label, backup_digest = legacy._validate_source(verified)
-            finally:
-                verified.rollback()
-                verified.close()
-            if (backup_label, backup_digest) != (source_label, source_digest):
-                raise _error("reset_failed")
-            if (
-                legacy._relative_entry_identity(
-                    partial, backup_staging.parent_handle
-                )
-                != backup_staging.identity
-            ):
-                raise _error("reset_path_unsafe")
-            backup_control = _elevate_sqlite_staging(backup_staging)
-            backup_sha = _promote_open_control(
-                backup_control, backup, expected_raw=None
+
+            def validate_backup_staging(path: Path) -> None:
+                verified = legacy._open_connection(path, immutable=True)
+                try:
+                    backup_label, backup_digest = legacy._validate_source(verified)
+                finally:
+                    verified.rollback()
+                    verified.close()
+                if (backup_label, backup_digest) != (source_label, source_digest):
+                    raise _error("reset_failed")
+
+            backup_evidence = _validate_sqlite_staging(
+                backup_staging, validate_backup_staging
             )
-        _flush_namespace(under_lease, backup.parent)
+            _promote_sqlite_staging(
+                backup_staging, backup, backup_evidence, under_lease
+            )
         active, quarantine_paths = _component_paths(root, manifest)
         source_components = {
             key: (legacy._component(path, f"data/{path.name}") if os.path.lexists(path) else None)
@@ -2447,7 +2745,11 @@ def execute_database_reset(
         }
         journal = {
             "audit_path": expected_audit_path,
-            "backup": {"identity": legacy._path_identity(backup), "path": expected_backup_path, "sha256": backup_sha},
+            "backup": {
+                "identity": backup_evidence.identity,
+                "path": expected_backup_path,
+                "sha256": backup_evidence.sha256,
+            },
             "database_path": "data/helios.db",
             "implementation_commit": plan["implementation_commit"],
             "journal_sequence": 0,
@@ -2494,6 +2796,13 @@ def execute_database_reset(
                     fresh.close()
             finally:
                 template.close()
+            configured = legacy._open_direct(fresh_staging, read_only=False)
+            try:
+                mode = configured.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    raise _error("reset_failed")
+            finally:
+                configured.close()
             if any(
                 os.path.lexists(Path(f"{fresh_staging}{suffix}"))
                 for suffix in ("-wal", "-shm", "-journal")
@@ -2506,39 +2815,53 @@ def execute_database_reset(
                 != fresh_staging_state.identity
             ):
                 raise _error("reset_path_unsafe")
-            store.append(journal, "installing_fresh", crash_checkpoint)
-            fresh_control = _elevate_sqlite_staging(fresh_staging_state)
-            _promote_open_control(
-                fresh_control, database, expected_raw=None
+
+            def validate_fresh_staging(path: Path) -> None:
+                validation = legacy._open_connection(path, immutable=True)
+                try:
+                    validate_v14_foundation(validation)
+                    validate_database_integrity(validation)
+                finally:
+                    validation.rollback()
+                    validation.close()
+
+            fresh_evidence = _validate_sqlite_staging(
+                fresh_staging_state, validate_fresh_staging
             )
-        _flush_namespace(under_lease, database.parent)
-        fresh = legacy._open_direct(database, read_only=False)
-        try:
-            mode = fresh.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-            if str(mode).lower() != "wal":
-                raise _error("reset_failed")
-        finally:
-            fresh.close()
+            store.append(journal, "installing_fresh", crash_checkpoint)
+            _promote_sqlite_staging(
+                fresh_staging_state,
+                database,
+                fresh_evidence,
+                under_lease,
+            )
         store.append(journal, "fresh_installed", crash_checkpoint)
         store.append(journal, "validating_fresh", crash_checkpoint)
-        fresh = legacy._open_direct(database, read_only=True)
-        try:
-            validate_v14_foundation(fresh)
-            validate_database_integrity(fresh)
-        finally:
-            fresh.rollback()
-            fresh.close()
         store.append(journal, "fresh_validated", crash_checkpoint)
-        for key in ("database", "wal", "shm"):
-            item = quarantine[key]
-            if item is None or not os.path.lexists(quarantine_paths[key]):
-                continue
-            store.append(journal, "cleaning_quarantine", crash_checkpoint)
-            _unlink_verified(quarantine_paths[key], item["identity"])
-            _flush_namespace(under_lease, quarantine_paths[key].parent)
-        store.append(journal, "finalizing", crash_checkpoint)
-        _install_terminal_audit(store, journal, "reset", "1.4", crash_checkpoint)
-        _delete_generation_controls(store)
+        with _hold_file_evidence(
+            backup, backup_evidence
+        ) as held_backup, _hold_file_evidence(
+            database, fresh_evidence
+        ) as held_fresh:
+            for key in ("database", "wal", "shm"):
+                item = quarantine[key]
+                if item is None or not os.path.lexists(quarantine_paths[key]):
+                    continue
+                store.append(journal, "cleaning_quarantine", crash_checkpoint)
+                _unlink_verified(quarantine_paths[key], item["identity"])
+                _flush_namespace(under_lease, quarantine_paths[key].parent)
+                _require_control_evidence(held_backup, backup_evidence)
+                _require_control_evidence(held_fresh, fresh_evidence)
+            _require_control_evidence(held_backup, backup_evidence)
+            _require_control_evidence(held_fresh, fresh_evidence)
+            store.append(journal, "finalizing", crash_checkpoint)
+            _install_terminal_audit(
+                store, journal, "reset", "1.4", crash_checkpoint
+            )
+            installed_audit = _existing_terminal_audit(store, journal)
+            if installed_audit is None or installed_audit["outcome"] != "reset":
+                raise _error("reset_failed")
+            _delete_generation_controls(store)
         return _report(journal, "reset")
     except legacy.DatabaseResetError as error:
         if store is None:
@@ -2658,7 +2981,11 @@ def _is_demonstrably_incomplete_legacy_next(
     implementation_commit: str,
 ) -> bool:
     marker = b"2000-01-01T00:00:00.000Z"
-    for stage in STAGES:
+    current_stage_index = STAGES.index(journal["stage"])
+    allowed_stages = STAGES[
+        current_stage_index:min(current_stage_index + 2, len(STAGES))
+    ]
+    for stage in allowed_stages:
         successor = dict(journal)
         successor["journal_sequence"] = journal["journal_sequence"] + 1
         successor["stage"] = stage
@@ -2802,13 +3129,21 @@ def _evidence_name(token: str, digest: str) -> str:
     return f".helios-room-reset-state.{token}.legacy-evidence.{digest}.json"
 
 
-def _validate_evidence_record(path: Path, *, partial: bool, expected_token: str, converter: str) -> EvidenceRecord:
+def _evidence_record_from_canonical(
+    path: Path,
+    *,
+    partial: bool,
+    expected_token: str,
+    converter: str,
+    value: Any,
+    raw: bytes,
+    identity: str,
+) -> EvidenceRecord:
     base = path.name[:-len(GENERATION_PARTIAL_SUFFIX)] if partial else path.name
     match = EVIDENCE_RE.fullmatch(base)
     if match is None or match.group(1) != expected_token:
         raise _error("reset_recovery_invalid")
     token, digest = match.groups()
-    value, raw, identity = _read_canonical(path)
     if not isinstance(value, dict) or set(value) != EVIDENCE_RECORD_KEYS:
         raise _error("reset_recovery_invalid")
     if (
@@ -2836,6 +3171,21 @@ def _validate_evidence_record(path: Path, *, partial: bool, expected_token: str,
         raise _error("reset_recovery_invalid")
     _validate_legacy_evidence(value["legacy_recovery_evidence"], token, converter)
     return EvidenceRecord(path, partial, token, digest, value, raw, identity)
+
+
+def _validate_evidence_record(
+    path: Path, *, partial: bool, expected_token: str, converter: str
+) -> EvidenceRecord:
+    value, raw, identity = _read_canonical(path)
+    return _evidence_record_from_canonical(
+        path,
+        partial=partial,
+        expected_token=expected_token,
+        converter=converter,
+        value=value,
+        raw=raw,
+        identity=identity,
+    )
 
 
 def _stable_partial_snapshot(path: Path) -> tuple[bytes, str, int, int]:
@@ -3091,13 +3441,35 @@ def _handle_evidence_state(
                     root, expected_token, converter, selection,
                     _expected_legacy_names(selection.source) + [path.name],
                 )
-                _promote_existing_json_partial(
-                    path, final, record.raw, record.identity, authority
-                )
-                return _validate_evidence_record(
-                    final, partial=False, expected_token=expected_token,
-                    converter=converter,
-                ), authority
+                with _open_control_partial(path, create_new=False) as control:
+                    value, raw = _read_canonical_control(control)
+                    retained = _evidence_record_from_canonical(
+                        path,
+                        partial=True,
+                        expected_token=expected_token,
+                        converter=converter,
+                        value=value,
+                        raw=raw,
+                        identity=control.identity,
+                    )
+                    if (
+                        retained.identity != record.identity
+                        or retained.raw != record.raw
+                    ):
+                        raise _error("reset_recovery_invalid")
+                    _promote_validated_json_control(
+                        control, final, raw, authority
+                    )
+                    installed = _evidence_record_from_canonical(
+                        final,
+                        partial=False,
+                        expected_token=expected_token,
+                        converter=converter,
+                        value=value,
+                        raw=raw,
+                        identity=control.identity,
+                    )
+                return installed, authority
         record = _validate_evidence_record(
             path, partial=False, expected_token=expected_token,
             converter=converter,
@@ -3150,10 +3522,28 @@ def _promote_or_rebuild_legacy_generation_partial(
     raw, identity, size, mtime_ns = _stable_partial_snapshot(partial)
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
     if raw == expected_raw:
-        _promote_existing_json_partial(
-            partial, final, raw, identity, store.authority
-        )
-        store.generations.append(_read_generation(final, partial=False))
+        with _open_control_partial(partial, create_new=False) as control:
+            value, retained_raw = _read_canonical_control(control)
+            generation = _generation_from_canonical(
+                partial,
+                partial=True,
+                value=value,
+                raw=retained_raw,
+                identity=control.identity,
+            )
+            if generation.raw != raw or generation.identity != identity:
+                raise _error("reset_recovery_invalid")
+            _promote_validated_json_control(
+                control, final, retained_raw, store.authority
+            )
+            installed = _generation_from_canonical(
+                final,
+                partial=False,
+                value=value,
+                raw=retained_raw,
+                identity=control.identity,
+            )
+        store.generations.append(installed)
         return
     if len(raw) >= len(expected_raw) or expected_raw[:len(raw)] != raw:
         raise _error("reset_recovery_invalid")
@@ -3285,21 +3675,27 @@ def _install_legacy_chain_manifest(store: GenerationStore, journal: dict[str, An
             _flush_namespace(store.authority, partial.parent)
         return path
     if os.path.lexists(partial):
-        try:
-            existing, _raw, identity = _read_canonical(partial)
-        except legacy.DatabaseResetError:
+        canonical_invalid = False
+        with _open_control_partial(partial, create_new=False) as control:
+            try:
+                existing, partial_raw = _read_canonical_control(control)
+            except legacy.DatabaseResetError as error:
+                if error.code == "reset_path_unsafe":
+                    raise
+                canonical_invalid = True
+            else:
+                if existing != value:
+                    raise _error("reset_recovery_invalid")
+                _promote_validated_json_control(
+                    control, path, partial_raw, store.authority
+                )
+                return path
+        if canonical_invalid:
             identity, partial_raw = _read_exact_prefix(
                 partial, _canonical_bytes(value)
             )
             _unlink_verified_bytes(partial, identity, partial_raw)
             _flush_namespace(store.authority, partial.parent)
-        else:
-            if existing != value:
-                raise _error("reset_recovery_invalid")
-            _promote_existing_json_partial(
-                partial, path, _raw, identity, store.authority
-            )
-            return path
     _write_and_install_json(partial, path, value, store.authority)
     return path
 
@@ -3501,31 +3897,30 @@ def _promote_terminal_audit_partial(
     partial = Path(f"{audit}.partial")
     if os.path.lexists(audit) or not os.path.lexists(partial):
         return None
-    try:
-        value, _raw, identity = _read_canonical(partial)
-        if store.origin == "native_v2":
-            _validate_native_audit(value, store, journal)
-        else:
-            legacy._validate_audit(value, journal)
-        if value["outcome"] != expected_outcome:
-            raise _error("reset_recovery_invalid")
-    except legacy.DatabaseResetError as error:
-        if error.code == "reset_path_unsafe":
-            raise
+    canonical_invalid = False
+    with _open_control_partial(partial, create_new=False) as control:
         try:
-            _read_canonical(partial)
-        except legacy.DatabaseResetError as canonical_error:
-            if canonical_error.code == "reset_path_unsafe":
+            value, raw = _read_canonical_control(control)
+        except legacy.DatabaseResetError as error:
+            if error.code == "reset_path_unsafe":
                 raise
+            canonical_invalid = True
         else:
-            raise error
+            if store.origin == "native_v2":
+                _validate_native_audit(value, store, journal)
+            else:
+                legacy._validate_audit(value, journal)
+            if value["outcome"] != expected_outcome:
+                raise _error("reset_recovery_invalid")
+            _promote_validated_json_control(
+                control, audit, raw, store.authority
+            )
+            return value
+    if canonical_invalid:
         _unlink_verified(partial, legacy._path_identity(partial))
         _flush_namespace(store.authority, partial.parent)
         return None
-    _promote_existing_json_partial(
-        partial, audit, _raw, identity, store.authority
-    )
-    return value
+    raise _error("reset_recovery_invalid")
 
 
 def _restore_v2(
@@ -3576,7 +3971,10 @@ def _restore_v2(
                     != journal["backup"]["sha256"]
                 ):
                     interrupted_identity = _validate_file_prefix(
-                        candidate, backup
+                        candidate,
+                        backup,
+                        expected_source_identity=journal["backup"]["identity"],
+                        expected_source_sha256=journal["backup"]["sha256"],
                     )
                     store.append(
                         journal, journal["stage"], crash_checkpoint,
@@ -3634,23 +4032,53 @@ def _complete_fresh_v2(
         raise _error("reset_recovery_invalid")
     database = store.root / journal["database_path"]
     store.append(journal, journal["stage"], crash_checkpoint, "recovery:fresh_validate")
-    connection = legacy._open_direct(database, read_only=True)
-    try:
-        validate_v14_foundation(connection)
-        validate_database_integrity(connection)
-    finally:
-        connection.rollback()
-        connection.close()
+
+    def validate_fresh(path: Path) -> None:
+        connection = legacy._open_connection(path, immutable=True)
+        try:
+            validate_v14_foundation(connection)
+            validate_database_integrity(connection)
+        finally:
+            connection.rollback()
+            connection.close()
+
+    backup = store.root / journal["backup"]["path"]
     _active, quarantines, _failed, _restoring = _operational_paths(store, journal)
-    for key, path in quarantines.items():
-        if path is not None and os.path.lexists(path):
-            store.append(journal, journal["stage"], crash_checkpoint, "recovery:fresh_cleanup")
-            expected = journal["quarantine"][key]["identity"]
-            _unlink_verified(path, expected)
-            _flush_namespace(store.authority, path.parent)
-    store.append(journal, journal["stage"], crash_checkpoint, "recovery:fresh_audit")
-    _install_terminal_audit(store, journal, "reset", "1.4", crash_checkpoint)
-    _cleanup_after_audit(store, journal)
+    with _hold_file_identity_hash(
+        backup,
+        journal["backup"]["identity"],
+        journal["backup"]["sha256"],
+    ) as (held_backup, backup_evidence), _hold_validated_sqlite_file(
+        database, validate_fresh
+    ) as (held_fresh, fresh_evidence):
+        for key, path in quarantines.items():
+            if path is not None and os.path.lexists(path):
+                store.append(
+                    journal,
+                    journal["stage"],
+                    crash_checkpoint,
+                    "recovery:fresh_cleanup",
+                )
+                expected = journal["quarantine"][key]["identity"]
+                _unlink_verified(path, expected)
+                _flush_namespace(store.authority, path.parent)
+                _require_control_evidence(held_backup, backup_evidence)
+                _require_control_evidence(held_fresh, fresh_evidence)
+        _require_control_evidence(held_backup, backup_evidence)
+        _require_control_evidence(held_fresh, fresh_evidence)
+        store.append(
+            journal,
+            journal["stage"],
+            crash_checkpoint,
+            "recovery:fresh_audit",
+        )
+        _install_terminal_audit(
+            store, journal, "reset", "1.4", crash_checkpoint
+        )
+        installed_audit = _existing_terminal_audit(store, journal)
+        if installed_audit is None or installed_audit["outcome"] != "reset":
+            raise _error("reset_recovery_invalid")
+        _cleanup_after_audit(store, journal)
     return _report(journal, "reset", native=store.origin == "native_v2")
 
 
@@ -3901,10 +4329,28 @@ def _handle_native_partial_only(
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
     authority = complete.envelope["reviewed_plan_manifest"]["durability"]
     _revalidate_persisted_authority(root, authority)
-    _promote_existing_json_partial(
-        partial, final, complete.raw, complete.identity, authority
-    )
-    return _read_generation(final, partial=False)
+    with _open_control_partial(partial, create_new=False) as control:
+        value, raw = _read_canonical_control(control)
+        retained = _generation_from_canonical(
+            partial,
+            partial=True,
+            value=value,
+            raw=raw,
+            identity=control.identity,
+        )
+        if (
+            retained.raw != complete.raw
+            or retained.identity != complete.identity
+        ):
+            raise _error("reset_recovery_invalid")
+        _promote_validated_json_control(control, final, raw, authority)
+        return _generation_from_canonical(
+            final,
+            partial=False,
+            value=value,
+            raw=raw,
+            identity=control.identity,
+        )
 
 
 def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
@@ -3950,13 +4396,34 @@ def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
         _unlink_verified(partial, legacy._path_identity(partial))
         _flush_namespace(store.authority, partial.parent)
         return
-    if generation.envelope["previous_generation_sha256"] != store.generations[-1].content_hash:
-        raise _error("reset_recovery_invalid")
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
-    _promote_existing_json_partial(
-        partial, final, generation.raw, generation.identity, store.authority
-    )
-    store.generations.append(_read_generation(final, partial=False))
+    with _open_control_partial(partial, create_new=False) as control:
+        value, raw = _read_canonical_control(control)
+        retained = _generation_from_canonical(
+            partial,
+            partial=True,
+            value=value,
+            raw=raw,
+            identity=control.identity,
+        )
+        if (
+            retained.raw != generation.raw
+            or retained.identity != generation.identity
+            or retained.envelope["previous_generation_sha256"]
+            != store.generations[-1].content_hash
+        ):
+            raise _error("reset_recovery_invalid")
+        _promote_validated_json_control(
+            control, final, raw, store.authority
+        )
+        installed = _generation_from_canonical(
+            final,
+            partial=False,
+            value=value,
+            raw=raw,
+            identity=control.identity,
+        )
+    store.generations.append(installed)
 
 
 def recover_database_reset(

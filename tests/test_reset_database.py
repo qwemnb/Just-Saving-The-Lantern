@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import ctypes
+import inspect
 import json
 import os
 import sqlite3
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from ctypes import wintypes
 from pathlib import Path
 from unittest.mock import patch
@@ -593,13 +596,47 @@ class ResetProtocolTests(unittest.TestCase):
         record = json.loads(partial.read_text(encoding="utf-8"))
         self.assertEqual(set(record), reset_v2.EVIDENCE_RECORD_KEYS)
         self.assertEqual(reset_v2._sha256(partial.read_bytes()), partial.name.split(".")[-3])
-        report = recover_database_reset(
-            "data/helios.db", expected_plan_token=token,
-            action="restore-source", confirm_reset_recovery=True,
-            repository_root=self.root,
-        )
+        real_read_control = reset_v2._read_canonical_control
+        real_promote_control = reset_v2._promote_open_control
+        retained_reads: list[tuple[Path, int]] = []
+        retained_promotions: list[tuple[Path, int]] = []
+
+        def record_control_read(
+            control: object, **kwargs: object
+        ) -> tuple[object, bytes]:
+            result = real_read_control(control, **kwargs)
+            if ".legacy-evidence." in control.path.name:
+                retained_reads.append((control.path, control.descriptor))
+            return result
+
+        def record_control_promotion(
+            control: object,
+            final: Path,
+            expected_raw: bytes | None,
+            **kwargs: object,
+        ) -> str:
+            if ".legacy-evidence." in final.name:
+                retained_promotions.append((control.path, control.descriptor))
+            return real_promote_control(
+                control, final, expected_raw, **kwargs
+            )
+
+        with patch(
+            "app.reset_protocol_v2._read_canonical_control",
+            side_effect=record_control_read,
+        ), patch(
+            "app.reset_protocol_v2._promote_open_control",
+            side_effect=record_control_promotion,
+        ):
+            report = recover_database_reset(
+                "data/helios.db", expected_plan_token=token,
+                action="restore-source", confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
         self.assertEqual(report["status"], "restored_source")
         self.assertFalse(partial.exists())
+        self.assertEqual(len(retained_reads), 1)
+        self.assertEqual(retained_promotions, retained_reads)
 
     def test_json_control_partial_uses_one_handle_through_promotion(self) -> None:
         partial = self.root / "data" / ".control.json.partial"
@@ -636,6 +673,76 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertEqual(len(renamed), 1)
         self.assertGreaterEqual(len(flushed), 2)
         self.assertTrue(all(handle == renamed[0] for handle in flushed))
+
+    def test_every_complete_json_partial_promotion_retains_its_read_handle(self) -> None:
+        tree = ast.parse(inspect.getsource(reset_v2))
+        required_functions = {
+            "_install_terminal_audit",
+            "_handle_evidence_state",
+            "_promote_or_rebuild_legacy_generation_partial",
+            "_install_legacy_chain_manifest",
+            "_promote_terminal_audit_partial",
+            "_handle_native_partial_only",
+            "_handle_chain_partial",
+        }
+        observed: set[str] = set()
+
+        def call_name(node: ast.AST) -> str | None:
+            if not isinstance(node, ast.Call):
+                return None
+            if isinstance(node.func, ast.Name):
+                return node.func.id
+            return None
+
+        for function in (
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        ):
+            for with_node in (
+                node for node in ast.walk(function) if isinstance(node, ast.With)
+            ):
+                controls = {
+                    item.optional_vars.id
+                    for item in with_node.items
+                    if (
+                        isinstance(item.context_expr, ast.Call)
+                        and call_name(item.context_expr)
+                        == "_open_control_partial"
+                        and isinstance(item.optional_vars, ast.Name)
+                    )
+                }
+                if not controls:
+                    continue
+                reads = [
+                    node
+                    for node in ast.walk(with_node)
+                    if (
+                        isinstance(node, ast.Call)
+                        and call_name(node) == "_read_canonical_control"
+                        and node.args
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in controls
+                    )
+                ]
+                promotions = [
+                    node
+                    for node in ast.walk(with_node)
+                    if (
+                        isinstance(node, ast.Call)
+                        and call_name(node)
+                        == "_promote_validated_json_control"
+                        and node.args
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in controls
+                    )
+                ]
+                for promotion in promotions:
+                    self.assertTrue(any(
+                        read.lineno < promotion.lineno for read in reads
+                    ))
+                    observed.add(function.name)
+
+        self.assertEqual(observed, required_functions)
+        self.assertFalse(hasattr(reset_v2, "_promote_existing_json_partial"))
 
     def test_sqlite_staging_elevates_via_same_parent_and_same_object(self) -> None:
         staging = self.root / "data" / ".sqlite-staging"
@@ -695,14 +802,24 @@ class ResetProtocolTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            control = reset_v2._elevate_sqlite_staging(state)
-            self.assertEqual(control.identity, original_identity)
-            reset_v2._promote_open_control(control, final, expected_raw=None)
-        self.assertEqual(len(creates), 2)
-        initial, elevated = creates
+            evidence = reset_v2._validate_sqlite_staging(
+                state,
+                lambda path: sqlite3.connect(
+                    f"{path.as_uri()}?mode=ro&immutable=1", uri=True
+                ).close(),
+            )
+            self.assertEqual(evidence.identity, original_identity)
+            reset_v2._promote_sqlite_staging(
+                state, final, evidence, self.synthetic_durability(self.root)
+            )
+        self.assertEqual(len(creates), 3)
+        initial, validation, elevated = creates
         self.assertTrue(initial[0])
         self.assertEqual(initial[1], 0x00100000 | 0x00000080)
         self.assertEqual(initial[2], 0x1 | 0x2 | 0x4)
+        self.assertFalse(validation[0])
+        self.assertEqual(validation[2], 0x1)
+        self.assertFalse(int(validation[1]) & 0x00010000)
         self.assertFalse(elevated[0])
         self.assertIsNotNone(elevated[1])
         self.assertTrue(int(elevated[1]) & 0x00010000)
@@ -726,6 +843,121 @@ class ResetProtocolTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_sqlite_validation_handle_denies_writes_and_deletes(self) -> None:
+        staging = self.root / "data" / ".validation-held.db"
+        attempts: list[str] = []
+        with reset_v2._open_sqlite_staging(staging) as state:
+            connection = sqlite3.connect(staging)
+            connection.execute("CREATE TABLE fixture(value TEXT NOT NULL)")
+            connection.execute("INSERT INTO fixture VALUES ('safe')")
+            connection.commit()
+            connection.close()
+
+            def validate(path: Path) -> None:
+                with self.assertRaises(OSError):
+                    with path.open("r+b"):
+                        pass
+                attempts.append("write-blocked")
+                with self.assertRaises(OSError):
+                    path.unlink()
+                attempts.append("delete-blocked")
+                reader = sqlite3.connect(
+                    f"{path.as_uri()}?mode=ro&immutable=1", uri=True
+                )
+                try:
+                    self.assertEqual(
+                        reader.execute("SELECT value FROM fixture").fetchone()[0],
+                        "safe",
+                    )
+                finally:
+                    reader.close()
+
+            evidence = reset_v2._validate_sqlite_staging(state, validate)
+            self.assertEqual(evidence.identity, state.identity)
+        self.assertEqual(attempts, ["write-blocked", "delete-blocked"])
+
+    def test_sqlite_staging_substitution_after_validation_fails_elevation(self) -> None:
+        staging = self.root / "data" / ".validation-substitution.db"
+        with reset_v2._open_sqlite_staging(staging) as state:
+            connection = sqlite3.connect(staging)
+            connection.execute("CREATE TABLE fixture(value TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+            evidence = reset_v2._validate_sqlite_staging(
+                state, lambda _path: None
+            )
+            replacement = staging.with_name(staging.name + ".replacement")
+            replacement.write_bytes(staging.read_bytes())
+            staging.unlink()
+            replacement.rename(staging)
+            self.assertNotEqual(
+                reset_module._path_identity(staging), evidence.identity
+            )
+            with self.assertRaises(DatabaseResetError) as unsafe:
+                reset_v2._elevate_sqlite_staging(state, evidence)
+            self.assertEqual(unsafe.exception.code, "reset_path_unsafe")
+
+    def test_sqlite_staging_modification_after_validation_fails_elevation(self) -> None:
+        staging = self.root / "data" / ".validation-modification.db"
+        with reset_v2._open_sqlite_staging(staging) as state:
+            connection = sqlite3.connect(staging)
+            connection.execute("CREATE TABLE fixture(value TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+            evidence = reset_v2._validate_sqlite_staging(
+                state, lambda _path: None
+            )
+            identity_before = reset_module._path_identity(staging)
+            with staging.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(b"changed!")
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.assertEqual(
+                reset_module._path_identity(staging), identity_before
+            )
+            with self.assertRaises(DatabaseResetError) as unsafe:
+                reset_v2._elevate_sqlite_staging(state, evidence)
+            self.assertEqual(unsafe.exception.code, "reset_path_unsafe")
+
+    def test_sqlite_installed_substitution_before_final_reopen_is_rejected(self) -> None:
+        staging = self.root / "data" / ".installed-substitution.partial"
+        final = self.root / "data" / ".installed-substitution.db"
+        real_verify = reset_v2._verify_relative_file_evidence
+
+        def substitute_then_verify(
+            path: Path,
+            parent_handle: int,
+            parent_identity: str,
+            expected: object,
+        ) -> None:
+            replacement = path.with_name(path.name + ".replacement")
+            replacement.write_bytes(path.read_bytes())
+            path.unlink()
+            replacement.rename(path)
+            real_verify(path, parent_handle, parent_identity, expected)
+
+        with reset_v2._open_sqlite_staging(staging) as state:
+            connection = sqlite3.connect(staging)
+            connection.execute("CREATE TABLE fixture(value TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+            evidence = reset_v2._validate_sqlite_staging(
+                state, lambda _path: None
+            )
+            with patch(
+                "app.reset_protocol_v2._verify_relative_file_evidence",
+                side_effect=substitute_then_verify,
+            ):
+                with self.assertRaises(DatabaseResetError) as unsafe:
+                    reset_v2._promote_sqlite_staging(
+                        state,
+                        final,
+                        evidence,
+                        self.synthetic_durability(self.root),
+                    )
+        self.assertEqual(unsafe.exception.code, "reset_path_unsafe")
 
     def test_legacy_next_accepts_only_exact_incomplete_successor_prefix(self) -> None:
         token = "1" * 64
@@ -759,6 +991,47 @@ class ResetProtocolTests(unittest.TestCase):
                 with self.assertRaises(DatabaseResetError) as invalid:
                     reset_v2._select_legacy(self.root, token)
                 self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+
+        def incomplete(current: dict[str, object], stage: str) -> bytes:
+            candidate = {
+                **current,
+                "journal_sequence": int(current["journal_sequence"]) + 1,
+                "stage": stage,
+                "updated_at": "2026-08-14T12:00:00.002Z",
+            }
+            return reset_v2._canonical_bytes(candidate)[:-7]
+
+        self.assertTrue(reset_v2._is_demonstrably_incomplete_legacy_next(
+            incomplete(journal, "ready_to_quarantine"),
+            journal,
+            expected_token=token,
+            implementation_commit=journal["implementation_commit"],
+        ))
+        self.assertFalse(reset_v2._is_demonstrably_incomplete_legacy_next(
+            incomplete(journal, "original_quarantined"),
+            journal,
+            expected_token=token,
+            implementation_commit=journal["implementation_commit"],
+        ))
+        quarantining = {**journal, "stage": "quarantining"}
+        self.assertFalse(reset_v2._is_demonstrably_incomplete_legacy_next(
+            incomplete(quarantining, "ready_to_quarantine"),
+            quarantining,
+            expected_token=token,
+            implementation_commit=journal["implementation_commit"],
+        ))
+        self.assertTrue(reset_v2._is_demonstrably_incomplete_legacy_next(
+            incomplete(quarantining, "original_quarantined"),
+            quarantining,
+            expected_token=token,
+            implementation_commit=journal["implementation_commit"],
+        ))
+        self.assertFalse(reset_v2._is_demonstrably_incomplete_legacy_next(
+            incomplete(quarantining, "installing_fresh"),
+            quarantining,
+            expected_token=token,
+            implementation_commit=journal["implementation_commit"],
+        ))
 
     def test_incomplete_native_shm_allows_only_sqlite_managed_changes(self) -> None:
         planned = {
@@ -1149,6 +1422,129 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertEqual(self.status(), before_status)
         self.assertFalse((self.root / "data" / ".helios-room-reset-state.json").exists())
 
+    def test_execution_configures_staging_before_evidence_and_holds_final_files(self) -> None:
+        plan = plan_database_reset("data/helios.db", repository_root=self.root)
+        manifest = plan["reviewed_plan_manifest"]
+        backup = self.root / plan["backup_path"]
+        quarantine_paths = {
+            self.root / relative
+            for name, relative in manifest["artifact_paths"].items()
+            if name.startswith("original_quarantine_")
+        }
+        real_validate = reset_v2._validate_sqlite_staging
+        real_open_direct = reset_module._open_direct
+        real_unlink = reset_v2._unlink_verified
+        validated_fresh: list[Path] = []
+        writable_paths: list[Path] = []
+        guarded_deletions: list[Path] = []
+
+        def record_validation(
+            state: object, validator: object
+        ) -> object:
+            path = Path(state.path)
+            if ".reset-fresh" in path.name:
+                self.assertTrue(reset_module._has_wal_header(path))
+                validated_fresh.append(path)
+            return real_validate(state, validator)
+
+        def record_open(path: Path, *, read_only: bool) -> sqlite3.Connection:
+            if not read_only:
+                writable_paths.append(Path(path))
+            return real_open_direct(path, read_only=read_only)
+
+        def guarded_unlink(path: Path, identity: str) -> None:
+            if path in quarantine_paths:
+                with self.assertRaises(OSError):
+                    with backup.open("r+b"):
+                        pass
+                with self.assertRaises(OSError):
+                    backup.unlink()
+                with self.assertRaises(OSError):
+                    with self.database.open("r+b"):
+                        pass
+                with self.assertRaises(OSError):
+                    self.database.unlink()
+                guarded_deletions.append(path)
+            real_unlink(path, identity)
+
+        with patch(
+            "app.reset_protocol_v2._validate_sqlite_staging",
+            side_effect=record_validation,
+        ), patch(
+            "app.reset_database._open_direct",
+            side_effect=record_open,
+        ), patch(
+            "app.reset_protocol_v2._unlink_verified",
+            side_effect=guarded_unlink,
+        ):
+            report = execute_database_reset(
+                "data/helios.db",
+                expected_plan_token=plan["plan_token"],
+                expected_backup_path=plan["backup_path"],
+                expected_audit_path=plan["audit_path"],
+                confirm_destroy_canonical_history=True,
+                repository_root=self.root,
+            )
+
+        self.assertEqual(report["status"], "reset")
+        self.assertEqual(len(validated_fresh), 1)
+        self.assertNotIn(self.database, writable_paths)
+        self.assertGreaterEqual(len(guarded_deletions), 1)
+        self.assertTrue(all(path in quarantine_paths for path in guarded_deletions))
+
+    def test_failed_backup_or_fresh_hold_prevents_all_quarantine_deletion(self) -> None:
+        real_hold = reset_v2._hold_file_evidence
+        real_unlink = reset_v2._unlink_verified
+        for failed_name in ("backup", "fresh"):
+            with self.subTest(failed_name=failed_name):
+                root, database = self.make_isolated_fixture(
+                    f"hold-failure-{failed_name}"
+                )
+                plan = plan_database_reset(
+                    "data/helios.db", repository_root=root
+                )
+                backup = root / plan["backup_path"]
+                quarantines = {
+                    root / relative
+                    for name, relative in plan["reviewed_plan_manifest"][
+                        "artifact_paths"
+                    ].items()
+                    if name.startswith("original_quarantine_")
+                }
+                quarantine_deletions: list[Path] = []
+
+                @contextmanager
+                def reject_selected(path: Path, expected: object):
+                    selected = backup if failed_name == "backup" else database
+                    if path == selected:
+                        raise reset_v2._error("reset_path_unsafe")
+                    with real_hold(path, expected) as control:
+                        yield control
+
+                def record_unlink(path: Path, identity: str) -> None:
+                    if path in quarantines:
+                        quarantine_deletions.append(path)
+                    real_unlink(path, identity)
+
+                with patch(
+                    "app.reset_protocol_v2._hold_file_evidence",
+                    side_effect=reject_selected,
+                ), patch(
+                    "app.reset_protocol_v2._unlink_verified",
+                    side_effect=record_unlink,
+                ):
+                    with self.assertRaises(DatabaseResetError) as failed:
+                        execute_database_reset(
+                            "data/helios.db",
+                            expected_plan_token=plan["plan_token"],
+                            expected_backup_path=plan["backup_path"],
+                            expected_audit_path=plan["audit_path"],
+                            confirm_destroy_canonical_history=True,
+                            repository_root=root,
+                        )
+                self.assertEqual(failed.exception.code, "reset_path_unsafe")
+                self.assertEqual(quarantine_deletions, [])
+
     def test_crash_journal_blocks_startup_and_restore_source_is_repeatable(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
         with self.assertRaises(KeyboardInterrupt):
@@ -1392,6 +1788,88 @@ class ResetProtocolTests(unittest.TestCase):
             if path.name.startswith(".helios-room-reset-state.")
         }, controls_before)
 
+    def test_prefix_validation_rejects_backup_replaced_after_initial_gate(self) -> None:
+        plan = plan_database_reset("data/helios.db", repository_root=self.root)
+        with self.assertRaises(KeyboardInterrupt):
+            execute_database_reset(
+                "data/helios.db",
+                expected_plan_token=plan["plan_token"],
+                expected_backup_path=plan["backup_path"],
+                expected_audit_path=plan["audit_path"],
+                confirm_destroy_canonical_history=True,
+                repository_root=self.root,
+                crash_checkpoint=lambda stage: (
+                    (_ for _ in ()).throw(KeyboardInterrupt())
+                    if stage == "fresh_installed" else None
+                ),
+            )
+        original = self.root / plan["reviewed_plan_manifest"]["artifact_paths"][
+            "original_quarantine_database_path"
+        ]
+        original.unlink()
+        with self.assertRaises(KeyboardInterrupt):
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=plan["plan_token"],
+                action="restore-source",
+                confirm_reset_recovery=True,
+                repository_root=self.root,
+                crash_checkpoint=lambda stage: (
+                    (_ for _ in ()).throw(KeyboardInterrupt())
+                    if stage == "recovery:backup_copy_partial" else None
+                ),
+            )
+        candidate = self.root / plan["reviewed_plan_manifest"]["artifact_paths"][
+            "backup_copy_partial_path"
+        ]
+        backup = self.root / plan["backup_path"]
+        expected_identity = reset_module._path_identity(backup)
+        expected_sha256 = reset_module._stable_sha256(backup)
+        candidate_before = candidate.read_bytes()
+        real_prefix = reset_v2._validate_file_prefix
+        boundary_calls: list[dict[str, str]] = []
+
+        def replace_after_gate(
+            path: Path,
+            source: Path,
+            *,
+            expected_source_identity: str,
+            expected_source_sha256: str,
+        ) -> str:
+            boundary_calls.append({
+                "identity": expected_source_identity,
+                "sha256": expected_source_sha256,
+            })
+            replacement = source.with_name(source.name + ".replacement")
+            replacement.write_bytes(source.read_bytes())
+            source.unlink()
+            replacement.rename(source)
+            return real_prefix(
+                path,
+                source,
+                expected_source_identity=expected_source_identity,
+                expected_source_sha256=expected_source_sha256,
+            )
+
+        with patch(
+            "app.reset_protocol_v2._validate_file_prefix",
+            side_effect=replace_after_gate,
+        ):
+            with self.assertRaises(DatabaseResetError) as invalid:
+                recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=plan["plan_token"],
+                    action="restore-source",
+                    confirm_reset_recovery=True,
+                    repository_root=self.root,
+                )
+        self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+        self.assertEqual(boundary_calls, [{
+            "identity": expected_identity,
+            "sha256": expected_sha256,
+        }])
+        self.assertEqual(candidate.read_bytes(), candidate_before)
+
     def test_destructive_helpers_reject_links_and_parent_substitution(self) -> None:
         hard_link = self.root / "data" / (".helios.db.reset-" + "0" * 64 + ".failed-new")
         os.link(self.database, hard_link)
@@ -1570,12 +2048,39 @@ class ResetProtocolTests(unittest.TestCase):
                 crash_checkpoint=lambda stage: (_ for _ in ()).throw(KeyboardInterrupt())
                 if stage == "fresh_validated" else None,
             )
-        report = recover_database_reset(
-            "data/helios.db", expected_plan_token=plan["plan_token"],
-            action="complete-fresh", confirm_reset_recovery=True,
-            repository_root=self.root,
-        )
+        backup = self.root / plan["backup_path"]
+        quarantines = {
+            self.root / relative
+            for name, relative in plan["reviewed_plan_manifest"][
+                "artifact_paths"
+            ].items()
+            if name.startswith("original_quarantine_")
+        }
+        real_unlink = reset_v2._unlink_verified
+        guarded: list[Path] = []
+
+        def assert_recovery_holds(path: Path, identity: str) -> None:
+            if path in quarantines:
+                for held in (backup, self.database):
+                    with self.assertRaises(OSError):
+                        with held.open("r+b"):
+                            pass
+                    with self.assertRaises(OSError):
+                        held.unlink()
+                guarded.append(path)
+            real_unlink(path, identity)
+
+        with patch(
+            "app.reset_protocol_v2._unlink_verified",
+            side_effect=assert_recovery_holds,
+        ):
+            report = recover_database_reset(
+                "data/helios.db", expected_plan_token=plan["plan_token"],
+                action="complete-fresh", confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
         self.assertEqual(report["status"], "reset")
+        self.assertGreaterEqual(len(guarded), 1)
         connection = sqlite3.connect(self.database)
         connection.row_factory = sqlite3.Row
         try:
