@@ -353,7 +353,7 @@ def _git_evidence(root: Path, prospective: Iterable[str]) -> tuple[str, dict[str
     }
 
 
-def _close_handle(handle: int) -> None:
+def _close_handle(handle: Any) -> None:
     try:
         legacy._windows_close_handle(handle)
     except legacy.DatabaseResetError as error:
@@ -447,9 +447,21 @@ def _open_and_flush_volume(guid: str, expected_serial: str) -> None:
     from ctypes import wintypes
 
     path = guid[:-1]
+    get_last_error = ctypes.windll.kernel32.GetLastError
+    get_last_error.argtypes = []
+    get_last_error.restype = wintypes.DWORD
     create = ctypes.windll.kernel32.CreateFileW
+    create.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
     create.restype = wintypes.HANDLE
-    handle = create(
+    raw_handle = create(
         path,
         0x80000000 | 0x40000000,
         0x1 | 0x2,
@@ -459,16 +471,31 @@ def _open_and_flush_volume(guid: str, expected_serial: str) -> None:
         None,
     )
     invalid = ctypes.c_void_p(-1).value
-    if handle in (None, invalid):
-        raise _error("reset_durability_unsupported")
+    handle_value = (
+        raw_handle.value
+        if isinstance(raw_handle, wintypes.HANDLE)
+        else raw_handle
+    )
+    if handle_value in (None, invalid):
+        error_code = int(get_last_error())
+        raise _error("reset_durability_unsupported") from OSError(
+            error_code, "CreateFileW"
+        )
+    handle = wintypes.HANDLE(handle_value)
+    flush = ctypes.windll.kernel32.FlushFileBuffers
+    flush.argtypes = [wintypes.HANDLE]
+    flush.restype = wintypes.BOOL
     try:
-        identity = legacy._windows_handle_identity(int(handle))
+        identity = legacy._windows_handle_identity(handle)
         if identity.split(":")[1] != expected_serial:
             raise _error("reset_durability_unsupported")
-        if not ctypes.windll.kernel32.FlushFileBuffers(handle):
-            raise _error("reset_durability_unsupported")
+        if not flush(handle):
+            error_code = int(get_last_error())
+            raise _error("reset_durability_unsupported") from OSError(
+                error_code, "FlushFileBuffers"
+            )
     finally:
-        _close_handle(int(handle))
+        _close_handle(handle)
 
 
 def _probe_durability(root: Path) -> dict[str, Any]:

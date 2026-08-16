@@ -154,7 +154,18 @@ def _identity(info: os.stat_result) -> str:
     return f"posix:{info.st_dev}:{info.st_ino}"
 
 
-def _windows_handle_identity(handle: int) -> str:
+def _windows_typed_handle(handle: Any):
+    """Return one full-width Win32 HANDLE without implicit integer coercion."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    if isinstance(handle, wintypes.HANDLE):
+        return handle
+    return wintypes.HANDLE(handle)
+
+
+def _windows_handle_identity(handle: Any) -> str:
     import ctypes
     from ctypes import wintypes
 
@@ -171,7 +182,8 @@ def _windows_handle_identity(handle: int) -> str:
     ]
     function.restype = wintypes.BOOL
     if not function(
-        wintypes.HANDLE(handle), 18, ctypes.byref(info), ctypes.sizeof(info)
+        _windows_typed_handle(handle), 18,
+        ctypes.byref(info), ctypes.sizeof(info),
     ):
         raise _error("reset_path_unsafe")
     return f"windows:{info.VolumeSerialNumber:016x}:{bytes(info.FileId).hex()}"
@@ -779,25 +791,31 @@ def _windows_open_handle(
     return int(handle)
 
 
-def _windows_close_handle(handle: int) -> None:
+def _windows_close_handle(handle: Any) -> None:
     import ctypes
     from ctypes import wintypes
 
     close_handle = ctypes.windll.kernel32.CloseHandle
     close_handle.argtypes = [wintypes.HANDLE]
     close_handle.restype = wintypes.BOOL
-    if not close_handle(wintypes.HANDLE(handle)):
-        raise _error("reset_path_unsafe")
+    if not close_handle(_windows_typed_handle(handle)):
+        get_last_error = ctypes.windll.kernel32.GetLastError
+        get_last_error.argtypes = []
+        get_last_error.restype = wintypes.DWORD
+        error_code = int(get_last_error())
+        raise _error("reset_path_unsafe") from OSError(
+            error_code, "CloseHandle"
+        )
 
 
-def _windows_flush_file_handle(handle: int) -> None:
+def _windows_flush_file_handle(handle: Any) -> None:
     import ctypes
     from ctypes import wintypes
 
     flush = ctypes.windll.kernel32.FlushFileBuffers
     flush.argtypes = [wintypes.HANDLE]
     flush.restype = wintypes.BOOL
-    if not flush(wintypes.HANDLE(handle)):
+    if not flush(_windows_typed_handle(handle)):
         raise _error("reset_failed")
 
 

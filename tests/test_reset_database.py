@@ -34,6 +34,18 @@ from app.preflight import DatabasePreflightError, preflight_database
 from app.schema_validation import validate_v14_foundation
 
 
+class _FakeWin32Function:
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.argtypes: object = None
+        self.restype: object = None
+        self.calls: list[tuple[object, ...]] = []
+
+    def __call__(self, *arguments: object) -> object:
+        self.calls.append(arguments)
+        return self.result
+
+
 class ResetProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parents[1])
@@ -49,6 +61,8 @@ class ResetProtocolTests(unittest.TestCase):
         self.git("commit", "-m", "fixture")
         self.database = self.root / "data" / "helios.db"
         self.make_v12()
+        self.real_probe_durability = reset_v2._probe_durability
+        self.real_volume_flush = reset_v2._open_and_flush_volume
         self.durability_patch = patch(
             "app.reset_protocol_v2._probe_durability",
             side_effect=lambda root: self.synthetic_durability(Path(root)),
@@ -800,6 +814,182 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertEqual(fake.argtypes, [wintypes.HANDLE])
         self.assertIs(fake.restype, wintypes.BOOL)
         self.assertEqual(fake.values, [high_handle])
+
+    def test_volume_flush_preserves_full_width_handle_and_exact_ffi(self) -> None:
+        high_handle = 0x1234567887654321
+        serial = "0123456789abcdef"
+        create = _FakeWin32Function(wintypes.HANDLE(high_handle))
+        flush = _FakeWin32Function(1)
+        close = _FakeWin32Function(1)
+        last_error = _FakeWin32Function(0)
+        observed_identity_handles: list[int] = []
+
+        def identity(handle: object) -> str:
+            self.assertIsInstance(handle, wintypes.HANDLE)
+            observed_identity_handles.append(int(handle.value))
+            return f"windows:{serial}:" + "0" * 32
+
+        with patch.object(
+            ctypes.windll.kernel32, "CreateFileW", create
+        ), patch.object(
+            ctypes.windll.kernel32, "FlushFileBuffers", flush
+        ), patch.object(
+            ctypes.windll.kernel32, "CloseHandle", close
+        ), patch.object(
+            ctypes.windll.kernel32, "GetLastError", last_error
+        ), patch(
+            "app.reset_database._windows_handle_identity",
+            side_effect=identity,
+        ):
+            self.real_volume_flush(
+                "\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\",
+                serial,
+            )
+
+        self.assertEqual(create.argtypes, [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ])
+        self.assertIs(create.restype, wintypes.HANDLE)
+        self.assertEqual(flush.argtypes, [wintypes.HANDLE])
+        self.assertIs(flush.restype, wintypes.BOOL)
+        self.assertEqual(close.argtypes, [wintypes.HANDLE])
+        self.assertIs(close.restype, wintypes.BOOL)
+        self.assertEqual(last_error.argtypes, [])
+        self.assertIs(last_error.restype, wintypes.DWORD)
+        self.assertEqual(observed_identity_handles, [high_handle])
+        self.assertEqual([int(call[0].value) for call in flush.calls], [high_handle])
+        self.assertEqual([int(call[0].value) for call in close.calls], [high_handle])
+        self.assertEqual(last_error.calls, [])
+
+    def test_volume_create_invalid_and_null_handles_fail_closed(self) -> None:
+        invalid = ctypes.c_void_p(-1).value
+        for label, returned in (
+            ("invalid", wintypes.HANDLE(invalid)),
+            ("null", wintypes.HANDLE()),
+        ):
+            with self.subTest(label=label):
+                create = _FakeWin32Function(returned)
+                flush = _FakeWin32Function(1)
+                close = _FakeWin32Function(1)
+                last_error = _FakeWin32Function(5)
+                with patch.object(
+                    ctypes.windll.kernel32, "CreateFileW", create
+                ), patch.object(
+                    ctypes.windll.kernel32, "FlushFileBuffers", flush
+                ), patch.object(
+                    ctypes.windll.kernel32, "CloseHandle", close
+                ), patch.object(
+                    ctypes.windll.kernel32, "GetLastError", last_error
+                ), patch(
+                    "app.reset_database._windows_handle_identity"
+                ) as identity:
+                    with self.assertRaises(DatabaseResetError) as failed:
+                        self.real_volume_flush(
+                            "\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\",
+                            "0123456789abcdef",
+                        )
+                self.assertEqual(
+                    failed.exception.code, "reset_durability_unsupported"
+                )
+                identity.assert_not_called()
+                self.assertEqual(flush.calls, [])
+                self.assertEqual(close.calls, [])
+                self.assertEqual(len(last_error.calls), 1)
+
+    def test_volume_flush_and_close_failures_map_to_sanitized_error(self) -> None:
+        high_handle = 0x1234567887654321
+        serial = "0123456789abcdef"
+        for label, flush_result, close_result in (
+            ("flush", 0, 1),
+            ("close", 1, 0),
+        ):
+            with self.subTest(label=label):
+                create = _FakeWin32Function(wintypes.HANDLE(high_handle))
+                flush = _FakeWin32Function(flush_result)
+                close = _FakeWin32Function(close_result)
+                last_error = _FakeWin32Function(5)
+                with patch.object(
+                    ctypes.windll.kernel32, "CreateFileW", create
+                ), patch.object(
+                    ctypes.windll.kernel32, "FlushFileBuffers", flush
+                ), patch.object(
+                    ctypes.windll.kernel32, "CloseHandle", close
+                ), patch.object(
+                    ctypes.windll.kernel32, "GetLastError", last_error
+                ), patch(
+                    "app.reset_database._windows_handle_identity",
+                    return_value=f"windows:{serial}:" + "0" * 32,
+                ):
+                    with self.assertRaises(DatabaseResetError) as failed:
+                        self.real_volume_flush(
+                            "\\\\?\\Volume{00000000-0000-0000-0000-000000000001}\\",
+                            serial,
+                        )
+                self.assertEqual(
+                    failed.exception.code, "reset_durability_unsupported"
+                )
+                self.assertEqual(
+                    [int(call[0].value) for call in flush.calls], [high_handle]
+                )
+                self.assertEqual(
+                    [int(call[0].value) for call in close.calls], [high_handle]
+                )
+                self.assertEqual(
+                    len(last_error.calls), 1
+                )
+
+    def test_preliminary_volume_failure_has_zero_sqlite_or_artifacts(self) -> None:
+        database_before = self.database.read_bytes()
+        controls_before = reset_v2._enumerate_reserved(self.root / "data")
+        self.assertFalse((self.root / "backups").exists())
+        unsupported = DatabaseResetError(
+            "reset_durability_unsupported", "synthetic volume failure"
+        )
+        with patch(
+            "app.reset_protocol_v2._probe_durability",
+            side_effect=self.real_probe_durability,
+        ), patch(
+            "app.reset_protocol_v2._open_and_flush_volume",
+            side_effect=unsupported,
+        ) as volume_flush, patch(
+            "app.reset_protocol_v2.sqlite3.connect",
+            side_effect=AssertionError("SQLite must remain unopened"),
+        ) as protocol_sqlite, patch(
+            "app.reset_database.sqlite3.connect",
+            side_effect=AssertionError("SQLite must remain unopened"),
+        ) as legacy_sqlite:
+            with self.assertRaises(DatabaseResetError) as failed:
+                plan_database_reset("data/helios.db", repository_root=self.root)
+        self.assertEqual(failed.exception.code, "reset_durability_unsupported")
+        volume_flush.assert_called_once()
+        protocol_sqlite.assert_not_called()
+        legacy_sqlite.assert_not_called()
+        self.assertEqual(self.database.read_bytes(), database_before)
+        self.assertEqual(
+            reset_v2._enumerate_reserved(self.root / "data"), controls_before
+        )
+        self.assertFalse((self.root / "backups").exists())
+
+    def test_preliminary_directory_flush_does_not_open_volume(self) -> None:
+        (self.root / "backups").mkdir()
+        with patch(
+            "app.reset_protocol_v2._open_and_flush_volume",
+            side_effect=AssertionError("directory mode must not open volume"),
+        ) as volume_flush:
+            durability = self.real_probe_durability(self.root)
+        self.assertEqual(durability["mode"], "directory_flush")
+        self.assertIsNone(durability["fallback_reason"])
+        self.assertTrue(all(
+            item["flush_succeeded"] is True
+            for item in durability["directory_probes"]
+        ))
+        volume_flush.assert_not_called()
 
     def test_legacy_state_rejects_external_native_manifest_before_open(self) -> None:
         token = "d" * 64
