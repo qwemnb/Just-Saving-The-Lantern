@@ -781,9 +781,24 @@ def _windows_open_handle(
 
 def _windows_close_handle(handle: int) -> None:
     import ctypes
+    from ctypes import wintypes
 
-    if not ctypes.windll.kernel32.CloseHandle(handle):
+    close_handle = ctypes.windll.kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(wintypes.HANDLE(handle)):
         raise _error("reset_path_unsafe")
+
+
+def _windows_flush_file_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    flush = ctypes.windll.kernel32.FlushFileBuffers
+    flush.argtypes = [wintypes.HANDLE]
+    flush.restype = wintypes.BOOL
+    if not flush(wintypes.HANDLE(handle)):
+        raise _error("reset_failed")
 
 
 def _windows_close_after_mutation(handle: int) -> None:
@@ -1155,6 +1170,119 @@ def _windows_enumerate_directory_handle(handle: int) -> list[str]:
     return names
 
 
+def _windows_relative_entry_identity(
+    parent_handle: int, entry_name: str
+) -> str | None:
+    """Resolve one child through the held directory handle without opening it."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    if (
+        not entry_name
+        or entry_name in {".", ".."}
+        or "\\" in entry_name
+        or "/" in entry_name
+    ):
+        raise _error("reset_path_unsafe")
+
+    class FILE_ID_EXTD_DIR_INFO(ctypes.Structure):
+        _fields_ = [
+            ("NextEntryOffset", wintypes.DWORD),
+            ("FileIndex", wintypes.DWORD),
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("EndOfFile", ctypes.c_longlong),
+            ("AllocationSize", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+            ("FileNameLength", wintypes.DWORD),
+            ("EaSize", wintypes.DWORD),
+            ("ReparsePointTag", wintypes.DWORD),
+            ("FileId", ctypes.c_ubyte * 16),
+        ]
+
+    class IO_STATUS_BLOCK(ctypes.Structure):
+        _fields_ = [
+            ("Status", ctypes.c_void_p),
+            ("Information", ctypes.c_size_t),
+        ]
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        ]
+
+    name_buffer = ctypes.create_unicode_buffer(entry_name)
+    encoded_length = len(entry_name.encode("utf-16-le"))
+    name = UNICODE_STRING(
+        encoded_length,
+        encoded_length,
+        ctypes.cast(name_buffer, wintypes.LPWSTR),
+    )
+    query = ctypes.windll.ntdll.NtQueryDirectoryFile
+    query.argtypes = [
+        wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG,
+        wintypes.ULONG, wintypes.BOOLEAN, ctypes.POINTER(UNICODE_STRING),
+        wintypes.BOOLEAN,
+    ]
+    query.restype = ctypes.c_long
+    parent_before = _windows_handle_snapshot(parent_handle)
+    volume_serial = parent_before["file_id"].split(":")[1]
+    buffer = ctypes.create_string_buffer(65_536)
+    status_block = IO_STATUS_BLOCK()
+    status = int(query(
+        wintypes.HANDLE(parent_handle), None, None, None,
+        ctypes.byref(status_block), buffer, len(buffer),
+        60, True, ctypes.byref(name), True,
+    ))
+    unsigned_status = status & 0xFFFFFFFF
+    if unsigned_status in {0x80000006, 0xC000000F}:
+        result = None
+    elif status < 0:
+        raise _error("reset_path_unsafe")
+    else:
+        length = int(status_block.Information)
+        if length < ctypes.sizeof(FILE_ID_EXTD_DIR_INFO) or length > len(buffer):
+            raise _error("reset_path_unsafe")
+        item = FILE_ID_EXTD_DIR_INFO.from_buffer(buffer)
+        name_offset = ctypes.sizeof(FILE_ID_EXTD_DIR_INFO)
+        name_length = int(item.FileNameLength)
+        if (
+            int(item.NextEntryOffset) != 0
+            or name_length == 0
+            or name_length % 2
+            or name_offset + name_length > length
+        ):
+            raise _error("reset_path_unsafe")
+        try:
+            returned_name = buffer.raw[
+                name_offset:name_offset + name_length
+            ].decode("utf-16-le", errors="strict")
+        except UnicodeDecodeError as error:
+            raise _error("reset_path_unsafe") from error
+        if returned_name.casefold() != entry_name.casefold():
+            raise _error("reset_path_unsafe")
+        if (
+            int(item.FileAttributes) & (0x10 | 0x400)
+            or int(item.ReparsePointTag) != 0
+        ):
+            raise _error("reset_path_unsafe")
+        result = f"windows:{volume_serial}:{bytes(item.FileId).hex()}"
+    parent_after = _windows_handle_snapshot(parent_handle)
+    stable = {
+        "delete_pending", "directory", "file_attributes", "file_id",
+        "link_count", "reparse_tag",
+    }
+    if any(parent_after[field] != parent_before[field] for field in stable):
+        raise _error("reset_path_unsafe")
+    return result
+
+
 def _windows_enumerate_directory(path: Path) -> list[str]:
     """Enumerate through a component-walked, verified directory handle."""
 
@@ -1200,9 +1328,7 @@ def _open_new_regular(
             try:
                 descriptor = msvcrt.open_osfhandle(handle, flags)
             except Exception:
-                import ctypes
-
-                ctypes.windll.kernel32.CloseHandle(handle)
+                _windows_close_handle(handle)
                 raise
         else:
             flags = (
@@ -1257,9 +1383,7 @@ def _open_existing_regular(
             try:
                 descriptor = msvcrt.open_osfhandle(handle, flags)
             except Exception:
-                import ctypes
-
-                ctypes.windll.kernel32.CloseHandle(handle)
+                _windows_close_handle(handle)
                 raise
         else:
             flags = (
@@ -1421,7 +1545,10 @@ def _flush_directory(path: Path) -> None:
 
 def _relative_entry_identity(path: Path, parent_handle: int) -> str:
     if os.name == "nt":
-        return _path_identity(path)
+        identity = _windows_relative_entry_identity(parent_handle, path.name)
+        if identity is None:
+            raise _error("reset_path_unsafe")
+        return identity
     try:
         info = os.stat(path.name, dir_fd=parent_handle, follow_symlinks=False)
     except OSError as exception:
@@ -1433,7 +1560,7 @@ def _relative_entry_identity(path: Path, parent_handle: int) -> str:
 
 def _relative_entry_exists(path: Path, parent_handle: int) -> bool:
     if os.name == "nt":
-        return os.path.lexists(path)
+        return _windows_relative_entry_identity(parent_handle, path.name) is not None
     try:
         os.stat(path.name, dir_fd=parent_handle, follow_symlinks=False)
     except FileNotFoundError:
@@ -1464,8 +1591,6 @@ def _rename_verified(
     with _verified_parent(source) as (parent_handle, parent_identity):
         _revalidate_parent(source, parent_identity)
         if os.name == "nt":
-            import ctypes
-
             source_handle = _windows_create_relative(
                 parent_handle, source.name, directory=False, create_new=False,
                 desired_access=(
@@ -1473,7 +1598,7 @@ def _rename_verified(
                 ),
             )
             if _windows_handle_identity(source_handle) != expected_identity:
-                ctypes.windll.kernel32.CloseHandle(source_handle)
+                _windows_close_handle(source_handle)
                 raise _error("reset_path_unsafe")
         else:
             source_handle = os.open(
@@ -1493,13 +1618,13 @@ def _rename_verified(
                 != expected_target_identity
             ):
                 if os.name == "nt":
-                    ctypes.windll.kernel32.CloseHandle(source_handle)
+                    _windows_close_handle(source_handle)
                 else:
                     os.close(source_handle)
                 raise _error("reset_path_unsafe")
         elif target_exists:
             if os.name == "nt":
-                ctypes.windll.kernel32.CloseHandle(source_handle)
+                _windows_close_handle(source_handle)
             else:
                 os.close(source_handle)
             raise _error("reset_failed")
@@ -1512,8 +1637,7 @@ def _rename_verified(
                     source_handle, target, parent_handle, replace=replace
                 )
                 mutation_completed = True
-                if not ctypes.windll.kernel32.FlushFileBuffers(source_handle):
-                    raise _error("reset_failed")
+                _windows_flush_file_handle(source_handle)
             elif replace:
                 os.rename(
                     source.name, target.name,
@@ -1580,14 +1704,12 @@ def _unlink_verified(
     with _verified_parent(path) as (parent_handle, parent_identity):
         _revalidate_parent(path, parent_identity)
         if os.name == "nt":
-            import ctypes
-
             handle = _windows_create_relative(
                 parent_handle, path.name, directory=False, create_new=False,
                 desired_access=0x00010000 | 0x00000080 | 0x00100000,
             )
             if _windows_handle_identity(handle) != expected_identity:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                _windows_close_handle(handle)
                 raise _error("reset_path_unsafe")
         else:
             handle = os.open(
@@ -1660,19 +1782,30 @@ def _copy_verified(
     crash_checkpoint: Callable[[str], None] | None = None,
     *,
     flush_parent: bool = True,
+    expected_source_identity: str | None = None,
 ) -> None:
     source_identity = _path_identity(source)
-    if _stable_sha256(source) != expected_sha256:
+    if (
+        expected_source_identity is not None
+        and source_identity != expected_source_identity
+    ):
         raise _error("reset_recovery_invalid")
-    source_descriptor = _open_existing_regular(source, source_identity)
+    source_descriptor = _open_existing_regular(
+        source,
+        source_identity,
+        share_write=False,
+        share_delete=False,
+    )
     try:
         target_descriptor = _open_new_regular(target, read_write=False)
+        digest = hashlib.sha256()
         try:
             first_block = True
             while True:
                 block = os.read(source_descriptor, 1024 * 1024)
                 if not block:
                     break
+                digest.update(block)
                 if first_block and crash_checkpoint is not None:
                     boundary = max(1, len(block) // 2)
                     _write_all(target_descriptor, block[:boundary])
@@ -1684,6 +1817,14 @@ def _copy_verified(
             os.fsync(target_descriptor)
         finally:
             os.close(target_descriptor)
+        source_after = os.fstat(source_descriptor)
+        if (
+            source_after.st_nlink != 1
+            or _descriptor_identity(source_descriptor, source_after)
+            != source_identity
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise _error("reset_recovery_invalid")
     finally:
         os.close(source_descriptor)
     if _stable_sha256(target) != expected_sha256:

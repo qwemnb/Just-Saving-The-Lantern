@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import sqlite3
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from ctypes import wintypes
 from pathlib import Path
 from unittest.mock import patch
 
@@ -53,6 +55,16 @@ class ResetProtocolTests(unittest.TestCase):
         )
         self.flush_patch = patch("app.reset_protocol_v2._flush_namespace")
         self.volume_patch = patch("app.reset_protocol_v2._open_and_flush_volume")
+        self.directory_probe_patch = patch(
+            "app.reset_protocol_v2._directory_probe",
+            side_effect=lambda name, _path, identity: {
+                "error_code": None,
+                "flush_succeeded": True,
+                "identity": identity,
+                "name": name,
+                "state": "present",
+            },
+        )
         self.stable_authority_patch = patch(
             "app.reset_protocol_v2._inspect_stable_durability_authority",
             side_effect=lambda root: self.synthetic_stable_authority(Path(root)),
@@ -60,10 +72,12 @@ class ResetProtocolTests(unittest.TestCase):
         self.durability_patch.start()
         self.flush_patch.start()
         self.volume_patch.start()
+        self.directory_probe_patch.start()
         self.stable_authority_patch.start()
         self.addCleanup(self.durability_patch.stop)
         self.addCleanup(self.flush_patch.stop)
         self.addCleanup(self.volume_patch.stop)
+        self.addCleanup(self.directory_probe_patch.stop)
         self.addCleanup(self.stable_authority_patch.stop)
 
     def synthetic_durability(self, root: Path) -> dict[str, object]:
@@ -539,17 +553,17 @@ class ResetProtocolTests(unittest.TestCase):
         backup = "backups/helios-pre-room-shared-reset-20260814T120000005Z.db"
         audit = "backups/helios-pre-room-shared-reset-20260814T120000005Z.audit.json"
         self.make_legacy_ready_journal(token, backup, audit)
-        original_install = reset_v2._install_json_no_overwrite
+        original_promote = reset_v2._promote_open_control
 
         def stop_evidence_install(
-            partial: Path, final: Path, identity: str, authority: dict[str, object]
-        ) -> None:
+            control: object, final: Path, expected_raw: bytes | None, **kwargs: object
+        ) -> str:
             if ".legacy-evidence." in final.name:
                 raise KeyboardInterrupt()
-            original_install(partial, final, identity, authority)
+            return original_promote(control, final, expected_raw, **kwargs)
 
         with patch(
-            "app.reset_protocol_v2._install_json_no_overwrite",
+            "app.reset_protocol_v2._promote_open_control",
             side_effect=stop_evidence_install,
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -572,6 +586,220 @@ class ResetProtocolTests(unittest.TestCase):
         )
         self.assertEqual(report["status"], "restored_source")
         self.assertFalse(partial.exists())
+
+    def test_json_control_partial_uses_one_handle_through_promotion(self) -> None:
+        partial = self.root / "data" / ".control.json.partial"
+        final = self.root / "data" / ".control.json"
+        authority = self.synthetic_durability(self.root)
+        real_flush = reset_module._windows_flush_file_handle
+        real_rename = reset_module._windows_rename
+        flushed: list[int] = []
+        renamed: list[int] = []
+
+        def record_flush(handle: int) -> None:
+            flushed.append(handle)
+            real_flush(handle)
+
+        def record_rename(
+            handle: int, target: Path, parent: int, *, replace: bool
+        ) -> None:
+            renamed.append(handle)
+            real_rename(handle, target, parent, replace=replace)
+
+        with patch(
+            "app.reset_database._windows_flush_file_handle",
+            side_effect=record_flush,
+        ), patch(
+            "app.reset_database._windows_rename",
+            side_effect=record_rename,
+        ):
+            raw, identity = reset_v2._write_and_install_json(
+                partial, final, {"kind": "synthetic"}, authority
+            )
+        self.assertEqual(final.read_bytes(), raw)
+        self.assertEqual(reset_module._path_identity(final), identity)
+        self.assertFalse(partial.exists())
+        self.assertEqual(len(renamed), 1)
+        self.assertGreaterEqual(len(flushed), 2)
+        self.assertTrue(all(handle == renamed[0] for handle in flushed))
+
+    def test_sqlite_staging_elevates_via_same_parent_and_same_object(self) -> None:
+        staging = self.root / "data" / ".sqlite-staging"
+        final = self.root / "data" / ".sqlite-installed"
+        real_create = reset_module._windows_create_relative
+        real_flush = reset_module._windows_flush_file_handle
+        real_rename = reset_module._windows_rename
+        creates: list[tuple[bool, int | None, int, int]] = []
+        mutation_events: list[tuple[str, int]] = []
+
+        def record_create(
+            parent: int,
+            name: str,
+            *,
+            directory: bool,
+            create_new: bool = True,
+            desired_access: int | None = None,
+            share_access: int = 0x1 | 0x2 | 0x4,
+        ) -> int:
+            handle = real_create(
+                parent,
+                name,
+                directory=directory,
+                create_new=create_new,
+                desired_access=desired_access,
+                share_access=share_access,
+            )
+            if name == staging.name:
+                creates.append((create_new, desired_access, share_access, handle))
+            return handle
+
+        def record_flush(handle: int) -> None:
+            mutation_events.append(("flush", handle))
+            real_flush(handle)
+
+        def record_rename(
+            handle: int, target: Path, parent: int, *, replace: bool
+        ) -> None:
+            mutation_events.append(("rename", handle))
+            real_rename(handle, target, parent, replace=replace)
+
+        with patch(
+            "app.reset_database._windows_create_relative",
+            side_effect=record_create,
+        ), patch(
+            "app.reset_database._windows_flush_file_handle",
+            side_effect=record_flush,
+        ), patch(
+            "app.reset_database._windows_rename",
+            side_effect=record_rename,
+        ), reset_v2._open_sqlite_staging(staging) as state:
+            original_identity = state.identity
+            connection = sqlite3.connect(staging)
+            try:
+                connection.execute("CREATE TABLE fixture(value TEXT NOT NULL)")
+                connection.execute("INSERT INTO fixture VALUES ('safe')")
+                connection.commit()
+            finally:
+                connection.close()
+            control = reset_v2._elevate_sqlite_staging(state)
+            self.assertEqual(control.identity, original_identity)
+            reset_v2._promote_open_control(control, final, expected_raw=None)
+        self.assertEqual(len(creates), 2)
+        initial, elevated = creates
+        self.assertTrue(initial[0])
+        self.assertEqual(initial[1], 0x00100000 | 0x00000080)
+        self.assertEqual(initial[2], 0x1 | 0x2 | 0x4)
+        self.assertFalse(elevated[0])
+        self.assertIsNotNone(elevated[1])
+        self.assertTrue(int(elevated[1]) & 0x00010000)
+        self.assertEqual(elevated[2], 0)
+        self.assertNotEqual(initial[3], elevated[3])
+        rename_index = next(
+            index for index, event in enumerate(mutation_events)
+            if event[0] == "rename"
+        )
+        self.assertGreater(rename_index, 0)
+        self.assertEqual(mutation_events[rename_index - 1][0], "flush")
+        self.assertEqual(
+            mutation_events[rename_index - 1][1],
+            mutation_events[rename_index][1],
+        )
+        connection = sqlite3.connect(final)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT value FROM fixture").fetchone()[0],
+                "safe",
+            )
+        finally:
+            connection.close()
+
+    def test_legacy_next_accepts_only_exact_incomplete_successor_prefix(self) -> None:
+        token = "1" * 64
+        backup = "backups/helios-pre-room-shared-reset-20260814T120000006Z.db"
+        audit = "backups/helios-pre-room-shared-reset-20260814T120000006Z.audit.json"
+        state = self.make_legacy_ready_journal(token, backup, audit)
+        journal = json.loads(state.read_text(encoding="utf-8"))
+        successor = {
+            **journal,
+            "journal_sequence": journal["journal_sequence"] + 1,
+            "stage": "quarantining",
+            "updated_at": "2026-08-14T12:00:00.001Z",
+        }
+        successor_raw = reset_v2._canonical_bytes(successor)
+        next_path = Path(f"{state}.next")
+        next_path.write_bytes(successor_raw[:-7])
+        selection = reset_v2._select_legacy(self.root, token)
+        self.assertEqual(selection.selected_path, state)
+
+        invalid_candidates = (
+            reset_v2._canonical_bytes({
+                **successor,
+                "journal_sequence": journal["journal_sequence"] + 2,
+            }),
+            b'{"complete":"but hostile"}\n',
+            successor_raw[:-7] + b"x",
+        )
+        for candidate in invalid_candidates:
+            with self.subTest(candidate=candidate[-24:]):
+                next_path.write_bytes(candidate)
+                with self.assertRaises(DatabaseResetError) as invalid:
+                    reset_v2._select_legacy(self.root, token)
+                self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+
+    def test_incomplete_native_shm_allows_only_sqlite_managed_changes(self) -> None:
+        planned = {
+            "exists": True,
+            "file_type": "regular",
+            "identity": "windows:0000000000000001:" + "2" * 32,
+            "link_count": 1,
+            "mtime_ns": 10,
+            "sha256": "3" * 64,
+            "size": 32,
+        }
+        changed = {
+            **planned,
+            "mtime_ns": 20,
+            "sha256": "4" * 64,
+            "size": 64,
+        }
+        self.assertTrue(reset_v2._matches_incomplete_native_observation(
+            "database_shm", changed, planned
+        ))
+        self.assertFalse(reset_v2._matches_incomplete_native_observation(
+            "database", changed, planned
+        ))
+        for mutation in (
+            {"exists": False},
+            {"file_type": "symlink"},
+            {"identity": "windows:0000000000000001:" + "5" * 32},
+            {"link_count": 2},
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertFalse(
+                    reset_v2._matches_incomplete_native_observation(
+                        "database_shm", {**changed, **mutation}, planned
+                    )
+                )
+
+    def test_close_handle_uses_pointer_safe_ctypes_contract(self) -> None:
+        class FakeClose:
+            argtypes: object = None
+            restype: object = None
+
+            def __init__(self) -> None:
+                self.values: list[int] = []
+
+            def __call__(self, handle: object) -> int:
+                self.values.append(int(handle.value))
+                return 1
+
+        fake = FakeClose()
+        high_handle = 0xFEDCBA987654321
+        with patch.object(ctypes.windll.kernel32, "CloseHandle", fake):
+            reset_module._windows_close_handle(high_handle)
+        self.assertEqual(fake.argtypes, [wintypes.HANDLE])
+        self.assertIs(fake.restype, wintypes.BOOL)
+        self.assertEqual(fake.values, [high_handle])
 
     def test_legacy_state_rejects_external_native_manifest_before_open(self) -> None:
         token = "d" * 64
@@ -930,6 +1158,49 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertEqual(report["status"], "restored_source")
         self.assertFalse(copy_partial.exists())
         self.assertFalse(restoring.exists())
+
+    def test_recovery_rejects_byte_identical_replacement_backup_identity(self) -> None:
+        plan = plan_database_reset("data/helios.db", repository_root=self.root)
+        with self.assertRaises(KeyboardInterrupt):
+            execute_database_reset(
+                "data/helios.db", expected_plan_token=plan["plan_token"],
+                expected_backup_path=plan["backup_path"],
+                expected_audit_path=plan["audit_path"],
+                confirm_destroy_canonical_history=True,
+                repository_root=self.root,
+                crash_checkpoint=lambda stage: (
+                    (_ for _ in ()).throw(KeyboardInterrupt())
+                    if stage == "fresh_installed" else None
+                ),
+            )
+        backup = self.root / plan["backup_path"]
+        original_bytes = backup.read_bytes()
+        recorded_identity = reset_module._path_identity(backup)
+        replacement = backup.with_name(backup.name + ".replacement")
+        replacement.write_bytes(original_bytes)
+        backup.unlink()
+        replacement.rename(backup)
+        self.assertEqual(backup.read_bytes(), original_bytes)
+        self.assertNotEqual(reset_module._path_identity(backup), recorded_identity)
+        database_before = self.database.read_bytes()
+        controls_before = {
+            path.name: path.read_bytes()
+            for path in (self.root / "data").iterdir()
+            if path.name.startswith(".helios-room-reset-state.")
+        }
+        with self.assertRaises(DatabaseResetError) as invalid:
+            recover_database_reset(
+                "data/helios.db", expected_plan_token=plan["plan_token"],
+                action="restore-source", confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
+        self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+        self.assertEqual(self.database.read_bytes(), database_before)
+        self.assertEqual({
+            path.name: path.read_bytes()
+            for path in (self.root / "data").iterdir()
+            if path.name.startswith(".helios-room-reset-state.")
+        }, controls_before)
 
     def test_destructive_helpers_reject_links_and_parent_substitution(self) -> None:
         hard_link = self.root / "data" / (".helios.db.reset-" + "0" * 64 + ".failed-new")
@@ -1437,27 +1708,63 @@ class ResetProtocolTests(unittest.TestCase):
             return_value=stable,
         ), patch(
             "app.reset_protocol_v2._probe_durability",
+            side_effect=AssertionError("persisted mode must not be reselected"),
+        ) as probe, patch(
+            "app.reset_protocol_v2._open_and_flush_volume",
             side_effect=DatabaseResetError(
                 "reset_durability_unsupported", "synthetic operation failure"
             ),
-        ):
+        ) as volume_flush:
             with self.assertRaises(DatabaseResetError) as failed:
                 reset_v2._revalidate_persisted_authority(self.root, persisted)
         self.assertEqual(failed.exception.code, "reset_failed")
+        probe.assert_not_called()
+        volume_flush.assert_called_once_with(
+            persisted["volume_guid"], persisted["handle_volume_serial_hex"]
+        )
 
         (self.root / "backups").mkdir()
-        current = self.synthetic_durability(self.root)
+        directory_persisted = self.synthetic_durability(self.root)
         current_stable = self.synthetic_stable_authority(self.root)
+        directory_calls: list[tuple[str, Path, str]] = []
+
+        def directory_flush(
+            name: str, path: Path, identity: str
+        ) -> dict[str, object]:
+            directory_calls.append((name, path, identity))
+            return {
+                "error_code": None,
+                "flush_succeeded": True,
+                "identity": identity,
+                "name": name,
+                "state": "present",
+            }
+
         with patch(
             "app.reset_protocol_v2._inspect_stable_durability_authority",
             return_value=current_stable,
         ), patch(
-            "app.reset_protocol_v2._probe_durability", return_value=current
-        ):
+            "app.reset_protocol_v2._probe_durability",
+            side_effect=AssertionError("persisted mode must not be reselected"),
+        ) as probe, patch(
+            "app.reset_protocol_v2._directory_probe",
+            side_effect=directory_flush,
+        ), patch(
+            "app.reset_protocol_v2._open_and_flush_volume",
+            side_effect=AssertionError("directory mode must not flush volume"),
+        ) as volume_flush:
             self.assertIs(
-                reset_v2._revalidate_persisted_authority(self.root, persisted),
-                persisted,
+                reset_v2._revalidate_persisted_authority(
+                    self.root, directory_persisted
+                ),
+                directory_persisted,
             )
+        probe.assert_not_called()
+        volume_flush.assert_not_called()
+        self.assertEqual(
+            [item[0] for item in directory_calls],
+            ["repository", "data", "backups"],
+        )
 
     def test_real_subprocess_generation_interruption_matrix(self) -> None:
         checkpoints = (

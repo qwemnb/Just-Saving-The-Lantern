@@ -1,4 +1,4 @@
-"""Windows-only immutable reset-control protocol (Revisions 2.4 through 2.8).
+"""Windows-only immutable reset-control protocol (Revisions 2.4 through 2.9).
 
 This module deliberately contains only reset planning/execution/recovery code.
 Ordinary runtime interlocking remains in :mod:`app.maintenance_lock` and is
@@ -9,6 +9,7 @@ SQLite phase.
 
 from __future__ import annotations
 
+import calendar
 import ctypes
 import hashlib
 import json
@@ -16,6 +17,7 @@ import os
 import re
 import sqlite3
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -352,8 +354,10 @@ def _git_evidence(root: Path, prospective: Iterable[str]) -> tuple[str, dict[str
 
 
 def _close_handle(handle: int) -> None:
-    if not ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle)):
-        raise _error("reset_durability_unsupported")
+    try:
+        legacy._windows_close_handle(handle)
+    except legacy.DatabaseResetError as error:
+        raise _error("reset_durability_unsupported") from error
 
 
 def _volume_information(root: str) -> tuple[int, str]:
@@ -651,29 +655,61 @@ def _unlink_verified_bytes(path: Path, identity: str, expected: bytes) -> None:
                 legacy._windows_close_handle(raw_handle)
 
 
-def _install_no_overwrite(source: Path, target: Path) -> None:
-    try:
-        legacy._install_no_overwrite(source, target, flush_parent=False)
-    except legacy.DatabaseResetError as error:
-        if error.code == "reset_failed":
-            raise _DurabilityBoundaryError(error.code, error.message) from error
-        raise
-
-
 def _copy_verified(
     source: Path,
     target: Path,
     expected_sha256: str,
     crash_checkpoint: Callable[[str], None] | None,
+    *,
+    expected_source_identity: str | None = None,
 ) -> None:
     try:
         legacy._copy_verified(
-            source, target, expected_sha256, crash_checkpoint, flush_parent=False
+            source,
+            target,
+            expected_sha256,
+            crash_checkpoint,
+            flush_parent=False,
+            expected_source_identity=expected_source_identity,
         )
     except legacy.DatabaseResetError as error:
         if error.code == "reset_failed":
             raise _DurabilityBoundaryError(error.code, error.message) from error
         raise
+
+
+def _verified_file_sha256(path: Path, expected_identity: str) -> str:
+    if legacy._path_identity(path) != expected_identity:
+        raise _error("reset_recovery_invalid")
+    descriptor = legacy._open_existing_regular(
+        path,
+        expected_identity,
+        share_write=False,
+        share_delete=False,
+    )
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(descriptor)
+        if (
+            before.st_nlink != 1
+            or after.st_nlink != 1
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or legacy._descriptor_identity(descriptor, before)
+            != expected_identity
+            or legacy._descriptor_identity(descriptor, after)
+            != expected_identity
+        ):
+            raise _error("reset_recovery_invalid")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
 
 
 def _rmdir_verified(path: Path, identity: str) -> None:
@@ -1369,31 +1405,23 @@ class GenerationStore:
         )
         if os.path.lexists(final) or os.path.lexists(partial):
             raise _error("reset_failed")
-        descriptor = legacy._open_new_regular(partial, read_write=False)
-        identity = legacy._descriptor_identity(descriptor, os.fstat(descriptor))
-        try:
+        with _open_control_partial(partial, create_new=True) as control:
+            identity = control.identity
             checkpoint_prefix = label or stage
             if crash_checkpoint is not None:
                 boundary = max(1, len(raw) // 2)
-                legacy._write_all(descriptor, raw[:boundary])
+                legacy._write_all(control.descriptor, raw[:boundary])
                 crash_checkpoint(f"{checkpoint_prefix}:generation_partial_write")
-                legacy._write_all(descriptor, raw[boundary:])
+                legacy._write_all(control.descriptor, raw[boundary:])
             else:
-                legacy._write_all(descriptor, raw)
-            os.fsync(descriptor)
-            if os.fstat(descriptor).st_size != len(raw):
-                raise _error("reset_failed")
-            if crash_checkpoint is not None:
-                crash_checkpoint(f"{checkpoint_prefix}:generation_file_durable")
-        finally:
-            os.close(descriptor)
-        if legacy._stable_sha256(partial) != digest:
-            raise _error("reset_failed")
-        if crash_checkpoint is not None:
-            crash_checkpoint(f"{checkpoint_prefix}:generation_before_promotion")
-        _move_verified(partial, final, identity)
-        if crash_checkpoint is not None:
-            crash_checkpoint(f"{checkpoint_prefix}:generation_promoted")
+                legacy._write_all(control.descriptor, raw)
+            _promote_open_control(
+                control,
+                final,
+                raw,
+                crash_checkpoint=crash_checkpoint,
+                checkpoint_prefix=checkpoint_prefix,
+            )
         _flush_namespace(self.authority, self.data)
         parsed, installed, installed_identity = _read_canonical(final)
         _validate_envelope(parsed, token=self.token, content_hash=digest, sequence=sequence)
@@ -1738,27 +1766,24 @@ def _revalidate_persisted_authority(root: Path, persisted: dict[str, Any]) -> di
         != persisted["handle_volume_serial_hex"]
     ):
         raise _error("reset_recovery_invalid")
-    try:
-        current = _probe_durability(root)
-    except legacy.DatabaseResetError as error:
-        if error.code == "reset_durability_unsupported":
-            raise _error("reset_failed") from error
-        raise
-    if current["api_contract"] != persisted["api_contract"]:
-        raise _error("reset_recovery_invalid")
-    current_probes = {item["name"]: item for item in current["directory_probes"]}
-    for name in ("repository", "data"):
-        if current_probes[name]["identity"] != persisted_probes[name]["identity"]:
-            raise _error("reset_recovery_invalid")
-    if persisted_probes["backups"]["state"] == "present":
-        if current_probes["backups"]["identity"] != persisted_probes["backups"]["identity"]:
-            raise _error("reset_recovery_invalid")
-    elif current_probes["backups"]["state"] == "present":
-        # A newly created backups directory is legal only on the persisted volume.
-        if current_probes["backups"]["identity"].split(":")[1] != persisted["handle_volume_serial_hex"]:
-            raise _error("reset_recovery_invalid")
     if persisted["mode"] == "directory_flush":
-        if current["mode"] != "directory_flush":
+        paths = {
+            "repository": root,
+            "data": root / "data",
+            "backups": root / "backups",
+        }
+        try:
+            current_probes = [
+                _directory_probe(
+                    name,
+                    paths[name],
+                    persisted_probes[name]["identity"],
+                )
+                for name in ("repository", "data", "backups")
+            ]
+        except legacy.DatabaseResetError as error:
+            raise _error("reset_failed") from error
+        if any(item["flush_succeeded"] is not True for item in current_probes):
             raise _error("reset_failed")
     else:
         try:
@@ -1770,38 +1795,320 @@ def _revalidate_persisted_authority(root: Path, persisted: dict[str, Any]) -> di
     return persisted
 
 
-def _write_json_partial(
+@dataclass
+class _ControlPartial:
+    path: Path
+    descriptor: int
+    parent_handle: int
+    parent_identity: str
+    identity: str
+
+    @property
+    def handle(self) -> int:
+        import msvcrt
+
+        return int(msvcrt.get_osfhandle(self.descriptor))
+
+
+@contextmanager
+def _open_control_partial(path: Path, *, create_new: bool):
+    if os.name != "nt":
+        raise _error("reset_platform_unsupported")
+    import msvcrt
+
+    with legacy._verified_parent(path) as (parent_handle, parent_identity):
+        legacy._revalidate_parent(path, parent_identity)
+        handle = legacy._windows_create_relative(
+            parent_handle,
+            path.name,
+            directory=False,
+            create_new=create_new,
+            desired_access=(
+                0x80000000 | 0x40000000 | 0x00010000
+                | 0x00100000 | 0x00000080
+            ),
+            share_access=0,
+        )
+        descriptor: int | None = None
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                handle, getattr(os, "O_BINARY", 0) | os.O_RDWR
+            )
+            handle = 0
+            raw_handle = int(msvcrt.get_osfhandle(descriptor))
+            legacy._windows_validate_handle(raw_handle, directory=False)
+            identity = legacy._windows_handle_identity(raw_handle)
+            if (
+                legacy._relative_entry_identity(path, parent_handle)
+                != identity
+            ):
+                raise _error("reset_path_unsafe")
+            yield _ControlPartial(
+                path,
+                descriptor,
+                parent_handle,
+                parent_identity,
+                identity,
+            )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            elif handle:
+                legacy._windows_close_handle(handle)
+
+
+def _control_bytes(control: _ControlPartial, *, maximum: int = 1_048_576) -> bytes:
+    os.lseek(control.descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    length = 0
+    while True:
+        block = os.read(control.descriptor, min(65_536, maximum + 1 - length))
+        if not block:
+            break
+        chunks.append(block)
+        length += len(block)
+        if length > maximum:
+            raise _error("reset_recovery_invalid")
+    info = os.fstat(control.descriptor)
+    if (
+        info.st_nlink != 1
+        or info.st_size != length
+        or legacy._descriptor_identity(control.descriptor, info)
+        != control.identity
+    ):
+        raise _error("reset_path_unsafe")
+    return b"".join(chunks)
+
+
+def _control_sha256(control: _ControlPartial) -> str:
+    os.lseek(control.descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    before = os.fstat(control.descriptor)
+    while True:
+        block = os.read(control.descriptor, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    after = os.fstat(control.descriptor)
+    if (
+        before.st_nlink != 1
+        or after.st_nlink != 1
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or legacy._descriptor_identity(control.descriptor, before)
+        != control.identity
+        or legacy._descriptor_identity(control.descriptor, after)
+        != control.identity
+    ):
+        raise _error("reset_path_unsafe")
+    return digest.hexdigest()
+
+
+def _promote_open_control(
+    control: _ControlPartial,
+    final: Path,
+    expected_raw: bytes | None,
+    *,
+    expected_sha256: str | None = None,
+    crash_checkpoint: Callable[[str], None] | None = None,
+    checkpoint_prefix: str | None = None,
+) -> str:
+    if final.parent != control.path.parent:
+        raise _error("reset_path_unsafe")
+    try:
+        legacy._windows_flush_file_handle(control.handle)
+        if expected_raw is not None:
+            if _control_bytes(control) != expected_raw:
+                raise _error("reset_recovery_invalid")
+            content_hash = _sha256(expected_raw)
+        else:
+            content_hash = _control_sha256(control)
+        if expected_sha256 is not None and content_hash != expected_sha256:
+            raise _error("reset_recovery_invalid")
+        if crash_checkpoint is not None and checkpoint_prefix is not None:
+            crash_checkpoint(f"{checkpoint_prefix}:generation_file_durable")
+            crash_checkpoint(f"{checkpoint_prefix}:generation_before_promotion")
+        legacy._revalidate_parent(control.path, control.parent_identity)
+        if (
+            legacy._relative_entry_identity(
+                control.path, control.parent_handle
+            )
+            != control.identity
+            or legacy._relative_entry_exists(final, control.parent_handle)
+        ):
+            raise _error("reset_recovery_invalid")
+        legacy._windows_rename(
+            control.handle, final, control.parent_handle, replace=False
+        )
+        legacy._windows_flush_file_handle(control.handle)
+        if crash_checkpoint is not None and checkpoint_prefix is not None:
+            crash_checkpoint(f"{checkpoint_prefix}:generation_promoted")
+        legacy._revalidate_parent(final, control.parent_identity)
+        if (
+            legacy._relative_entry_identity(final, control.parent_handle)
+            != control.identity
+        ):
+            raise _error("reset_failed")
+    except legacy.DatabaseResetError as error:
+        if error.code == "reset_failed":
+            raise _DurabilityBoundaryError(error.code, error.message) from error
+        raise
+    return content_hash
+
+
+def _write_and_install_json(
     partial: Path,
+    final: Path,
     value: Any,
     authority: dict[str, Any],
     *,
     crash_checkpoint: Callable[[str], None] | None = None,
-    checkpoint: str | None = None,
+    partial_checkpoint: str | None = None,
 ) -> tuple[bytes, str]:
     raw = _canonical_bytes(value)
-    descriptor = legacy._open_new_regular(partial, read_write=False)
-    identity = legacy._descriptor_identity(descriptor, os.fstat(descriptor))
-    try:
-        if crash_checkpoint is not None and checkpoint is not None:
+    with _open_control_partial(partial, create_new=True) as control:
+        if crash_checkpoint is not None and partial_checkpoint is not None:
             boundary = max(1, len(raw) // 2)
-            legacy._write_all(descriptor, raw[:boundary])
-            crash_checkpoint(checkpoint)
-            legacy._write_all(descriptor, raw[boundary:])
+            legacy._write_all(control.descriptor, raw[:boundary])
+            crash_checkpoint(partial_checkpoint)
+            legacy._write_all(control.descriptor, raw[boundary:])
         else:
-            legacy._write_all(descriptor, raw)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    if legacy._stable_sha256(partial) != _sha256(raw):
-        raise _error("reset_failed")
+            legacy._write_all(control.descriptor, raw)
+        identity = control.identity
+        _promote_open_control(control, final, raw)
+    _flush_namespace(authority, final.parent)
     return raw, identity
 
 
-def _install_json_no_overwrite(
-    partial: Path, final: Path, identity: str, authority: dict[str, Any]
+def _promote_existing_json_partial(
+    partial: Path,
+    final: Path,
+    expected_raw: bytes,
+    expected_identity: str,
+    authority: dict[str, Any],
 ) -> None:
-    _move_verified(partial, final, identity)
+    with _open_control_partial(partial, create_new=False) as control:
+        if control.identity != expected_identity:
+            raise _error("reset_path_unsafe")
+        _promote_open_control(control, final, expected_raw)
     _flush_namespace(authority, final.parent)
+
+
+@dataclass
+class _SqliteStaging:
+    path: Path
+    parent_handle: int
+    parent_identity: str
+    guard_handle: int
+    identity: str
+    elevated: _ControlPartial | None = None
+
+
+@contextmanager
+def _open_sqlite_staging(path: Path):
+    if os.name != "nt":
+        raise _error("reset_platform_unsupported")
+    with legacy._verified_parent(path) as (parent_handle, parent_identity):
+        legacy._revalidate_parent(path, parent_identity)
+        guard_handle = legacy._windows_create_relative(
+            parent_handle,
+            path.name,
+            directory=False,
+            create_new=True,
+            desired_access=0x00100000 | 0x00000080,
+            share_access=0x1 | 0x2 | 0x4,
+        )
+        staging: _SqliteStaging | None = None
+        try:
+            legacy._windows_validate_handle(guard_handle, directory=False)
+            identity = legacy._windows_handle_identity(guard_handle)
+            if (
+                legacy._relative_entry_identity(path, parent_handle)
+                != identity
+            ):
+                raise _error("reset_path_unsafe")
+            staging = _SqliteStaging(
+                path,
+                parent_handle,
+                parent_identity,
+                guard_handle,
+                identity,
+            )
+            yield staging
+        finally:
+            if staging is not None and staging.elevated is not None:
+                os.close(staging.elevated.descriptor)
+                staging.elevated = None
+            if staging is None or staging.guard_handle:
+                legacy._windows_close_handle(
+                    guard_handle if staging is None else staging.guard_handle
+                )
+
+
+def _elevate_sqlite_staging(staging: _SqliteStaging) -> _ControlPartial:
+    if staging.elevated is not None or not staging.guard_handle:
+        raise _error("reset_path_unsafe")
+    import msvcrt
+
+    legacy._revalidate_parent(staging.path, staging.parent_identity)
+    if (
+        legacy._relative_entry_identity(staging.path, staging.parent_handle)
+        != staging.identity
+    ):
+        raise _error("reset_path_unsafe")
+    elevated_handle = legacy._windows_create_relative(
+        staging.parent_handle,
+        staging.path.name,
+        directory=False,
+        create_new=False,
+        desired_access=(
+            0x80000000 | 0x40000000 | 0x00010000
+            | 0x00100000 | 0x00000080
+        ),
+        share_access=0,
+    )
+    descriptor: int | None = None
+    try:
+        legacy._windows_validate_handle(elevated_handle, directory=False)
+        if legacy._windows_handle_identity(elevated_handle) != staging.identity:
+            raise _error("reset_path_unsafe")
+        snapshot = legacy._windows_handle_snapshot(elevated_handle)
+        if (
+            snapshot["file_id"] != staging.identity
+            or snapshot["directory"]
+            or snapshot["delete_pending"]
+            or snapshot["link_count"] != 1
+            or snapshot["reparse_tag"] != 0
+        ):
+            raise _error("reset_path_unsafe")
+        legacy._revalidate_parent(staging.path, staging.parent_identity)
+        if (
+            legacy._relative_entry_identity(
+                staging.path, staging.parent_handle
+            )
+            != staging.identity
+        ):
+            raise _error("reset_path_unsafe")
+        descriptor = msvcrt.open_osfhandle(
+            elevated_handle, getattr(os, "O_BINARY", 0) | os.O_RDWR
+        )
+        elevated_handle = 0
+        legacy._windows_close_handle(staging.guard_handle)
+        staging.guard_handle = 0
+        staging.elevated = _ControlPartial(
+            staging.path,
+            descriptor,
+            staging.parent_handle,
+            staging.parent_identity,
+            staging.identity,
+        )
+        return staging.elevated
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        elif elevated_handle:
+            legacy._windows_close_handle(elevated_handle)
+        raise
 
 
 def _native_audit_value(store: GenerationStore, journal: dict[str, Any], outcome: str, terminal: str) -> dict[str, Any]:
@@ -1871,9 +2178,10 @@ def _install_terminal_audit(
             _unlink_verified_bytes(partial, partial_identity, partial_raw)
             _flush_namespace(store.authority, partial.parent)
         return existing
+    promoted = False
     if os.path.lexists(partial):
         try:
-            partial_value, _raw, partial_identity = _read_canonical(partial)
+            partial_value, partial_raw, partial_identity = _read_canonical(partial)
         except legacy.DatabaseResetError:
             partial_identity = legacy._path_identity(partial)
             _unlink_verified(partial, partial_identity)
@@ -1888,17 +2196,25 @@ def _install_terminal_audit(
                 raise
             if partial_value["outcome"] != outcome:
                 raise _error("reset_recovery_invalid")
-    if not os.path.lexists(partial):
-        _raw, identity = _write_json_partial(
-            partial, value, store.authority,
+            _promote_existing_json_partial(
+                partial,
+                audit,
+                partial_raw,
+                partial_identity,
+                store.authority,
+            )
+            promoted = True
+    if not promoted:
+        _write_and_install_json(
+            partial,
+            audit,
+            value,
+            store.authority,
             crash_checkpoint=crash_checkpoint,
-            checkpoint="recovery:audit_write_partial",
+            partial_checkpoint="recovery:audit_write_partial",
         )
-    else:
-        identity = legacy._path_identity(partial)
     if crash_checkpoint is not None:
         crash_checkpoint("recovery:audit_partial_durable")
-    _install_json_no_overwrite(partial, audit, identity, store.authority)
     return value
 
 
@@ -2036,53 +2352,55 @@ def execute_database_reset(
             raise _error("reset_plan_stale")
         manifest = plan["reviewed_plan_manifest"]
         before = legacy._observations(database)
-        source = legacy._open_reset_source(database)
-        try:
-            source_label, source_digest = legacy._validate_source(source)
-            backups = root / "backups"
-            if not os.path.lexists(backups):
-                legacy._mkdir_verified(backups)
-                _flush_namespace(under_lease, root)
-                created_backups = True
-            partial = Path(f"{backup}.partial")
-            if any(os.path.lexists(item) for item in (backup, partial, audit, Path(f"{audit}.partial"))):
-                raise _error("reset_failed")
-            partial_guard = legacy._open_new_regular(
-                partial, read_write=True, share_delete=False
-            )
-            partial_identity = legacy._descriptor_identity(
-                partial_guard, os.fstat(partial_guard)
-            )
+        backups = root / "backups"
+        if not os.path.lexists(backups):
+            legacy._mkdir_verified(backups)
+            _flush_namespace(under_lease, root)
+            created_backups = True
+        partial = Path(f"{backup}.partial")
+        if any(os.path.lexists(item) for item in (backup, partial, audit, Path(f"{audit}.partial"))):
+            raise _error("reset_failed")
+        with _open_sqlite_staging(partial) as backup_staging:
+            source = legacy._open_reset_source(database)
             try:
+                source_label, source_digest = legacy._validate_source(source)
                 target = legacy._open_direct(partial, read_only=False)
                 try:
                     source.backup(target)
                 finally:
                     target.close()
-                if (
-                    legacy._descriptor_identity(partial_guard, os.fstat(partial_guard))
-                    != partial_identity
-                    or legacy._path_identity(partial) != partial_identity
-                ):
-                    raise _error("reset_failed")
             finally:
-                os.close(partial_guard)
-        finally:
-            source.rollback()
-            source.close()
-        after = legacy._observations(database)
-        if before["database"] != after["database"] or before["wal"] != after["wal"]:
-            raise _error("reset_failed")
-        verified = legacy._open_connection(partial, immutable=True)
-        try:
-            backup_label, backup_digest = legacy._validate_source(verified)
-        finally:
-            verified.rollback()
-            verified.close()
-        if (backup_label, backup_digest) != (source_label, source_digest):
-            raise _error("reset_failed")
-        backup_sha = legacy._stable_sha256(partial)
-        _install_no_overwrite(partial, backup)
+                source.rollback()
+                source.close()
+            after = legacy._observations(database)
+            if before["database"] != after["database"] or before["wal"] != after["wal"]:
+                raise _error("reset_failed")
+            if (
+                legacy._relative_entry_identity(
+                    partial, backup_staging.parent_handle
+                )
+                != backup_staging.identity
+            ):
+                raise _error("reset_path_unsafe")
+            verified = legacy._open_connection(partial, immutable=True)
+            try:
+                backup_label, backup_digest = legacy._validate_source(verified)
+            finally:
+                verified.rollback()
+                verified.close()
+            if (backup_label, backup_digest) != (source_label, source_digest):
+                raise _error("reset_failed")
+            if (
+                legacy._relative_entry_identity(
+                    partial, backup_staging.parent_handle
+                )
+                != backup_staging.identity
+            ):
+                raise _error("reset_path_unsafe")
+            backup_control = _elevate_sqlite_staging(backup_staging)
+            backup_sha = _promote_open_control(
+                backup_control, backup, expected_raw=None
+            )
         _flush_namespace(under_lease, backup.parent)
         active, quarantine_paths = _component_paths(root, manifest)
         source_components = {
@@ -2133,13 +2451,7 @@ def execute_database_reset(
         store.append(journal, "original_quarantined", crash_checkpoint)
         fresh_staging = root / manifest["artifact_paths"]["fresh_database_staging_path"]
         store.append(journal, "installing_fresh", crash_checkpoint)
-        fresh_guard = legacy._open_new_regular(
-            fresh_staging, read_write=True, share_delete=False
-        )
-        fresh_identity = legacy._descriptor_identity(
-            fresh_guard, os.fstat(fresh_guard)
-        )
-        try:
+        with _open_sqlite_staging(fresh_staging) as fresh_staging_state:
             template = sqlite3.connect(":memory:")
             template.row_factory = sqlite3.Row
             template.execute("PRAGMA foreign_keys=ON")
@@ -2155,15 +2467,23 @@ def execute_database_reset(
                     fresh.close()
             finally:
                 template.close()
-        finally:
-            os.close(fresh_guard)
-        if any(
-            os.path.lexists(Path(f"{fresh_staging}{suffix}"))
-            for suffix in ("-wal", "-shm", "-journal")
-        ):
-            raise _error("reset_failed")
-        store.append(journal, "installing_fresh", crash_checkpoint)
-        _move_verified(fresh_staging, database, fresh_identity)
+            if any(
+                os.path.lexists(Path(f"{fresh_staging}{suffix}"))
+                for suffix in ("-wal", "-shm", "-journal")
+            ):
+                raise _error("reset_failed")
+            if (
+                legacy._relative_entry_identity(
+                    fresh_staging, fresh_staging_state.parent_handle
+                )
+                != fresh_staging_state.identity
+            ):
+                raise _error("reset_path_unsafe")
+            store.append(journal, "installing_fresh", crash_checkpoint)
+            fresh_control = _elevate_sqlite_staging(fresh_staging_state)
+            _promote_open_control(
+                fresh_control, database, expected_raw=None
+            )
         _flush_namespace(under_lease, database.parent)
         fresh = legacy._open_direct(database, read_only=False)
         try:
@@ -2251,6 +2571,105 @@ def _safe_raw_hash(path: Path) -> str:
     return legacy._stable_sha256(path)
 
 
+def _decimal_prefix_possible(
+    fragment: str, width: int, minimum: int, maximum: int
+) -> bool:
+    return (
+        len(fragment) <= width
+        and fragment.isdigit()
+        and any(
+            str(value).zfill(width).startswith(fragment)
+            for value in range(minimum, maximum + 1)
+        )
+    )
+
+
+def _utc_millisecond_prefix_possible(raw: bytes) -> bool:
+    if len(raw) > 24:
+        return False
+    try:
+        value = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    literals = {4: "-", 7: "-", 10: "T", 13: ":", 16: ":", 19: ".", 23: "Z"}
+    for index, character in enumerate(value):
+        expected = literals.get(index)
+        if expected is not None:
+            if character != expected:
+                return False
+        elif not character.isdigit():
+            return False
+    fields = (
+        (0, 4, 1, 9999),
+        (5, 7, 1, 12),
+        (8, 10, 1, 31),
+        (11, 13, 0, 23),
+        (14, 16, 0, 59),
+        (17, 19, 0, 59),
+        (20, 23, 0, 999),
+    )
+    for start, end, minimum, maximum in fields:
+        if len(value) <= start:
+            continue
+        fragment = value[start:min(len(value), end)]
+        if not _decimal_prefix_possible(fragment, end - start, minimum, maximum):
+            return False
+    if len(value) >= 10:
+        year = int(value[0:4])
+        month = int(value[5:7])
+        day = int(value[8:10])
+        if day > calendar.monthrange(year, month)[1]:
+            return False
+    return True
+
+
+def _is_demonstrably_incomplete_legacy_next(
+    raw: bytes,
+    journal: dict[str, Any],
+    *,
+    expected_token: str,
+    implementation_commit: str,
+) -> bool:
+    marker = b"2000-01-01T00:00:00.000Z"
+    for stage in STAGES:
+        successor = dict(journal)
+        successor["journal_sequence"] = journal["journal_sequence"] + 1
+        successor["stage"] = stage
+        successor["updated_at"] = marker.decode("ascii")
+        try:
+            legacy._validate_journal(
+                successor,
+                expected_token=expected_token,
+                implementation_commit=implementation_commit,
+            )
+        except legacy.DatabaseResetError:
+            continue
+        candidate = _canonical_bytes(successor)
+        marker_at = candidate.find(marker)
+        if marker_at < 0 or candidate.find(marker, marker_at + 1) >= 0:
+            raise _error("reset_recovery_invalid")
+        before = candidate[:marker_at]
+        after = candidate[marker_at + len(marker):]
+        if len(raw) <= len(before):
+            if raw == before[:len(raw)] and len(raw) < len(candidate):
+                return True
+            continue
+        if raw[:len(before)] != before:
+            continue
+        timestamp_length = min(len(raw) - len(before), len(marker))
+        timestamp = raw[len(before):len(before) + timestamp_length]
+        if not _utc_millisecond_prefix_possible(timestamp):
+            continue
+        if timestamp_length < len(marker):
+            return True
+        if not legacy._valid_utc_millisecond(timestamp.decode("ascii")):
+            continue
+        remainder = raw[len(before) + len(marker):]
+        if len(remainder) < len(after) and remainder == after[:len(remainder)]:
+            return True
+    return False
+
+
 def _select_legacy(root: Path, expected_token: str) -> LegacySelection:
     data = root / "data"
     state = data / ".helios-room-reset-state.json"
@@ -2268,18 +2687,28 @@ def _select_legacy(root: Path, expected_token: str) -> LegacySelection:
             continue
         try:
             candidate, _raw, _identity = _read_canonical(path)
-            if not isinstance(candidate, dict):
-                raise _error("reset_recovery_invalid")
-            commit = candidate.get("implementation_commit")
-            if commit not in LEGACY_V1_IMPLEMENTATION_COMMITS:
-                raise _error("reset_recovery_invalid")
-            valid[key] = legacy._validate_journal(
-                candidate, expected_token=expected_token,
-                implementation_commit=commit,
-            )
-        except legacy.DatabaseResetError:
-            if key == "journal" or state not in present:
-                raise _error("reset_recovery_invalid")
+        except legacy.DatabaseResetError as error:
+            if key == "journal" or state not in present or "journal" not in valid:
+                raise _error("reset_recovery_invalid") from error
+            raw = _stable_partial_snapshot(path)[0]
+            journal = valid["journal"]
+            if not _is_demonstrably_incomplete_legacy_next(
+                raw,
+                journal,
+                expected_token=expected_token,
+                implementation_commit=journal["implementation_commit"],
+            ):
+                raise _error("reset_recovery_invalid") from error
+            continue
+        if not isinstance(candidate, dict):
+            raise _error("reset_recovery_invalid")
+        commit = candidate.get("implementation_commit")
+        if commit not in LEGACY_V1_IMPLEMENTATION_COMMITS:
+            raise _error("reset_recovery_invalid")
+        valid[key] = legacy._validate_journal(
+            candidate, expected_token=expected_token,
+            implementation_commit=commit,
+        )
     if "journal" in valid:
         selected = "journal"
         if "next" in valid:
@@ -2489,14 +2918,16 @@ def _write_evidence_record(
     legacy._git_safety(root, [f"data/{name}", f"data/{name}{GENERATION_PARTIAL_SUFFIX}"])
     if os.path.lexists(final) or os.path.lexists(partial):
         raise _error("reset_recovery_invalid")
-    installed_raw, identity = _write_json_partial(
-        partial, value, authority,
+    installed_raw, _identity = _write_and_install_json(
+        partial,
+        final,
+        value,
+        authority,
         crash_checkpoint=crash_checkpoint,
-        checkpoint="legacy_evidence:partial_write",
+        partial_checkpoint="legacy_evidence:partial_write",
     )
     if installed_raw != raw:
         raise _error("reset_failed")
-    _install_json_no_overwrite(partial, final, identity, authority)
     return _validate_evidence_record(
         final, partial=False, expected_token=value["legacy_plan_token"],
         converter=value["converter_implementation_commit"],
@@ -2633,8 +3064,9 @@ def _handle_evidence_state(
                     root, expected_token, converter, selection,
                     _expected_legacy_names(selection.source) + [path.name],
                 )
-                _move_verified(path, final, record.identity)
-                _flush_namespace(authority, final.parent)
+                _promote_existing_json_partial(
+                    path, final, record.raw, record.identity, authority
+                )
                 return _validate_evidence_record(
                     final, partial=False, expected_token=expected_token,
                     converter=converter,
@@ -2691,8 +3123,9 @@ def _promote_or_rebuild_legacy_generation_partial(
     raw, identity, size, mtime_ns = _stable_partial_snapshot(partial)
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
     if raw == expected_raw:
-        _move_verified(partial, final, identity)
-        _flush_namespace(store.authority, final.parent)
+        _promote_existing_json_partial(
+            partial, final, raw, identity, store.authority
+        )
         store.generations.append(_read_generation(final, partial=False))
         return
     if len(raw) >= len(expected_raw) or expected_raw[:len(raw)] != raw:
@@ -2836,10 +3269,11 @@ def _install_legacy_chain_manifest(store: GenerationStore, journal: dict[str, An
         else:
             if existing != value:
                 raise _error("reset_recovery_invalid")
-            _install_json_no_overwrite(partial, path, identity, store.authority)
+            _promote_existing_json_partial(
+                partial, path, _raw, identity, store.authority
+            )
             return path
-    _raw, identity = _write_json_partial(partial, value, store.authority)
-    _install_json_no_overwrite(partial, path, identity, store.authority)
+    _write_and_install_json(partial, path, value, store.authority)
     return path
 
 
@@ -3061,7 +3495,9 @@ def _promote_terminal_audit_partial(
         _unlink_verified(partial, legacy._path_identity(partial))
         _flush_namespace(store.authority, partial.parent)
         return None
-    _install_json_no_overwrite(partial, audit, identity, store.authority)
+    _promote_existing_json_partial(
+        partial, audit, _raw, identity, store.authority
+    )
     return value
 
 
@@ -3129,6 +3565,7 @@ def _restore_v2(
                 _copy_verified(
                     backup, copy_target, journal["backup"]["sha256"],
                     crash_checkpoint,
+                    expected_source_identity=journal["backup"]["identity"],
                 )
                 _flush_namespace(store.authority, copy_target.parent)
             if copy_target != target and os.path.lexists(copy_target):
@@ -3335,6 +3772,21 @@ def _read_reviewed_plan(
     return plan
 
 
+def _matches_incomplete_native_observation(
+    key: str,
+    current: dict[str, Any],
+    planned: dict[str, Any],
+) -> bool:
+    if key != "database_shm" or not planned["exists"]:
+        return current == planned
+    return (
+        current["exists"] is True
+        and current["file_type"] == "regular"
+        and current["identity"] == planned["identity"]
+        and current["link_count"] == 1
+    )
+
+
 def _handle_native_partial_only(
     root: Path,
     partial: Path,
@@ -3368,7 +3820,11 @@ def _handle_native_partial_only(
             ("database_wal", Path(f"{database}-wal")),
             ("database_shm", Path(f"{database}-shm")),
         ):
-            if _file_observation(path) != manifest["filesystem"][key]:
+            current_observation = _file_observation(path)
+            planned_observation = manifest["filesystem"][key]
+            if not _matches_incomplete_native_observation(
+                key, current_observation, planned_observation
+            ):
                 raise _error("reset_recovery_invalid")
         backup = root / plan["backup_path"]
         if not os.path.lexists(backup):
@@ -3418,8 +3874,9 @@ def _handle_native_partial_only(
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
     authority = complete.envelope["reviewed_plan_manifest"]["durability"]
     _revalidate_persisted_authority(root, authority)
-    _move_verified(partial, final, complete.identity)
-    _flush_namespace(authority, final.parent)
+    _promote_existing_json_partial(
+        partial, final, complete.raw, complete.identity, authority
+    )
     return _read_generation(final, partial=False)
 
 
@@ -3469,8 +3926,9 @@ def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
     if generation.envelope["previous_generation_sha256"] != store.generations[-1].content_hash:
         raise _error("reset_recovery_invalid")
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
-    _move_verified(partial, final, generation.identity)
-    _flush_namespace(store.authority, final.parent)
+    _promote_existing_json_partial(
+        partial, final, generation.raw, generation.identity, store.authority
+    )
     store.generations.append(_read_generation(final, partial=False))
 
 
@@ -3543,7 +4001,12 @@ def recover_database_reset(
             _handle_chain_partial(store, partials)
             journal = store.journal
             backup = root / journal["backup"]["path"]
-            if legacy._stable_sha256(backup) != journal["backup"]["sha256"]:
+            if (
+                _verified_file_sha256(
+                    backup, journal["backup"]["identity"]
+                )
+                != journal["backup"]["sha256"]
+            ):
                 raise _error("reset_recovery_invalid")
             if action == "restore-source":
                 return _restore_v2(store, journal, crash_checkpoint)
