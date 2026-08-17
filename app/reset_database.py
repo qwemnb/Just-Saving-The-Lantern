@@ -54,6 +54,7 @@ IGNORE_BLOCK = """# Helios Room database and reset artifacts
 /data/helios.db
 /data/helios.db-wal
 /data/helios.db-shm
+/data/helios.db-journal
 /data/.helios-room-database.lock
 /data/.helios-room-reset-state.json
 /data/.helios-room-reset-state.json.next
@@ -888,6 +889,44 @@ def _windows_handle_snapshot(handle: int) -> dict[str, Any]:
     }
 
 
+def _windows_handle_mode(handle: int) -> int:
+    """Return FileModeInformation for diagnostics, never deletion authority."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class IO_STATUS_BLOCK(ctypes.Structure):
+        _fields_ = [
+            ("Status", ctypes.c_void_p),
+            ("Information", ctypes.c_size_t),
+        ]
+
+    class FILE_MODE_INFORMATION(ctypes.Structure):
+        _fields_ = [("Mode", wintypes.ULONG)]
+
+    status_block = IO_STATUS_BLOCK()
+    information = FILE_MODE_INFORMATION()
+    query = ctypes.windll.ntdll.NtQueryInformationFile
+    query.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(IO_STATUS_BLOCK),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        wintypes.ULONG,
+    ]
+    query.restype = ctypes.c_long
+    status = query(
+        _windows_typed_handle(handle),
+        ctypes.byref(status_block),
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+        16,  # FileModeInformation
+    )
+    if status < 0:
+        raise _error("reset_failed")
+    return int(information.Mode)
+
+
 def _windows_validate_handle(handle: int, *, directory: bool) -> None:
     snapshot = _windows_handle_snapshot(handle)
     if (
@@ -1044,6 +1083,8 @@ def _windows_create_relative(
     desired_access: int | None = None,
     share_access: int = 0x1 | 0x2 | 0x4,
     collision_error: str | None = None,
+    delete_on_close: bool = False,
+    expected_information: int | None = None,
 ) -> int:
     import ctypes
     from ctypes import wintypes
@@ -1096,6 +1137,12 @@ def _windows_create_relative(
                 if directory else 0x00000001 | 0x00000002 | 0x00000004
             )
         )
+    if delete_on_close and (
+        directory
+        or not create_new
+        or desired_access & 0x00010000 == 0
+    ):
+        raise _error("reset_failed")
     options = (
         0x00000001 | 0x00200000 | 0x00000020
         if directory
@@ -1103,6 +1150,8 @@ def _windows_create_relative(
     )
     if create_new and not directory:
         options |= 0x00000002
+    if delete_on_close:
+        options |= 0x00001000
     status = create(
         ctypes.byref(handle), desired_access, ctypes.byref(attributes),
         ctypes.byref(status_block), None, 0x10 if directory else 0x80,
@@ -1116,7 +1165,34 @@ def _windows_create_relative(
         raise _error(collision_error)
     if status < 0 or not handle.value:
         raise _error("reset_failed")
+    if (
+        expected_information is not None
+        and int(status_block.Information) != expected_information
+    ):
+        _windows_close_after_mutation(int(handle.value))
+        raise _error("reset_failed")
     return int(handle.value)
+
+
+def _windows_create_sidecar_guard(
+    parent_handle: int,
+    name: str,
+    *,
+    collision_error: str = "reset_recovery_invalid",
+) -> int:
+    """Atomically reserve a sidecar name with create-time delete-on-close."""
+
+    return _windows_create_relative(
+        parent_handle,
+        name,
+        directory=False,
+        create_new=True,
+        desired_access=0x00100000 | 0x00010000 | 0x00000080,
+        share_access=0,
+        collision_error=collision_error,
+        delete_on_close=True,
+        expected_information=2,  # FILE_CREATED
+    )
 
 
 def _windows_enumerate_directory_handle(handle: int) -> list[str]:

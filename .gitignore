@@ -195,6 +195,7 @@ data/
 /data/helios.db
 /data/helios.db-wal
 /data/helios.db-shm
+/data/helios.db-journal
 /data/.helios-room-database.lock
 /data/.helios-room-reset-state.json
 /data/.helios-room-reset-state.json.next

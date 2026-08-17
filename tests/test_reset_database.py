@@ -213,6 +213,32 @@ class ResetProtocolTests(unittest.TestCase):
         path.write_bytes(raw)
         return token, reset_v2._read_generation(path, partial=False)
 
+    @staticmethod
+    def reviewed_plan_from_native_generation(
+        generation: reset_v2.Generation,
+    ) -> dict[str, object]:
+        manifest = generation.envelope["reviewed_plan_manifest"]
+        filesystem = manifest["filesystem"]
+        paths = manifest["artifact_paths"]
+        return {
+            "audit_path": paths["audit_path"],
+            "backup_path": paths["backup_path"],
+            "database_identity": filesystem["database"]["identity"],
+            "database_path": "data/helios.db",
+            "database_sha256": filesystem["database"]["sha256"],
+            "implementation_commit": manifest["implementation_commit"],
+            "journal_storage_protocol_version": (
+                reset_v2.JOURNAL_STORAGE_PROTOCOL_VERSION
+            ),
+            "plan_token": generation.token,
+            "recovery_commit_by_schema": manifest[
+                "recovery_commit_by_schema"
+            ],
+            "reset_protocol_version": manifest["reset_protocol_version"],
+            "reviewed_plan_manifest": manifest,
+            "status": "planned",
+        }
+
     def crash_native_at(
         self, checkpoint: str, *, occurrence: int = 1
     ) -> tuple[dict[str, object], list[reset_v2.Generation]]:
@@ -793,6 +819,142 @@ class ResetProtocolTests(unittest.TestCase):
                     historical_commit,
                 )
 
+    def test_mixed_historical_evidence_and_current_generation_partial_fail_before_mutation(self) -> None:
+        token = "c" * 64
+        stem = "helios-pre-room-shared-reset-20260814T120000014Z"
+        self.make_legacy_ready_journal(
+            token,
+            f"backups/{stem}.db",
+            f"backups/{stem}.audit.json",
+        )
+        historical_commit = sorted(
+            reset_v2.LEGACY_CONVERSION_RECOVERY_COMMITS
+        )[0]
+        current_commit = self.git("rev-parse", "HEAD").strip()
+        self.assertNotEqual(current_commit, historical_commit)
+
+        with patch(
+            "app.reset_protocol_v2._current_commit",
+            return_value=historical_commit,
+        ), patch.object(
+            reset_v2.GenerationStore,
+            "append",
+            side_effect=KeyboardInterrupt(),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=token,
+                    action="restore-source",
+                    confirm_reset_recovery=True,
+                    repository_root=self.root,
+                )
+
+        evidence_path = next(
+            path
+            for path in (self.root / "data").iterdir()
+            if reset_v2.EVIDENCE_RE.fullmatch(path.name)
+        )
+        evidence = reset_v2._validate_evidence_record_for_recovery(
+            evidence_path,
+            partial=False,
+            expected_token=token,
+            current_commit=current_commit,
+        )
+        self.assertEqual(
+            evidence.value["converter_implementation_commit"],
+            historical_commit,
+        )
+
+        current_recovery_evidence = json.loads(json.dumps(
+            evidence.value["legacy_recovery_evidence"]
+        ))
+        current_recovery_evidence[
+            "converter_implementation_commit"
+        ] = current_commit
+        selection = reset_v2._select_legacy(self.root, token)
+        mixed_envelope = {
+            "converter_implementation_commit": current_commit,
+            "generation_sequence": 1,
+            "generation_version": reset_v2.GENERATION_VERSION,
+            "journal": selection.journal,
+            "legacy_recovery_evidence": current_recovery_evidence,
+            "legacy_source": evidence.value["legacy_source"],
+            "origin": "legacy_v1_conversion",
+            "previous_generation_sha256": None,
+            "reviewed_plan_manifest": None,
+        }
+        mixed_raw = reset_v2._canonical_bytes(mixed_envelope)
+        mixed_digest = reset_v2._sha256(mixed_raw)
+        mixed_partial = self.root / "data" / (
+            reset_v2._generation_name(token, 1, mixed_digest)
+            + reset_v2.GENERATION_PARTIAL_SUFFIX
+        )
+        mixed_partial.write_bytes(mixed_raw)
+        parsed_mixed = reset_v2._read_generation(
+            mixed_partial, partial=True
+        )
+        self.assertEqual(
+            parsed_mixed.envelope["converter_implementation_commit"],
+            current_commit,
+        )
+        self.assertEqual(
+            parsed_mixed.envelope["legacy_recovery_evidence"][
+                "converter_implementation_commit"
+            ],
+            current_commit,
+        )
+
+        def snapshot() -> dict[str, bytes]:
+            return {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for parent in (self.root / "data", self.root / "backups")
+                for path in parent.iterdir()
+                if path.is_file()
+                and path.name != ".helios-room-database.lock"
+            }
+
+        before = snapshot()
+        guarded_boundaries = (
+            patch.object(
+                reset_v2.GenerationStore,
+                "append",
+                side_effect=AssertionError("generation append forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._promote_validated_json_control",
+                side_effect=AssertionError("promotion forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._unlink_verified_bytes",
+                side_effect=AssertionError("cleanup forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._unlink_verified",
+                side_effect=AssertionError("cleanup forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._write_evidence_record",
+                side_effect=AssertionError("evidence rewrite forbidden"),
+            ),
+        )
+        guards = [boundary.start() for boundary in guarded_boundaries]
+        try:
+            with self.assertRaises(DatabaseResetError) as invalid:
+                recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=token,
+                    action="restore-source",
+                    confirm_reset_recovery=True,
+                    repository_root=self.root,
+                )
+        finally:
+            for boundary in reversed(guarded_boundaries):
+                boundary.stop()
+        self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+        self.assertTrue(all(guard.call_count == 0 for guard in guards))
+        self.assertEqual(snapshot(), before)
+
     def test_legacy_complete_fresh_and_unlisted_converter_fail_before_mutation(self) -> None:
         token = "d" * 64
         stem = "helios-pre-room-shared-reset-20260814T120000012Z"
@@ -1096,10 +1258,97 @@ class ResetProtocolTests(unittest.TestCase):
                     self.assertTrue(any(
                         read.lineno < promotion.lineno for read in reads
                     ))
+                    namespace_flushes_inside = [
+                        node
+                        for node in ast.walk(with_node)
+                        if (
+                            isinstance(node, ast.Call)
+                            and call_name(node) == "_flush_namespace"
+                        )
+                    ]
+                    self.assertEqual(namespace_flushes_inside, [])
+                    namespace_flushes_after = [
+                        node
+                        for node in ast.walk(function)
+                        if (
+                            isinstance(node, ast.Call)
+                            and call_name(node) == "_flush_namespace"
+                            and node.lineno > int(with_node.end_lineno)
+                        )
+                    ]
+                    self.assertTrue(namespace_flushes_after)
                     observed.add(function.name)
 
         self.assertEqual(observed, required_functions)
         self.assertFalse(hasattr(reset_v2, "_promote_existing_json_partial"))
+        self.assertNotIn(
+            "_flush_namespace",
+            inspect.getsource(reset_v2._promote_validated_json_control),
+        )
+
+    def test_recovered_json_partial_closes_before_namespace_flush(self) -> None:
+        partial = self.root / "data" / ".recovered.json.partial"
+        final = self.root / "data" / ".recovered.json"
+        raw = reset_v2._canonical_bytes({"kind": "recovered"})
+        partial.write_bytes(raw)
+        events: list[str] = []
+        descriptor = -1
+        real_file_flush = reset_module._windows_flush_file_handle
+        real_rename = reset_module._windows_rename
+
+        def file_flush(handle: int) -> None:
+            events.append("file_flush")
+            real_file_flush(handle)
+
+        def rename(
+            handle: int, target: Path, parent: int, *, replace: bool
+        ) -> None:
+            events.append("rename")
+            real_rename(handle, target, parent, replace=replace)
+
+        def namespace_flush(
+            _authority: dict[str, object], _directory: Path
+        ) -> None:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+            events.append("namespace_flush")
+
+        with patch(
+            "app.reset_database._windows_flush_file_handle",
+            side_effect=file_flush,
+        ), patch(
+            "app.reset_database._windows_rename",
+            side_effect=rename,
+        ), patch(
+            "app.reset_protocol_v2._flush_namespace",
+            side_effect=namespace_flush,
+        ):
+            with reset_v2._open_control_partial(
+                partial, create_new=False
+            ) as control:
+                descriptor = control.descriptor
+                value, retained_raw = reset_v2._read_canonical_control(
+                    control
+                )
+                self.assertEqual(value, {"kind": "recovered"})
+                events.append("validated")
+                reset_v2._promote_validated_json_control(
+                    control, final, retained_raw
+                )
+            reset_v2._flush_namespace(
+                self.synthetic_durability(self.root), final.parent
+            )
+        self.assertEqual(final.read_bytes(), raw)
+        self.assertEqual(
+            events,
+            [
+                "validated",
+                "file_flush",
+                "rename",
+                "file_flush",
+                "namespace_flush",
+            ],
+        )
 
     def test_sqlite_staging_elevates_via_same_parent_and_same_object(self) -> None:
         staging = self.root / "data" / ".sqlite-staging"
@@ -1348,6 +1597,77 @@ class ResetProtocolTests(unittest.TestCase):
                 with self.assertRaises(DatabaseResetError) as invalid:
                     reset_v2._select_legacy(self.root, token)
                 self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+
+        for stage in ("ready_to_quarantine", "quarantining"):
+            next_path.write_bytes(reset_v2._canonical_bytes({
+                **journal,
+                "journal_sequence": journal["journal_sequence"] + 1,
+                "stage": stage,
+                "updated_at": "2026-08-14T12:00:00.003Z",
+            }))
+            self.assertEqual(
+                reset_v2._select_legacy(self.root, token).selected_path,
+                next_path,
+            )
+        next_path.write_bytes(reset_v2._canonical_bytes({
+            **journal,
+            "journal_sequence": journal["journal_sequence"] + 1,
+            "stage": "original_quarantined",
+            "updated_at": "2026-08-14T12:00:00.004Z",
+        }))
+        with self.assertRaises(DatabaseResetError) as skipped:
+            reset_v2._select_legacy(self.root, token)
+        self.assertEqual(skipped.exception.code, "reset_recovery_invalid")
+
+        quarantining_complete = {
+            **journal,
+            "stage": "quarantining",
+            "updated_at": "2026-08-14T12:00:00.005Z",
+        }
+        state.write_bytes(reset_v2._canonical_bytes(quarantining_complete))
+        for stage, accepted in (
+            ("ready_to_quarantine", False),
+            ("quarantining", True),
+            ("original_quarantined", True),
+            ("installing_fresh", False),
+        ):
+            next_path.write_bytes(reset_v2._canonical_bytes({
+                **quarantining_complete,
+                "journal_sequence": (
+                    quarantining_complete["journal_sequence"] + 1
+                ),
+                "stage": stage,
+                "updated_at": "2026-08-14T12:00:00.006Z",
+            }))
+            if accepted:
+                self.assertEqual(
+                    reset_v2._select_legacy(
+                        self.root, token
+                    ).selected_path,
+                    next_path,
+                )
+            else:
+                with self.assertRaises(DatabaseResetError) as invalid_stage:
+                    reset_v2._select_legacy(self.root, token)
+                self.assertEqual(
+                    invalid_stage.exception.code, "reset_recovery_invalid"
+                )
+
+        finalizing = {
+            **journal,
+            "stage": "finalizing",
+            "updated_at": "2026-08-14T12:00:00.007Z",
+        }
+        state.write_bytes(reset_v2._canonical_bytes(finalizing))
+        next_path.write_bytes(reset_v2._canonical_bytes({
+            **finalizing,
+            "journal_sequence": finalizing["journal_sequence"] + 1,
+            "updated_at": "2026-08-14T12:00:00.008Z",
+        }))
+        self.assertEqual(
+            reset_v2._select_legacy(self.root, token).selected_path,
+            next_path,
+        )
 
         def incomplete(current: dict[str, object], stage: str) -> bytes:
             candidate = {
@@ -1779,6 +2099,22 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertEqual(self.status(), before_status)
         self.assertFalse((self.root / "data" / ".helios-room-reset-state.json").exists())
 
+    def test_reset_ignore_block_is_one_exact_committed_contract(self) -> None:
+        project_ignore = (
+            Path(__file__).parents[1] / ".gitignore"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(reset_module.IGNORE_BLOCK, reset_v2.IGNORE_BLOCK)
+        self.assertEqual(project_ignore.count(reset_v2.IGNORE_BLOCK), 1)
+        self.assertIn("/data/helios.db-journal\n", reset_v2.IGNORE_BLOCK)
+        head, evidence = reset_v2._git_evidence(
+            self.root, ["data/helios.db-journal"]
+        )
+        self.assertRegex(head, r"^[0-9a-f]{40}$")
+        self.assertEqual(
+            evidence["prospective_ignore"],
+            [{"ignored": True, "path": "data/helios.db-journal"}],
+        )
+
     def test_execution_configures_staging_before_evidence_and_holds_final_files(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
         manifest = plan["reviewed_plan_manifest"]
@@ -2047,17 +2383,36 @@ class ResetProtocolTests(unittest.TestCase):
             Path(f"{self.database}-journal"),
         ]
         self.assertTrue(all(not os.path.lexists(path) for path in sidecars))
-        with reset_v2._hold_active_sidecar_guards(
+        with patch(
+            "app.reset_database._windows_unlink_handle",
+            side_effect=AssertionError(
+                "delete-on-close guards must not use a second disposition"
+            ),
+        ) as disposition, reset_v2._hold_active_sidecar_guards(
             self.database, authority
         ) as guards:
             self.assertEqual(
                 [guard.name for guard in guards],
                 [path.name for path in sidecars],
             )
+            for guard in guards:
+                snapshot = reset_module._windows_handle_snapshot(
+                    guard.handle
+                )
+                self.assertIs(snapshot["delete_pending"], False)
+                self.assertEqual(snapshot["link_count"], 1)
+                self.assertEqual(
+                    snapshot["file_id"],
+                    guard.identity,
+                )
+                self.assertTrue(
+                    os.path.lexists(self.database.parent / guard.name)
+                )
             reset_v2._require_sidecar_guards(guards)
             for path in sidecars:
                 with self.assertRaises(OSError):
                     path.write_bytes(b"attacker")
+        disposition.assert_not_called()
         self.assertTrue(all(not os.path.lexists(path) for path in sidecars))
 
         for path in sidecars:
@@ -2074,6 +2429,214 @@ class ResetProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(path.read_bytes(), before)
                 path.unlink()
+
+    def test_sidecar_guard_ntcreate_is_atomic_delete_on_close(self) -> None:
+        high_handle = 0x1234567887654321
+
+        class NtCreate:
+            def __init__(self) -> None:
+                self.argtypes: object = None
+                self.restype: object = None
+                self.calls: list[tuple[object, ...]] = []
+
+            def __call__(self, *arguments: object) -> int:
+                self.calls.append(arguments)
+                arguments[0]._obj.value = high_handle
+                arguments[3]._obj.Information = 2
+                return 0
+
+        create = NtCreate()
+        with patch.object(
+            ctypes.windll.ntdll, "NtCreateFile", create
+        ):
+            returned = reset_module._windows_create_sidecar_guard(
+                0x1111222233334444,
+                "helios.db-wal",
+                collision_error="reset_recovery_invalid",
+            )
+        self.assertEqual(returned, high_handle)
+        self.assertEqual(len(create.calls), 1)
+        arguments = create.calls[0]
+        self.assertEqual(arguments[1], 0x00100000 | 0x00010000 | 0x00000080)
+        self.assertEqual(arguments[6], 0)
+        self.assertEqual(arguments[7], 2)
+        self.assertEqual(int(arguments[8]), 0x00201062)
+        self.assertEqual(arguments[3]._obj.Information, 2)
+        self.assertIs(create.restype, ctypes.c_long)
+        self.assertEqual(len(create.argtypes), 11)
+
+    def test_sidecar_guard_rejects_noncreated_nt_information(self) -> None:
+        high_handle = 0x1234567887654321
+
+        class NtCreate:
+            def __init__(self) -> None:
+                self.argtypes: object = None
+                self.restype: object = None
+
+            def __call__(self, *arguments: object) -> int:
+                arguments[0]._obj.value = high_handle
+                arguments[3]._obj.Information = 1
+                return 0
+
+        with patch.object(
+            ctypes.windll.ntdll, "NtCreateFile", NtCreate()
+        ), patch(
+            "app.reset_database._windows_close_after_mutation"
+        ) as close:
+            with self.assertRaises(DatabaseResetError) as failed:
+                reset_module._windows_create_sidecar_guard(
+                    0x1111222233334444,
+                    "helios.db-wal",
+                )
+        self.assertEqual(failed.exception.code, "reset_failed")
+        close.assert_called_once_with(high_handle)
+
+    def test_windows_delete_on_close_is_bound_to_original_guard_handle(self) -> None:
+        target = self.root / "data" / "synthetic-delete-on-close.guard"
+        authority = self.synthetic_durability(self.root)
+        handle = 0
+        with reset_module._verified_parent(target) as (
+            parent_handle,
+            _parent_identity,
+        ):
+            with patch(
+                "app.reset_database._windows_unlink_handle",
+                side_effect=AssertionError(
+                    "create-time delete-on-close needs no disposition"
+                ),
+            ) as disposition:
+                handle = reset_module._windows_create_sidecar_guard(
+                    parent_handle,
+                    target.name,
+                    collision_error="reset_recovery_invalid",
+                )
+                try:
+                    snapshot = reset_module._windows_handle_snapshot(handle)
+                    self.assertIs(snapshot["delete_pending"], False)
+                    self.assertEqual(snapshot["link_count"], 1)
+                    self.assertEqual(
+                        reset_module._windows_handle_mode(handle)
+                        & 0x00001000,
+                        0,
+                    )
+                    self.assertEqual(
+                        reset_module._windows_relative_entry_identity(
+                            parent_handle, target.name
+                        ),
+                        snapshot["file_id"],
+                    )
+                    self.assertIn(
+                        target.name,
+                        reset_module._windows_enumerate_directory_handle(
+                            parent_handle
+                        ),
+                    )
+                    self.assertTrue(os.path.lexists(target))
+                    with self.assertRaises(OSError):
+                        target.open("rb")
+                    with self.assertRaises(DatabaseResetError) as collision:
+                        reset_module._windows_create_sidecar_guard(
+                            parent_handle, target.name
+                        )
+                    self.assertEqual(
+                        collision.exception.code, "reset_recovery_invalid"
+                    )
+                finally:
+                    reset_module._windows_close_handle(handle)
+                    handle = 0
+                reset_v2._flush_namespace(authority, target.parent)
+                disposition.assert_not_called()
+        self.assertFalse(os.path.lexists(target))
+
+    def test_sidecar_guard_partial_creation_failures_leave_no_residue(self) -> None:
+        authority = self.synthetic_durability(self.root)
+        sidecars = [
+            Path(f"{self.database}-wal"),
+            Path(f"{self.database}-shm"),
+            Path(f"{self.database}-journal"),
+        ]
+        real_identity = reset_module._windows_relative_entry_identity
+        for failed_position in (1, 2, 3):
+            failed_name = sidecars[failed_position - 1].name
+            validated_names: list[str] = []
+
+            def fail_after_selected_creation(
+                parent_handle: int, name: str
+            ) -> str | None:
+                validated_names.append(name)
+                if name == failed_name:
+                    raise reset_v2._error("reset_failed")
+                return real_identity(parent_handle, name)
+
+            with self.subTest(position=failed_position), patch(
+                "app.reset_database._windows_relative_entry_identity",
+                side_effect=fail_after_selected_creation,
+            ), patch(
+                "app.reset_database._windows_unlink_handle",
+                side_effect=AssertionError(
+                    "atomic guards must never call disposition"
+                ),
+            ) as disposition:
+                with self.assertRaises(DatabaseResetError) as failed:
+                    with reset_v2._hold_active_sidecar_guards(
+                        self.database, authority
+                    ):
+                        self.fail("guard creation failure must prevent entry")
+                self.assertEqual(failed.exception.code, "reset_failed")
+                disposition.assert_not_called()
+            self.assertEqual(
+                validated_names,
+                [path.name for path in sidecars[:failed_position]],
+            )
+            self.assertTrue(
+                all(not os.path.lexists(path) for path in sidecars)
+            )
+
+    def test_sidecar_guard_namespace_flush_follows_every_handle_close(self) -> None:
+        authority = self.synthetic_durability(self.root)
+        sidecars = [
+            Path(f"{self.database}-wal"),
+            Path(f"{self.database}-shm"),
+            Path(f"{self.database}-journal"),
+        ]
+        real_create = reset_module._windows_create_sidecar_guard
+        guard_handles: list[int] = []
+        namespace_flushes = 0
+
+        def record_create(
+            parent_handle: int, name: str, **kwargs: object
+        ) -> int:
+            handle = real_create(parent_handle, name, **kwargs)
+            guard_handles.append(handle)
+            return handle
+
+        def require_closed(
+            _authority: dict[str, object], _directory: Path
+        ) -> None:
+            nonlocal namespace_flushes
+            namespace_flushes += 1
+            for handle in guard_handles:
+                with self.assertRaises(DatabaseResetError):
+                    reset_module._windows_handle_snapshot(handle)
+
+        with patch(
+            "app.reset_database._windows_create_sidecar_guard",
+            side_effect=record_create,
+        ), patch(
+            "app.reset_protocol_v2._flush_namespace",
+            side_effect=require_closed,
+        ):
+            with reset_v2._hold_active_sidecar_guards(
+                self.database, authority
+            ) as guards:
+                self.assertEqual(
+                    [guard.handle for guard in guards], guard_handles
+                )
+        self.assertEqual(namespace_flushes, 1)
+        self.assertEqual(len(guard_handles), 3)
+        self.assertTrue(
+            all(not os.path.lexists(path) for path in sidecars)
+        )
 
     def test_sidecar_guard_failure_precedes_every_quarantine_deletion(self) -> None:
         plan = plan_database_reset(
@@ -2637,6 +3200,142 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertEqual(report["status"], "prejournal_aborted")
         self.assertFalse(partials[0].exists())
 
+    def test_reviewed_plans_preserve_native_v2_historical_authority(self) -> None:
+        plan = plan_database_reset(
+            "data/helios.db", repository_root=self.root
+        )
+
+        def as_v2(implementation_commit: str) -> dict[str, object]:
+            value = json.loads(json.dumps(plan))
+            manifest = value["reviewed_plan_manifest"]
+            manifest["implementation_commit"] = implementation_commit
+            manifest["journal_version"] = (
+                reset_v2.NATIVE_V2_JOURNAL_VERSION
+            )
+            manifest["reset_protocol_version"] = (
+                reset_v2.NATIVE_V2_RESET_PROTOCOL_VERSION
+            )
+            token = reset_v2._sha256(
+                reset_v2._canonical_bytes(manifest)
+            )
+            value["implementation_commit"] = implementation_commit
+            value["plan_token"] = token
+            value["reset_protocol_version"] = (
+                reset_v2.NATIVE_V2_RESET_PROTOCOL_VERSION
+            )
+            return value
+
+        with tempfile.TemporaryDirectory(
+            dir=Path(__file__).parents[1]
+        ) as directory:
+            reviewed = Path(directory) / "reviewed-v2.json"
+            for historical_commit in sorted(
+                reset_v2.NATIVE_V2_RECOVERY_SOURCE_COMMITS
+            ):
+                with self.subTest(commit=historical_commit):
+                    historical_plan = as_v2(historical_commit)
+                    reviewed.write_bytes(
+                        reset_v2._canonical_bytes(historical_plan)
+                    )
+                    accepted = reset_v2._read_reviewed_plan(
+                        str(reviewed),
+                        historical_plan["plan_token"],
+                        plan["implementation_commit"],
+                        expected_journal_version=(
+                            reset_v2.NATIVE_V2_JOURNAL_VERSION
+                        ),
+                        expected_implementation_commit=historical_commit,
+                    )
+                    self.assertEqual(
+                        accepted["implementation_commit"],
+                        historical_commit,
+                    )
+                    dispatched = reset_v2._read_reviewed_plan(
+                        str(reviewed),
+                        historical_plan["plan_token"],
+                        plan["implementation_commit"],
+                    )
+                    self.assertEqual(dispatched, accepted)
+                    with self.assertRaises(DatabaseResetError) as wrong_v3:
+                        reset_v2._read_reviewed_plan(
+                            str(reviewed),
+                            historical_plan["plan_token"],
+                            plan["implementation_commit"],
+                            expected_journal_version=(
+                                reset_v2.JOURNAL_VERSION
+                            ),
+                            expected_implementation_commit=plan[
+                                "implementation_commit"
+                            ],
+                        )
+                    self.assertEqual(
+                        wrong_v3.exception.code, "reset_recovery_invalid"
+                    )
+
+            unlisted = as_v2("1" * 40)
+            reviewed.write_bytes(reset_v2._canonical_bytes(unlisted))
+            with self.assertRaises(DatabaseResetError) as invalid_commit:
+                reset_v2._read_reviewed_plan(
+                    str(reviewed),
+                    unlisted["plan_token"],
+                    plan["implementation_commit"],
+                )
+            self.assertEqual(
+                invalid_commit.exception.code, "reset_recovery_invalid"
+            )
+
+        with self.assertRaises(KeyboardInterrupt):
+            execute_database_reset(
+                "data/helios.db",
+                expected_plan_token=plan["plan_token"],
+                expected_backup_path=plan["backup_path"],
+                expected_audit_path=plan["audit_path"],
+                confirm_destroy_canonical_history=True,
+                repository_root=self.root,
+                crash_checkpoint=lambda reached: (
+                    (_ for _ in ()).throw(KeyboardInterrupt())
+                    if reached == "ready_to_quarantine" else None
+                ),
+            )
+        generation = next(
+            reset_v2._read_generation(path, partial=False)
+            for path in (self.root / "data").iterdir()
+            if reset_v2.GENERATION_RE.fullmatch(path.name)
+        )
+        historical_commit = sorted(
+            reset_v2.NATIVE_V2_RECOVERY_SOURCE_COMMITS
+        )[0]
+        token, native_v2 = self.rewrite_single_native_generation_as_v2(
+            generation, historical_commit
+        )
+        historical_plan = self.reviewed_plan_from_native_generation(
+            native_v2
+        )
+        partial = Path(f"{native_v2.path}.partial")
+        partial.write_bytes(native_v2.raw[: max(1, len(native_v2.raw) // 2)])
+        native_v2.path.unlink()
+        with tempfile.TemporaryDirectory(
+            dir=Path(__file__).parents[1]
+        ) as directory:
+            reviewed = Path(directory) / "reviewed-historical.json"
+            reviewed.write_bytes(
+                reset_v2._canonical_bytes(historical_plan)
+            )
+            report = recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="restore-source",
+                confirm_reset_recovery=True,
+                reviewed_plan_manifest=str(reviewed),
+                repository_root=self.root,
+            )
+        self.assertEqual(report["status"], "prejournal_aborted")
+        self.assertEqual(
+            report["reset_protocol_version"],
+            reset_v2.NATIVE_V2_RESET_PROTOCOL_VERSION,
+        )
+        self.assertFalse(partial.exists())
+
     def test_invalid_completed_generation_fails_closed_before_recovery_mutation(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
         with self.assertRaises(KeyboardInterrupt):
@@ -3144,6 +3843,99 @@ class ResetProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(audit["audit_version"], 2)
                 self.assertEqual(audit["fresh_database"], evidence)
+
+    def test_native_v3_fresh_matrix_is_closed_in_journals_chains_and_subsets(self) -> None:
+        plan, generations = self.crash_native_at("fresh_installed")
+        generations = sorted(generations, key=lambda item: item.sequence)
+        evidence = next(
+            item.envelope["journal"]["fresh_database"]
+            for item in generations
+            if item.envelope["journal"]["fresh_database"] is not None
+        )
+        base = dict(generations[0].envelope["journal"])
+        commit = plan["implementation_commit"]
+        installing_index = reset_v2.STAGES.index("installing_fresh")
+        for stage_index, stage in enumerate(reset_v2.STAGES):
+            for fresh in (None, evidence):
+                should_accept = (
+                    stage_index < installing_index and fresh is None
+                ) or (
+                    stage_index == installing_index
+                ) or (
+                    stage_index > installing_index and fresh is not None
+                )
+                candidate = {**base, "stage": stage, "fresh_database": fresh}
+                with self.subTest(stage=stage, fresh=fresh is not None):
+                    if should_accept:
+                        validated = reset_v2._validate_native_journal(
+                            candidate,
+                            plan["plan_token"],
+                            commit,
+                            candidate["journal_sequence"],
+                            journal_version=reset_v2.JOURNAL_VERSION,
+                        )
+                        self.assertEqual(validated["fresh_database"], fresh)
+                    else:
+                        with self.assertRaises(DatabaseResetError) as invalid:
+                            reset_v2._validate_native_journal(
+                                candidate,
+                                plan["plan_token"],
+                                commit,
+                                candidate["journal_sequence"],
+                                journal_version=reset_v2.JOURNAL_VERSION,
+                            )
+                        self.assertEqual(
+                            invalid.exception.code, "reset_recovery_invalid"
+                        )
+
+        terminal = generations[-1]
+        bad_envelope = json.loads(json.dumps(terminal.envelope))
+        self.assertEqual(
+            bad_envelope["journal"]["stage"], "fresh_installed"
+        )
+        bad_envelope["journal"]["fresh_database"] = None
+        bad_raw = reset_v2._canonical_bytes(bad_envelope)
+        bad_hash = reset_v2._sha256(bad_raw)
+        bad_terminal = reset_v2.Generation(
+            terminal.path,
+            terminal.partial,
+            terminal.token,
+            terminal.sequence,
+            bad_hash,
+            bad_envelope,
+            bad_raw,
+            terminal.identity,
+        )
+        with self.assertRaises(DatabaseResetError) as invalid_chain:
+            reset_v2._validate_chain(
+                [*generations[:-1], bad_terminal],
+                plan["plan_token"],
+                commit,
+            )
+        self.assertEqual(
+            invalid_chain.exception.code, "reset_recovery_invalid"
+        )
+
+        hashes = [item.content_hash for item in generations]
+        hashes[-1] = bad_hash
+        store = reset_v2._store_from_chain(
+            self.root, [bad_terminal], hashes
+        )
+        audit = reset_v2._native_audit_value(
+            store, bad_envelope["journal"], "reset", "1.4"
+        )
+        audit_path = self.root / bad_envelope["journal"]["audit_path"]
+        audit_path.write_bytes(reset_v2._canonical_bytes(audit))
+        with self.assertRaises(DatabaseResetError) as invalid_subset:
+            reset_v2._validate_terminal_subset(
+                self.root,
+                [bad_terminal],
+                plan["plan_token"],
+                commit,
+            )
+        self.assertEqual(
+            invalid_subset.exception.code, "reset_recovery_invalid"
+        )
 
     def test_complete_fresh_recovers_from_interrupted_audit_write(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)

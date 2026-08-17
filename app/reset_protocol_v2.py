@@ -867,16 +867,18 @@ def _require_sidecar_guards(guards: list[_SidecarGuard]) -> None:
     if len(guards) != 3:
         raise _error("reset_failed")
     for guard in guards:
-        snapshot = legacy._windows_handle_snapshot(guard.handle)
-        if (
-            snapshot["file_id"] != guard.identity
-            or snapshot["directory"]
-            or not snapshot["delete_pending"]
-            or snapshot["end_of_file"] != 0
-            or snapshot["link_count"] != 0
-            or snapshot["reparse_tag"] != 0
-        ):
-            raise _error("reset_failed")
+        try:
+            snapshot = legacy._windows_handle_snapshot(guard.handle)
+            if (
+                snapshot["file_id"] != guard.identity
+                or snapshot["directory"]
+                or snapshot["end_of_file"] != 0
+                or snapshot["link_count"] != 1
+                or snapshot["reparse_tag"] != 0
+            ):
+                raise _error("reset_failed")
+        except legacy.DatabaseResetError as error:
+            raise _error("reset_failed") from error
 
 
 @contextmanager
@@ -887,52 +889,63 @@ def _hold_active_sidecar_guards(
 
     names = [f"{database.name}-wal", f"{database.name}-shm", f"{database.name}-journal"]
     guards: list[_SidecarGuard] = []
+    created_names: list[str] = []
     with legacy._verified_parent(database) as (parent_handle, parent_identity):
         legacy._revalidate_parent(database, parent_identity)
-        present = {
-            name.casefold()
-            for name in legacy._windows_enumerate_directory_handle(parent_handle)
-        }
+        try:
+            present = {
+                name.casefold()
+                for name in legacy._windows_enumerate_directory_handle(
+                    parent_handle
+                )
+            }
+        except legacy.DatabaseResetError as error:
+            raise _error("reset_failed") from error
         if any(name.casefold() in present for name in names):
             raise _error("reset_recovery_invalid")
         try:
             for name in names:
                 try:
-                    handle = legacy._windows_create_relative(
+                    handle = legacy._windows_create_sidecar_guard(
                         parent_handle,
                         name,
-                        directory=False,
-                        create_new=True,
-                        desired_access=(
-                            0x00100000 | 0x00010000 | 0x00000080
-                        ),
-                        share_access=0,
                         collision_error="reset_recovery_invalid",
                     )
                 except legacy.DatabaseResetError as error:
                     if error.code == "reset_recovery_invalid":
                         raise
                     raise _error("reset_failed") from error
+                created_names.append(name)
                 try:
-                    legacy._windows_validate_handle(handle, directory=False)
                     snapshot = legacy._windows_handle_snapshot(handle)
                     identity = legacy._windows_handle_identity(handle)
                     if (
                         snapshot["file_id"] != identity
                         or snapshot["directory"]
-                        or snapshot["delete_pending"]
                         or snapshot["end_of_file"] != 0
                         or snapshot["link_count"] != 1
                         or snapshot["reparse_tag"] != 0
                         or identity.split(":")[1]
                         != parent_identity.split(":")[1]
+                        or legacy._windows_relative_entry_identity(
+                            parent_handle, name
+                        )
+                        != identity
+                        or name
+                        not in legacy._windows_enumerate_directory_handle(
+                            parent_handle
+                        )
                     ):
                         raise _error("reset_failed")
-                    legacy._windows_unlink_handle(handle)
                     guards.append(_SidecarGuard(name, handle, identity))
-                except BaseException:
-                    legacy._windows_close_handle(handle)
-                    raise
+                except BaseException as error:
+                    try:
+                        legacy._windows_close_handle(handle)
+                    except BaseException as close_error:
+                        raise _error("reset_failed") from close_error
+                    if not isinstance(error, Exception):
+                        raise
+                    raise _error("reset_failed") from error
             _require_sidecar_guards(guards)
             yield guards
         finally:
@@ -950,7 +963,9 @@ def _hold_active_sidecar_guards(
                         parent_handle
                     )
                 }
-                if any(name.casefold() in remaining for name in names):
+                if any(
+                    name.casefold() in remaining for name in created_names
+                ):
                     raise _error("reset_failed")
             except BaseException as error:
                 cleanup_error = cleanup_error or error
@@ -1391,6 +1406,26 @@ def _validate_fresh_database(value: Any, database_path: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _validate_native_v3_fresh_stage(
+    stage: Any, fresh_database: Any, database_path: Any
+) -> dict[str, Any] | None:
+    """Apply the closed native-v3 stage/evidence matrix."""
+
+    if stage not in STAGES or not isinstance(database_path, str):
+        raise _error("reset_recovery_invalid")
+    stage_index = STAGES.index(stage)
+    installing_index = STAGES.index("installing_fresh")
+    if stage_index < installing_index:
+        if fresh_database is not None:
+            raise _error("reset_recovery_invalid")
+        return None
+    if stage_index > installing_index and fresh_database is None:
+        raise _error("reset_recovery_invalid")
+    if fresh_database is None:
+        return None
+    return _validate_fresh_database(fresh_database, database_path)
+
+
 def _require_wal_header(
     control: _ControlPartial, *, recovery: bool
 ) -> None:
@@ -1460,11 +1495,11 @@ def _validate_native_journal(
     ):
         raise _error("reset_recovery_invalid")
     if journal_version == JOURNAL_VERSION:
-        fresh_database = candidate["fresh_database"]
-        if fresh_database is not None:
-            _validate_fresh_database(
-                fresh_database, candidate.get("database_path")
-            )
+        _validate_native_v3_fresh_stage(
+            candidate.get("stage"),
+            candidate["fresh_database"],
+            candidate.get("database_path"),
+        )
     compatibility = dict(candidate)
     compatibility.pop("fresh_database", None)
     compatibility["journal_version"] = 1
@@ -1924,6 +1959,11 @@ def _validate_chain(generations: list[Generation], expected_token: str, current_
                 raise _error("reset_recovery_invalid")
             if origin == "native_v3":
                 fresh = envelope["journal"]["fresh_database"]
+                _validate_native_v3_fresh_stage(
+                    envelope["journal"]["stage"],
+                    fresh,
+                    envelope["journal"]["database_path"],
+                )
                 if fresh is not None:
                     _validate_fresh_database(
                         fresh, envelope["journal"]["database_path"]
@@ -2066,6 +2106,11 @@ def _validate_terminal_subset(
                 raise _error("reset_recovery_invalid")
             if origin == "native_v3":
                 fresh = envelope["journal"]["fresh_database"]
+                _validate_native_v3_fresh_stage(
+                    envelope["journal"]["stage"],
+                    fresh,
+                    envelope["journal"]["database_path"],
+                )
                 if fresh is not None:
                     _validate_fresh_database(fresh, journal["database_path"])
                     if retained_fresh is None:
@@ -2382,7 +2427,6 @@ def _promote_open_control(
     if final.parent != control.path.parent:
         raise _error("reset_path_unsafe")
     try:
-        legacy._windows_flush_file_handle(control.handle)
         if expected_raw is not None:
             if _control_bytes(control) != expected_raw:
                 raise _error("reset_recovery_invalid")
@@ -2391,6 +2435,7 @@ def _promote_open_control(
             content_hash = _control_sha256(control)
         if expected_sha256 is not None and content_hash != expected_sha256:
             raise _error("reset_recovery_invalid")
+        legacy._windows_flush_file_handle(control.handle)
         if crash_checkpoint is not None and checkpoint_prefix is not None:
             crash_checkpoint(f"{checkpoint_prefix}:generation_file_durable")
             crash_checkpoint(f"{checkpoint_prefix}:generation_before_promotion")
@@ -2414,6 +2459,13 @@ def _promote_open_control(
             legacy._relative_entry_identity(final, control.parent_handle)
             != control.identity
         ):
+            raise _error("reset_failed")
+        if expected_raw is not None:
+            if _control_bytes(control) != expected_raw:
+                raise _error("reset_failed")
+        elif _control_sha256(control) != content_hash:
+            raise _error("reset_failed")
+        if expected_sha256 is not None and content_hash != expected_sha256:
             raise _error("reset_failed")
     except legacy.DatabaseResetError as error:
         if error.code == "reset_failed":
@@ -2450,10 +2502,8 @@ def _promote_validated_json_control(
     control: _ControlPartial,
     final: Path,
     expected_raw: bytes,
-    authority: dict[str, Any],
 ) -> None:
     _promote_open_control(control, final, expected_raw)
-    _flush_namespace(authority, final.parent)
 
 
 @dataclass(frozen=True)
@@ -2866,6 +2916,7 @@ def _install_terminal_audit(
     promoted = False
     if os.path.lexists(partial):
         canonical_invalid = False
+        promoted = False
         with _open_control_partial(partial, create_new=False) as control:
             try:
                 partial_value, partial_raw = _read_canonical_control(control)
@@ -2884,10 +2935,11 @@ def _install_terminal_audit(
                     control,
                     audit,
                     partial_raw,
-                    store.authority,
                 )
                 promoted = True
-        if canonical_invalid:
+        if promoted:
+            _flush_namespace(store.authority, audit.parent)
+        elif canonical_invalid:
             partial_identity = legacy._path_identity(partial)
             _unlink_verified(partial, partial_identity)
             _flush_namespace(store.authority, partial.parent)
@@ -3480,10 +3532,16 @@ def _select_legacy(root: Path, expected_token: str) -> LegacySelection:
     if "journal" in valid:
         selected = "journal"
         if "next" in valid:
+            current_stage_index = STAGES.index(valid["journal"]["stage"])
+            next_stage_index = STAGES.index(valid["next"]["stage"])
             if (
                 valid["next"]["journal_sequence"]
                 != valid["journal"]["journal_sequence"] + 1
                 or valid["next"]["plan_token"] != valid["journal"]["plan_token"]
+                or next_stage_index not in {
+                    current_stage_index,
+                    min(current_stage_index + 1, len(STAGES) - 1),
+                }
             ):
                 raise _error("reset_recovery_invalid")
             selected = "next"
@@ -3800,6 +3858,8 @@ def _handle_evidence_state(
             final = Path(str(path)[:-len(GENERATION_PARTIAL_SUFFIX)])
             if not os.path.lexists(final):
                 parsed = False
+                promoted_record: EvidenceRecord | None = None
+                promoted_authority: dict[str, Any] | None = None
                 with _open_control_partial(path, create_new=False) as control:
                     try:
                         value, raw = _read_canonical_control(control)
@@ -3839,9 +3899,9 @@ def _handle_evidence_state(
                             + [path.name],
                         )
                         _promote_validated_json_control(
-                            control, final, raw, authority
+                            control, final, raw
                         )
-                        return _evidence_record_from_canonical(
+                        promoted_record = _evidence_record_from_canonical(
                             final,
                             partial=False,
                             expected_token=expected_token,
@@ -3849,7 +3909,13 @@ def _handle_evidence_state(
                             value=value,
                             raw=raw,
                             identity=control.identity,
-                        ), authority
+                        )
+                        promoted_authority = authority
+                if promoted_record is not None:
+                    if promoted_authority is None:
+                        raise _error("reset_failed")
+                    _flush_namespace(promoted_authority, final.parent)
+                    return promoted_record, promoted_authority
                 if parsed:
                     raise _error("reset_recovery_invalid")
             try:
@@ -3957,7 +4023,7 @@ def _handle_evidence_state(
                     ):
                         raise _error("reset_recovery_invalid")
                     _promote_validated_json_control(
-                        control, final, raw, authority
+                        control, final, raw
                     )
                     installed = _evidence_record_from_canonical(
                         final,
@@ -3968,6 +4034,7 @@ def _handle_evidence_state(
                         raw=raw,
                         identity=control.identity,
                     )
+                _flush_namespace(authority, final.parent)
                 return installed, authority
         record = _validate_evidence_record_for_recovery(
             path, partial=False, expected_token=expected_token,
@@ -4023,6 +4090,7 @@ def _promote_or_rebuild_legacy_generation_partial(
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
     raw: bytes
     identity: str
+    installed: Generation | None = None
     with _open_control_partial(partial, create_new=False) as control:
         raw = _control_bytes(control)
         identity = control.identity
@@ -4038,7 +4106,7 @@ def _promote_or_rebuild_legacy_generation_partial(
             if generation.raw != raw or generation.identity != identity:
                 raise _error("reset_recovery_invalid")
             _promote_validated_json_control(
-                control, final, retained_raw, store.authority
+                control, final, retained_raw
             )
             installed = _generation_from_canonical(
                 final,
@@ -4047,9 +4115,11 @@ def _promote_or_rebuild_legacy_generation_partial(
                 raw=retained_raw,
                 identity=control.identity,
             )
-            store.generations.append(installed)
-            store.chain_hashes.append(installed.content_hash)
-            return
+    if installed is not None:
+        _flush_namespace(store.authority, final.parent)
+        store.generations.append(installed)
+        store.chain_hashes.append(installed.content_hash)
+        return
     if len(raw) >= len(expected_raw) or expected_raw[:len(raw)] != raw:
         raise _error("reset_recovery_invalid")
     # Exact Revision 2.6 strict-prefix basename reuse exception.
@@ -4198,9 +4268,12 @@ def _install_legacy_chain_manifest(store: GenerationStore, journal: dict[str, An
                 if existing != value:
                     raise _error("reset_recovery_invalid")
                 _promote_validated_json_control(
-                    control, path, partial_raw, store.authority
+                    control, path, partial_raw
                 )
-                return path
+                promoted = True
+        if promoted:
+            _flush_namespace(store.authority, path.parent)
+            return path
         if canonical_invalid:
             identity, partial_raw = _read_exact_prefix(
                 partial, _canonical_bytes(value)
@@ -4478,6 +4551,7 @@ def _promote_terminal_audit_partial(
     if os.path.lexists(audit) or not os.path.lexists(partial):
         return None
     canonical_invalid = False
+    promoted_value: dict[str, Any] | None = None
     with _open_control_partial(partial, create_new=False) as control:
         try:
             value, raw = _read_canonical_control(control)
@@ -4493,9 +4567,12 @@ def _promote_terminal_audit_partial(
             if value["outcome"] != expected_outcome:
                 raise _error("reset_recovery_invalid")
             _promote_validated_json_control(
-                control, audit, raw, store.authority
+                control, audit, raw
             )
-            return value
+            promoted_value = value
+    if promoted_value is not None:
+        _flush_namespace(store.authority, audit.parent)
+        return promoted_value
     if canonical_invalid:
         _unlink_verified(partial, legacy._path_identity(partial))
         _flush_namespace(store.authority, partial.parent)
@@ -4766,7 +4843,12 @@ def _open_reviewed_plan_handle(path: Path) -> int:
 
 
 def _read_reviewed_plan(
-    path_value: str, expected_token: str, current_commit: str
+    path_value: str,
+    expected_token: str,
+    current_commit: str,
+    *,
+    expected_journal_version: int | None = None,
+    expected_implementation_commit: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(path_value, str):
         raise _error("reset_recovery_invalid")
@@ -4845,8 +4927,44 @@ def _read_reviewed_plan(
         if handle:
             legacy._windows_close_handle(handle)
     value = _load_canonical(b"".join(chunks))
-    plan = _validate_plan(value, expected_token=expected_token)
-    if plan["implementation_commit"] != current_commit:
+    if not isinstance(value, dict):
+        raise _error("reset_recovery_invalid")
+    manifest = value.get("reviewed_plan_manifest")
+    if not isinstance(manifest, dict):
+        raise _error("reset_recovery_invalid")
+    candidate_version = manifest.get("journal_version")
+    journal_version = (
+        candidate_version
+        if expected_journal_version is None
+        else expected_journal_version
+    )
+    if journal_version not in {
+        NATIVE_V2_JOURNAL_VERSION, JOURNAL_VERSION
+    }:
+        raise _error("reset_recovery_invalid")
+    plan = _validate_plan(
+        value,
+        expected_token=expected_token,
+        expected_journal_version=journal_version,
+    )
+    plan_commit = plan["implementation_commit"]
+    if journal_version == JOURNAL_VERSION:
+        implementation_authority = current_commit
+    else:
+        implementation_authority = (
+            plan_commit
+            if expected_implementation_commit is None
+            else expected_implementation_commit
+        )
+        if implementation_authority not in NATIVE_V2_RECOVERY_SOURCE_COMMITS:
+            raise _error("reset_recovery_invalid")
+    if (
+        plan_commit != implementation_authority
+        or (
+            expected_implementation_commit is not None
+            and plan_commit != expected_implementation_commit
+        )
+    ):
         raise _error("reset_recovery_invalid")
     return plan
 
@@ -4885,6 +5003,8 @@ def _handle_native_partial_only(
     ):
         raise _error("reset_recovery_invalid")
     canonical_complete = False
+    promoted_complete: Generation | None = None
+    promoted_authority: dict[str, Any] | None = None
     try:
         with _open_control_partial(partial, create_new=False) as control:
             value, raw = _read_canonical_control(control)
@@ -4919,15 +5039,20 @@ def _handle_native_partial_only(
             ]["durability"]
             _revalidate_persisted_authority(root, authority)
             _promote_validated_json_control(
-                control, final, raw, authority
+                control, final, raw
             )
-            return _generation_from_canonical(
+            promoted_complete = _generation_from_canonical(
                 final,
                 partial=False,
                 value=value,
                 raw=raw,
                 identity=control.identity,
             )
+            promoted_authority = authority
+        if promoted_complete is None or promoted_authority is None:
+            raise _error("reset_failed")
+        _flush_namespace(promoted_authority, final.parent)
+        return promoted_complete
     except legacy.DatabaseResetError as error:
         if canonical_complete:
             raise
@@ -4937,7 +5062,9 @@ def _handle_native_partial_only(
             raise error
         if reviewed_plan_manifest is None:
             raise _error("reset_recovery_invalid")
-        plan = _read_reviewed_plan(reviewed_plan_manifest, expected_token, current_commit)
+        plan = _read_reviewed_plan(
+            reviewed_plan_manifest, expected_token, current_commit
+        )
         manifest = plan["reviewed_plan_manifest"]
         authority = _revalidate_persisted_authority(root, manifest["durability"])
         database = root / "data/helios.db"
@@ -4992,7 +5119,7 @@ def _handle_native_partial_only(
         return {
             "database_path": "data/helios.db",
             "plan_token": expected_token,
-            "reset_protocol_version": RESET_PROTOCOL_VERSION,
+            "reset_protocol_version": manifest["reset_protocol_version"],
             "status": "prejournal_aborted",
         }
 def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
@@ -5032,6 +5159,7 @@ def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
     canonical_complete = False
     canonical_error: legacy.DatabaseResetError | None = None
+    installed: Generation | None = None
     with _open_control_partial(partial, create_new=False) as control:
         try:
             value, raw = _read_canonical_control(control)
@@ -5052,7 +5180,7 @@ def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
             ):
                 raise _error("reset_recovery_invalid")
             _promote_validated_json_control(
-                control, final, raw, store.authority
+                control, final, raw
             )
             installed = _generation_from_canonical(
                 final,
@@ -5061,9 +5189,11 @@ def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
                 raw=raw,
                 identity=control.identity,
             )
-            store.generations.append(installed)
-            store.chain_hashes.append(installed.content_hash)
-            return
+    if installed is not None:
+        _flush_namespace(store.authority, final.parent)
+        store.generations.append(installed)
+        store.chain_hashes.append(installed.content_hash)
+        return
     if canonical_complete:
         raise _error("reset_recovery_invalid")
     filename_digest = match.group(3)
@@ -5108,7 +5238,15 @@ def recover_database_reset(
             if store.origin == "legacy_v1_conversion" and reviewed_plan_manifest is not None:
                 raise _error("reset_recovery_invalid")
             if store.origin in {"native_v2", "native_v3"} and reviewed_plan_manifest is not None:
-                supplied = _read_reviewed_plan(reviewed_plan_manifest, expected_plan_token, current_commit)
+                supplied = _read_reviewed_plan(
+                    reviewed_plan_manifest,
+                    expected_plan_token,
+                    current_commit,
+                    expected_journal_version=store.journal_version,
+                    expected_implementation_commit=store.journal[
+                        "implementation_commit"
+                    ],
+                )
                 if supplied["reviewed_plan_manifest"] != store.reviewed_plan_manifest:
                     raise _error("reset_recovery_invalid")
             if store.origin == "legacy_v1_conversion":
