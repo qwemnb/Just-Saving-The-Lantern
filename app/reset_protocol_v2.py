@@ -4709,6 +4709,12 @@ def _complete_fresh_v2(
     database = store.root / journal["database_path"]
     backup = store.root / journal["backup"]["path"]
     _active, quarantines, _failed, _restoring = _operational_paths(store, journal)
+    entered_finalizing = journal["stage"] == "finalizing"
+    if entered_finalizing and any(
+        path is not None and os.path.lexists(path)
+        for path in quarantines.values()
+    ):
+        raise _error("reset_recovery_invalid")
     with _hold_file_identity_hash(
         backup,
         journal["backup"]["identity"],
@@ -4760,12 +4766,13 @@ def _complete_fresh_v2(
             _require_control_evidence(held_backup, backup_evidence)
             _require_control_evidence(held_fresh, fresh_evidence)
             _require_sidecar_guards(guards)
-            store.append(
-                journal,
-                "finalizing",
-                crash_checkpoint,
-                "recovery:fresh_audit",
-            )
+            if not entered_finalizing:
+                store.append(
+                    journal,
+                    "finalizing",
+                    crash_checkpoint,
+                    "recovery:fresh_audit",
+                )
             _install_terminal_audit(
                 store, journal, "reset", "1.4", crash_checkpoint
             )

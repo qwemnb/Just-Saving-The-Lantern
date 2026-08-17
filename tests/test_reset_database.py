@@ -3971,6 +3971,98 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertEqual(report["status"], "reset")
         self.assertFalse(partial.exists())
 
+    def test_finalizing_with_remaining_quarantine_fails_before_mutation(self) -> None:
+        plan, generations = self.crash_native_at("finalizing")
+        terminal = generations[-1]
+        journal = terminal.envelope["journal"]
+        self.assertEqual(journal["stage"], "finalizing")
+        quarantine = next(
+            self.root / value["path"]
+            for value in journal["quarantine"].values()
+            if value is not None
+        )
+        quarantine.write_bytes(b"hostile remaining quarantine")
+
+        def snapshot() -> dict[str, bytes]:
+            return {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for parent in (self.root / "data", self.root / "backups")
+                for path in parent.rglob("*")
+                if path.is_file()
+                and path.name != ".helios-room-database.lock"
+            }
+
+        before = snapshot()
+        with patch.object(
+            reset_v2.GenerationStore,
+            "append",
+            side_effect=AssertionError("generation append forbidden"),
+        ) as append, patch(
+            "app.reset_protocol_v2._unlink_verified",
+            side_effect=AssertionError("quarantine deletion forbidden"),
+        ) as unlink, patch(
+            "app.reset_protocol_v2._install_terminal_audit",
+            side_effect=AssertionError("audit installation forbidden"),
+        ) as install, patch(
+            "app.reset_protocol_v2._hold_active_sidecar_guards",
+            side_effect=AssertionError("sidecar mutation forbidden"),
+        ) as sidecars:
+            with self.assertRaises(DatabaseResetError) as invalid:
+                recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=plan["plan_token"],
+                    action="complete-fresh",
+                    confirm_reset_recovery=True,
+                    repository_root=self.root,
+                )
+        self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+        append.assert_not_called()
+        unlink.assert_not_called()
+        install.assert_not_called()
+        sidecars.assert_not_called()
+        self.assertEqual(snapshot(), before)
+
+    def test_finalizing_promotes_complete_audit_partial_without_generation_append(self) -> None:
+        plan, generations = self.crash_native_at("finalizing")
+        store = reset_v2._store_from_chain(self.root, generations)
+        journal = store.journal
+        self.assertEqual(journal["stage"], "finalizing")
+        audit = self.root / plan["audit_path"]
+        partial = Path(f"{audit}.partial")
+        value = reset_v2._native_audit_value(
+            store, journal, "reset", "1.4"
+        )
+        raw = reset_v2._canonical_bytes(value)
+        partial.write_bytes(raw)
+        chain_hashes = store.hashes()
+        real_promote = reset_v2._promote_validated_json_control
+
+        with patch.object(
+            reset_v2.GenerationStore,
+            "append",
+            side_effect=AssertionError("generation append forbidden"),
+        ) as append, patch(
+            "app.reset_protocol_v2._write_and_install_json",
+            side_effect=AssertionError("audit rewrite forbidden"),
+        ) as rewrite, patch(
+            "app.reset_protocol_v2._promote_validated_json_control",
+            wraps=real_promote,
+        ) as promote:
+            report = recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=plan["plan_token"],
+                action="complete-fresh",
+                confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
+        self.assertEqual(report["status"], "reset")
+        append.assert_not_called()
+        rewrite.assert_not_called()
+        promote.assert_called_once()
+        self.assertFalse(partial.exists())
+        self.assertEqual(audit.read_bytes(), raw)
+        self.assertEqual(value["generation_chain_sha256"], chain_hashes)
+
     def test_recovery_schema_failure_is_sanitized_not_name_error(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
         with self.assertRaises(KeyboardInterrupt):
