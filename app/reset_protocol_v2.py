@@ -1,4 +1,4 @@
-"""Windows-only immutable reset-control protocol (Revisions 2.4 through 2.10).
+"""Windows-only immutable reset-control protocol (Revisions 2.4 through 2.17).
 
 This module deliberately contains only reset planning/execution/recovery code.
 Ordinary runtime interlocking remains in :mod:`app.maintenance_lock` and is
@@ -31,14 +31,40 @@ from .schema_validation import SchemaValidationError, validate_database_integrit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RESET_PROTOCOL_VERSION = "room_shared_reset_v2"
+RESET_PROTOCOL_VERSION = "room_shared_reset_v3"
+NATIVE_V2_RESET_PROTOCOL_VERSION = "room_shared_reset_v2"
 LEGACY_RESET_PROTOCOL_VERSION = "room_shared_reset_v1"
-JOURNAL_VERSION = 2
+JOURNAL_VERSION = 3
+NATIVE_V2_JOURNAL_VERSION = 2
+NATIVE_AUDIT_VERSION = 2
 GENERATION_VERSION = 1
 JOURNAL_STORAGE_PROTOCOL_VERSION = "immutable_generation_v1"
 MAXIMUM_GENERATION_COUNT = 4096
 LEGACY_V1_IMPLEMENTATION_COMMITS = {
     "d9d9717b4e882c19ef41e44a6f0c63fc062de41a"
+}
+NATIVE_V2_RECOVERY_SOURCE_COMMITS = {
+    "af0df4698b66b5c55c73ea9f5e2d50e6f5f72f4c",
+    "ada4c28d675d2f0c7bfb551fe3b4f7b2b37cd63e",
+    "f0939b6ad84f61cdb7a18d9a42db4c9361d8ce54",
+    "af6809988a8dbbcff20d3a7f27deffc031d4cd3b",
+}
+LEGACY_CONVERSION_RECOVERY_COMMITS = {
+    "af0df4698b66b5c55c73ea9f5e2d50e6f5f72f4c",
+    "ada4c28d675d2f0c7bfb551fe3b4f7b2b37cd63e",
+    "f0939b6ad84f61cdb7a18d9a42db4c9361d8ce54",
+    "af6809988a8dbbcff20d3a7f27deffc031d4cd3b",
+}
+NATIVE_JOURNAL_FIELDS_V3 = {
+    "audit_path", "backup", "database_path", "fresh_database",
+    "implementation_commit", "journal_sequence", "journal_version",
+    "logical_digest", "plan_manifest_sha256", "plan_token", "quarantine",
+    "recovery_commit", "reset_protocol_version", "source_files",
+    "source_observations", "source_schema_label", "stage", "updated_at",
+}
+FRESH_DATABASE_FIELDS = {
+    "identity", "journal_mode", "logical_digest", "path", "schema_label",
+    "sha256", "size",
 }
 GENERATION_FILENAME_REGEX = (
     r"^\.helios-room-reset-state\.([0-9a-f]{64})\.g"
@@ -67,6 +93,7 @@ IGNORE_BLOCK = """# Helios Room database and reset artifacts
 /data/helios.db
 /data/helios.db-wal
 /data/helios.db-shm
+/data/helios.db-journal
 /data/.helios-room-database.lock
 /data/.helios-room-reset-state.json
 /data/.helios-room-reset-state.json.next
@@ -829,6 +856,110 @@ def _hold_validated_sqlite_file(
         os.close(descriptor)
 
 
+@dataclass(frozen=True)
+class _SidecarGuard:
+    name: str
+    handle: int
+    identity: str
+
+
+def _require_sidecar_guards(guards: list[_SidecarGuard]) -> None:
+    if len(guards) != 3:
+        raise _error("reset_failed")
+    for guard in guards:
+        snapshot = legacy._windows_handle_snapshot(guard.handle)
+        if (
+            snapshot["file_id"] != guard.identity
+            or snapshot["directory"]
+            or not snapshot["delete_pending"]
+            or snapshot["end_of_file"] != 0
+            or snapshot["link_count"] != 0
+            or snapshot["reparse_tag"] != 0
+        ):
+            raise _error("reset_failed")
+
+
+@contextmanager
+def _hold_active_sidecar_guards(
+    database: Path, authority: dict[str, Any]
+):
+    """Reserve the exact SQLite sidecar namespace through destructive cleanup."""
+
+    names = [f"{database.name}-wal", f"{database.name}-shm", f"{database.name}-journal"]
+    guards: list[_SidecarGuard] = []
+    with legacy._verified_parent(database) as (parent_handle, parent_identity):
+        legacy._revalidate_parent(database, parent_identity)
+        present = {
+            name.casefold()
+            for name in legacy._windows_enumerate_directory_handle(parent_handle)
+        }
+        if any(name.casefold() in present for name in names):
+            raise _error("reset_recovery_invalid")
+        try:
+            for name in names:
+                try:
+                    handle = legacy._windows_create_relative(
+                        parent_handle,
+                        name,
+                        directory=False,
+                        create_new=True,
+                        desired_access=(
+                            0x00100000 | 0x00010000 | 0x00000080
+                        ),
+                        share_access=0,
+                        collision_error="reset_recovery_invalid",
+                    )
+                except legacy.DatabaseResetError as error:
+                    if error.code == "reset_recovery_invalid":
+                        raise
+                    raise _error("reset_failed") from error
+                try:
+                    legacy._windows_validate_handle(handle, directory=False)
+                    snapshot = legacy._windows_handle_snapshot(handle)
+                    identity = legacy._windows_handle_identity(handle)
+                    if (
+                        snapshot["file_id"] != identity
+                        or snapshot["directory"]
+                        or snapshot["delete_pending"]
+                        or snapshot["end_of_file"] != 0
+                        or snapshot["link_count"] != 1
+                        or snapshot["reparse_tag"] != 0
+                        or identity.split(":")[1]
+                        != parent_identity.split(":")[1]
+                    ):
+                        raise _error("reset_failed")
+                    legacy._windows_unlink_handle(handle)
+                    guards.append(_SidecarGuard(name, handle, identity))
+                except BaseException:
+                    legacy._windows_close_handle(handle)
+                    raise
+            _require_sidecar_guards(guards)
+            yield guards
+        finally:
+            cleanup_error: BaseException | None = None
+            for guard in reversed(guards):
+                try:
+                    legacy._windows_close_handle(guard.handle)
+                except BaseException as error:
+                    cleanup_error = cleanup_error or error
+            try:
+                _flush_namespace(authority, database.parent)
+                remaining = {
+                    name.casefold()
+                    for name in legacy._windows_enumerate_directory_handle(
+                        parent_handle
+                    )
+                }
+                if any(name.casefold() in remaining for name in names):
+                    raise _error("reset_failed")
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+            if cleanup_error is not None:
+                if isinstance(cleanup_error, legacy.DatabaseResetError):
+                    raise _error("reset_failed") from cleanup_error
+                raise _error("reset_failed") from cleanup_error
+
+
 def _rmdir_verified(path: Path, identity: str) -> None:
     try:
         legacy._rmdir_verified(path, identity, flush_parent=False)
@@ -1038,7 +1169,12 @@ def _valid_volume_guid(value: Any) -> bool:
     ) is not None
 
 
-def _validate_plan(value: Any, *, expected_token: str | None = None) -> dict[str, Any]:
+def _validate_plan(
+    value: Any,
+    *,
+    expected_token: str | None = None,
+    expected_journal_version: int = JOURNAL_VERSION,
+) -> dict[str, Any]:
     top = {
         "audit_path", "backup_path", "database_identity", "database_path",
         "database_sha256", "implementation_commit",
@@ -1135,15 +1271,18 @@ def _validate_plan(value: Any, *, expected_token: str | None = None) -> dict[str
     if manifest.get("path_absence") != expected_absence:
         raise _error("reset_recovery_invalid")
     token = _sha256(_canonical_bytes(manifest))
+    expected_protocol = _native_protocol_for_version(
+        expected_journal_version
+    )
     if (
         value["status"] != "planned"
         or value["database_path"] != "data/helios.db"
-        or value["reset_protocol_version"] != RESET_PROTOCOL_VERSION
+        or value["reset_protocol_version"] != expected_protocol
         or value["journal_storage_protocol_version"] != JOURNAL_STORAGE_PROTOCOL_VERSION
-        or manifest["reset_protocol_version"] != RESET_PROTOCOL_VERSION
+        or manifest["reset_protocol_version"] != expected_protocol
         or manifest["journal_storage_protocol_version"] != JOURNAL_STORAGE_PROTOCOL_VERSION
         or type(manifest["journal_version"]) is not int
-        or manifest["journal_version"] != JOURNAL_VERSION
+        or manifest["journal_version"] != expected_journal_version
         or type(manifest["generation_version"]) is not int
         or manifest["generation_version"] != GENERATION_VERSION
         or manifest["generation_filename_regex"] != GENERATION_FILENAME_REGEX
@@ -1225,18 +1364,109 @@ def _generation_name(token: str, sequence: int, digest: str) -> str:
     return f".helios-room-reset-state.{token}.g{sequence:020d}.{digest}.json"
 
 
-def _validate_native_journal(value: Any, token: str, commit: str, sequence: int) -> dict[str, Any]:
-    # Revision 2 retains the closed Revision 2.3 object and changes only these values.
-    if not isinstance(value, dict) or set(value) != legacy.JOURNAL_FIELDS:
+def _native_protocol_for_version(version: int) -> str:
+    if version == JOURNAL_VERSION:
+        return RESET_PROTOCOL_VERSION
+    if version == NATIVE_V2_JOURNAL_VERSION:
+        return NATIVE_V2_RESET_PROTOCOL_VERSION
+    raise _error("reset_recovery_invalid")
+
+
+def _validate_fresh_database(value: Any, database_path: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != FRESH_DATABASE_FIELDS:
+        raise _error("reset_recovery_invalid")
+    if (
+        re.fullmatch(
+            r"windows:[0-9a-f]{16}:[0-9a-f]{32}", str(value["identity"])
+        ) is None
+        or value["journal_mode"] != "wal"
+        or not _valid_sha(value["logical_digest"])
+        or value["path"] != database_path
+        or value["schema_label"] != "1.4"
+        or not _valid_sha(value["sha256"])
+        or type(value["size"]) is not int
+        or value["size"] <= 0
+    ):
+        raise _error("reset_recovery_invalid")
+    return dict(value)
+
+
+def _require_wal_header(
+    control: _ControlPartial, *, recovery: bool
+) -> None:
+    try:
+        os.lseek(control.descriptor, 0, os.SEEK_SET)
+        header = os.read(control.descriptor, 20)
+        os.lseek(control.descriptor, 0, os.SEEK_SET)
+    except OSError as error:
+        raise _error(
+            "reset_recovery_invalid" if recovery else "reset_failed"
+        ) from error
+    if (
+        len(header) != 20
+        or header[:16] != b"SQLite format 3\x00"
+        or header[18] != 0x02
+        or header[19] != 0x02
+    ):
+        raise _error(
+            "reset_recovery_invalid" if recovery else "reset_failed"
+        )
+
+
+def _validate_fresh_sqlite(path: Path, evidence: dict[str, Any]) -> None:
+    _validate_fresh_database(evidence, evidence["path"])
+    connection = legacy._open_connection(path, immutable=True)
+    try:
+        validate_v14_foundation(connection)
+        validate_database_integrity(connection)
+        if legacy.logical_digest(connection) != evidence["logical_digest"]:
+            raise _error("reset_recovery_invalid")
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def _converter_is_accepted(converter: Any, current_commit: str) -> bool:
+    return (
+        legacy._valid_commit(converter)
+        and (
+            converter == current_commit
+            or converter in LEGACY_CONVERSION_RECOVERY_COMMITS
+        )
+    )
+
+
+def _validate_native_journal(
+    value: Any,
+    token: str,
+    commit: str,
+    sequence: int,
+    *,
+    journal_version: int,
+) -> dict[str, Any]:
+    expected_fields = (
+        NATIVE_JOURNAL_FIELDS_V3
+        if journal_version == JOURNAL_VERSION
+        else legacy.JOURNAL_FIELDS
+    )
+    if not isinstance(value, dict) or set(value) != expected_fields:
         raise _error("reset_recovery_invalid")
     candidate = dict(value)
     if (
-        candidate.get("journal_version") != JOURNAL_VERSION
-        or candidate.get("reset_protocol_version") != RESET_PROTOCOL_VERSION
+        candidate.get("journal_version") != journal_version
+        or candidate.get("reset_protocol_version")
+        != _native_protocol_for_version(journal_version)
         or candidate.get("journal_sequence") != sequence
     ):
         raise _error("reset_recovery_invalid")
+    if journal_version == JOURNAL_VERSION:
+        fresh_database = candidate["fresh_database"]
+        if fresh_database is not None:
+            _validate_fresh_database(
+                fresh_database, candidate.get("database_path")
+            )
     compatibility = dict(candidate)
+    compatibility.pop("fresh_database", None)
     compatibility["journal_version"] = 1
     compatibility["reset_protocol_version"] = LEGACY_RESET_PROTOCOL_VERSION
     compatibility["quarantine"] = {
@@ -1330,7 +1560,7 @@ def _validate_envelope(
     elif not _valid_sha(value["previous_generation_sha256"]):
         raise _error("reset_recovery_invalid")
     origin = value["origin"]
-    if origin == "native_v2":
+    if origin in {"native_v2", "native_v3"}:
         if (
             value["converter_implementation_commit"] is not None
             or value["legacy_source"] is not None
@@ -1342,7 +1572,21 @@ def _validate_envelope(
         if _sha256(_canonical_bytes(manifest)) != token:
             raise _error("reset_recovery_invalid")
         commit = manifest.get("implementation_commit")
-        journal = _validate_native_journal(value["journal"], token, commit, sequence)
+        journal_version = (
+            JOURNAL_VERSION if origin == "native_v3" else NATIVE_V2_JOURNAL_VERSION
+        )
+        if manifest.get("journal_version") != journal_version:
+            raise _error("reset_recovery_invalid")
+        journal = _validate_native_journal(
+            value["journal"], token, commit, sequence,
+            journal_version=journal_version,
+        )
+        if (
+            origin == "native_v3"
+            and sequence == 1
+            and journal["fresh_database"] is not None
+        ):
+            raise _error("reset_recovery_invalid")
         filesystem = manifest.get("filesystem") if isinstance(manifest, dict) else None
         paths = manifest.get("artifact_paths") if isinstance(manifest, dict) else None
         if not isinstance(filesystem, dict) or not isinstance(paths, dict):
@@ -1357,10 +1601,12 @@ def _validate_envelope(
             "journal_storage_protocol_version": JOURNAL_STORAGE_PROTOCOL_VERSION,
             "plan_token": token,
             "recovery_commit_by_schema": manifest.get("recovery_commit_by_schema"),
-            "reset_protocol_version": RESET_PROTOCOL_VERSION,
+            "reset_protocol_version": _native_protocol_for_version(
+                journal_version
+            ),
             "reviewed_plan_manifest": manifest,
             "status": "planned",
-        }, expected_token=token)
+        }, expected_token=token, expected_journal_version=journal_version)
         if (
             journal["audit_path"] != paths["audit_path"]
             or journal["backup"]["path"] != paths["backup_path"]
@@ -1451,6 +1697,7 @@ class GenerationStore:
         legacy_recovery_evidence: dict[str, Any] | None = None,
         legacy_source: dict[str, Any] | None = None,
         converter_implementation_commit: str | None = None,
+        journal_version: int | None = None,
         generations: list[Generation] | None = None,
         chain_hashes: list[str] | None = None,
     ) -> None:
@@ -1463,6 +1710,11 @@ class GenerationStore:
         self.legacy_recovery_evidence = legacy_recovery_evidence
         self.legacy_source = legacy_source
         self.converter_implementation_commit = converter_implementation_commit
+        self.journal_version = journal_version
+        if self.origin == "native_v3" and self.journal_version is None:
+            self.journal_version = JOURNAL_VERSION
+        elif self.origin == "native_v2" and self.journal_version is None:
+            self.journal_version = NATIVE_V2_JOURNAL_VERSION
         self.generations = list(generations or [])
         self.chain_hashes = list(chain_hashes or [item.content_hash for item in self.generations])
 
@@ -1484,10 +1736,16 @@ class GenerationStore:
             raise _error("reset_failed")
         value = dict(journal)
         value["stage"] = stage
-        if self.origin == "native_v2":
+        if self.origin in {"native_v2", "native_v3"}:
+            if self.journal_version not in {
+                NATIVE_V2_JOURNAL_VERSION, JOURNAL_VERSION
+            }:
+                raise _error("reset_recovery_invalid")
             value["journal_sequence"] = sequence
-            value["journal_version"] = JOURNAL_VERSION
-            value["reset_protocol_version"] = RESET_PROTOCOL_VERSION
+            value["journal_version"] = self.journal_version
+            value["reset_protocol_version"] = _native_protocol_for_version(
+                self.journal_version
+            )
         else:
             if self.generations:
                 value["journal_sequence"] = (
@@ -1496,7 +1754,7 @@ class GenerationStore:
                 value["updated_at"] = legacy._utc_stamp()[1]
             # Conversion generation 1 preserves the selected legacy journal's
             # sequence and timestamp byte-for-byte.
-        if self.origin == "native_v2":
+        if self.origin in {"native_v2", "native_v3"}:
             value["updated_at"] = legacy._utc_stamp()[1]
         envelope = {
             "converter_implementation_commit": self.converter_implementation_commit,
@@ -1623,9 +1881,19 @@ def _validate_chain(generations: list[Generation], expected_token: str, current_
         raise _error("reset_recovery_invalid")
     first = ordered[0].envelope
     origin = first["origin"]
-    fixed_journal_keys = legacy.JOURNAL_FIELDS - {"journal_sequence", "stage", "updated_at"}
+    journal_version = first["journal"].get("journal_version")
+    if origin == "native_v3" and journal_version != JOURNAL_VERSION:
+        raise _error("reset_recovery_invalid")
+    if origin == "native_v2" and journal_version != NATIVE_V2_JOURNAL_VERSION:
+        raise _error("reset_recovery_invalid")
+    fixed_journal_keys = set(first["journal"]) - {
+        "journal_sequence", "stage", "updated_at"
+    }
+    if origin == "native_v3":
+        fixed_journal_keys.remove("fresh_database")
     previous_stage_index: int | None = None
     first_legacy_sequence = first["journal"].get("journal_sequence")
+    established_fresh: dict[str, Any] | None = None
     for index, generation in enumerate(ordered):
         envelope = generation.envelope
         if generation.token != expected_token or envelope["origin"] != origin:
@@ -1643,16 +1911,45 @@ def _validate_chain(generations: list[Generation], expected_token: str, current_
         ):
             raise _error("reset_recovery_invalid")
         previous_stage_index = stage_index
-        if origin == "native_v2":
+        if origin in {"native_v2", "native_v3"}:
             if envelope["reviewed_plan_manifest"] != first["reviewed_plan_manifest"]:
                 raise _error("reset_recovery_invalid")
-            if envelope["journal"]["implementation_commit"] != current_commit:
+            implementation_commit = envelope["journal"]["implementation_commit"]
+            if origin == "native_v3" and implementation_commit != current_commit:
                 raise _error("reset_recovery_invalid")
+            if (
+                origin == "native_v2"
+                and implementation_commit not in NATIVE_V2_RECOVERY_SOURCE_COMMITS
+            ):
+                raise _error("reset_recovery_invalid")
+            if origin == "native_v3":
+                fresh = envelope["journal"]["fresh_database"]
+                if fresh is not None:
+                    _validate_fresh_database(
+                        fresh, envelope["journal"]["database_path"]
+                    )
+                    if established_fresh is None:
+                        if (
+                            envelope["journal"]["stage"] != "installing_fresh"
+                            or index == 0
+                            or ordered[index - 1].envelope["journal"]["stage"]
+                            != "installing_fresh"
+                            or ordered[index - 1].envelope["journal"]["fresh_database"]
+                            is not None
+                        ):
+                            raise _error("reset_recovery_invalid")
+                        established_fresh = fresh
+                    elif fresh != established_fresh:
+                        raise _error("reset_recovery_invalid")
+                elif established_fresh is not None:
+                    raise _error("reset_recovery_invalid")
         else:
+            converter = envelope["converter_implementation_commit"]
             if (
                 envelope["legacy_recovery_evidence"] != first["legacy_recovery_evidence"]
                 or envelope["legacy_source"] != first["legacy_source"]
-                or envelope["converter_implementation_commit"] != current_commit
+                or not _converter_is_accepted(converter, current_commit)
+                or converter != first["converter_implementation_commit"]
                 or envelope["journal"]["journal_sequence"]
                 != first_legacy_sequence + index
             ):
@@ -1676,7 +1973,7 @@ def _validate_terminal_subset(
         raise _error("reset_recovery_invalid")
     audit, audit_raw, _identity = _read_canonical(audit_path)
     origin = terminal.envelope["origin"]
-    if origin == "native_v2":
+    if origin in {"native_v2", "native_v3"}:
         if not isinstance(audit, dict):
             raise _error("reset_recovery_invalid")
         hashes = audit.get("generation_chain_sha256")
@@ -1690,35 +1987,8 @@ def _validate_terminal_subset(
             or audit.get("terminal_generation_sha256") != hashes[-1]
         ):
             raise _error("reset_recovery_invalid")
-        compatibility = dict(audit)
-        for key in (
-            "generation_chain_sha256", "journal_storage_protocol_version",
-            "terminal_generation_sequence", "terminal_generation_sha256",
-        ):
-            compatibility.pop(key, None)
-        compatibility["reset_protocol_version"] = LEGACY_RESET_PROTOCOL_VERSION
-        legacy_journal = dict(journal)
-        legacy_journal["reset_protocol_version"] = LEGACY_RESET_PROTOCOL_VERSION
-        legacy_journal["journal_version"] = 1
-        legacy_journal["quarantine"] = {
-            key: (
-                None if item is None else {
-                    "identity": item["identity"],
-                    "path": f"data/.helios.db{suffix}.reset-{expected_token}.original",
-                }
-            )
-            for key, suffix, item in (
-                ("database", "", journal["quarantine"]["database"]),
-                ("wal", "-wal", journal["quarantine"]["wal"]),
-                ("shm", "-shm", journal["quarantine"]["shm"]),
-            )
-        }
-        legacy._validate_audit(compatibility, legacy_journal)
-        if set(audit) != set(compatibility) | {
-            "generation_chain_sha256", "journal_storage_protocol_version",
-            "terminal_generation_sequence", "terminal_generation_sha256",
-        }:
-            raise _error("reset_recovery_invalid")
+        provisional_store = _store_from_chain(root, ordered, hashes)
+        _validate_native_audit(audit, provisional_store, journal)
     else:
         legacy._validate_audit(audit, journal)
         chain_manifest_path = Path(f"{audit_path}.generation-chain.json")
@@ -1739,7 +2009,11 @@ def _validate_terminal_subset(
             or manifest.get("audit_sha256") != _sha256(audit_raw)
             or manifest.get("origin") != "legacy_v1_conversion"
             or manifest.get("plan_token") != expected_token
-            or manifest.get("converter_implementation_commit") != current_commit
+            or manifest.get("converter_implementation_commit")
+            != terminal.envelope["converter_implementation_commit"]
+            or not _converter_is_accepted(
+                manifest.get("converter_implementation_commit"), current_commit
+            )
             or type(manifest.get("terminal_generation_sequence")) is not int
             or manifest.get("terminal_generation_sequence") != len(hashes)
             or manifest.get("terminal_generation_sha256") != hashes[-1]
@@ -1747,6 +2021,7 @@ def _validate_terminal_subset(
             raise _error("reset_recovery_invalid")
     if terminal.sequence != len(hashes) or terminal.content_hash != hashes[-1]:
         raise _error("reset_recovery_invalid")
+    previous_retained: Generation | None = None
     for generation in ordered:
         if (
             generation.sequence < 1
@@ -1762,25 +2037,73 @@ def _validate_terminal_subset(
             raise _error("reset_recovery_invalid")
     # Validate fixed content and implementation relationships on the remaining
     # subset without requiring already-audited deleted predecessors to reappear.
-    fixed = legacy.JOURNAL_FIELDS - {"journal_sequence", "stage", "updated_at"}
     first_remaining = ordered[0].envelope
+    fixed = set(first_remaining["journal"]) - {
+        "journal_sequence", "stage", "updated_at"
+    }
+    if origin == "native_v3":
+        fixed.remove("fresh_database")
+    retained_fresh: dict[str, Any] | None = None
     for generation in ordered:
         envelope = generation.envelope
         if any(envelope["journal"][key] != first_remaining["journal"][key] for key in fixed):
             raise _error("reset_recovery_invalid")
-        if origin == "native_v2":
+        if origin in {"native_v2", "native_v3"}:
+            implementation_commit = envelope["journal"]["implementation_commit"]
             if (
-                envelope["journal"]["implementation_commit"] != current_commit
-                or envelope["reviewed_plan_manifest"] != terminal.envelope["reviewed_plan_manifest"]
+                envelope["reviewed_plan_manifest"]
+                != terminal.envelope["reviewed_plan_manifest"]
+                or (
+                    origin == "native_v3"
+                    and implementation_commit != current_commit
+                )
+                or (
+                    origin == "native_v2"
+                    and implementation_commit
+                    not in NATIVE_V2_RECOVERY_SOURCE_COMMITS
+                )
             ):
                 raise _error("reset_recovery_invalid")
-        elif envelope["converter_implementation_commit"] != current_commit:
+            if origin == "native_v3":
+                fresh = envelope["journal"]["fresh_database"]
+                if fresh is not None:
+                    _validate_fresh_database(fresh, journal["database_path"])
+                    if retained_fresh is None:
+                        if (
+                            previous_retained is not None
+                            and (
+                                previous_retained.envelope["journal"]["fresh_database"]
+                                is not None
+                                or previous_retained.envelope["journal"]["stage"]
+                                != "installing_fresh"
+                                or envelope["journal"]["stage"]
+                                != "installing_fresh"
+                            )
+                        ):
+                            raise _error("reset_recovery_invalid")
+                        retained_fresh = fresh
+                    elif fresh != retained_fresh:
+                        raise _error("reset_recovery_invalid")
+                elif retained_fresh is not None:
+                    raise _error("reset_recovery_invalid")
+        else:
+            converter = envelope["converter_implementation_commit"]
+            if (
+                not _converter_is_accepted(converter, current_commit)
+                or converter
+                != terminal.envelope["converter_implementation_commit"]
+                or envelope["legacy_recovery_evidence"]
+                != terminal.envelope["legacy_recovery_evidence"]
+                or envelope["legacy_source"]
+                != terminal.envelope["legacy_source"]
+            ):
+                raise _error("reset_recovery_invalid")
+        previous_retained = generation
+    if origin == "native_v3" and audit["outcome"] == "reset":
+        if retained_fresh is None or audit["fresh_database"] != retained_fresh:
             raise _error("reset_recovery_invalid")
-        elif (
-            envelope["legacy_recovery_evidence"]
-            != terminal.envelope["legacy_recovery_evidence"]
-            or envelope["legacy_source"] != terminal.envelope["legacy_source"]
-        ):
+    if origin == "native_v3" and audit["outcome"] == "restored_source":
+        if audit["fresh_database"] is not None:
             raise _error("reset_recovery_invalid")
     return ordered, hashes
 
@@ -2417,8 +2740,13 @@ def _promote_sqlite_staging(
     final: Path,
     expected: _FileEvidence,
     authority: dict[str, Any],
+    *,
+    require_wal_header: bool = False,
 ) -> _FileEvidence:
     control = _elevate_sqlite_staging(staging, expected)
+    if require_wal_header:
+        _require_wal_header(control, recovery=False)
+        _require_control_evidence(control, expected)
     _promote_open_control(
         control,
         final,
@@ -2439,7 +2767,13 @@ def _promote_sqlite_staging(
 
 def _native_audit_value(store: GenerationStore, journal: dict[str, Any], outcome: str, terminal: str) -> dict[str, Any]:
     value = legacy._audit_value(journal, outcome, terminal)
-    value["reset_protocol_version"] = RESET_PROTOCOL_VERSION
+    protocol = _native_protocol_for_version(store.journal_version)
+    value["reset_protocol_version"] = protocol
+    if store.journal_version == JOURNAL_VERSION:
+        value["audit_version"] = NATIVE_AUDIT_VERSION
+        value["fresh_database"] = (
+            journal["fresh_database"] if outcome == "reset" else None
+        )
     hashes = store.hashes()
     value.update({
         "generation_chain_sha256": hashes,
@@ -2455,14 +2789,39 @@ def _validate_native_audit(value: Any, store: GenerationStore, journal: dict[str
         "generation_chain_sha256", "journal_storage_protocol_version",
         "terminal_generation_sequence", "terminal_generation_sha256",
     }
+    if store.journal_version == JOURNAL_VERSION:
+        expected_keys.add("fresh_database")
     if not isinstance(value, dict) or set(value) != expected_keys:
         raise _error("reset_recovery_invalid")
     base = {key: value[key] for key in legacy.AUDIT_FIELDS}
-    compatibility_journal = {**journal, "reset_protocol_version": LEGACY_RESET_PROTOCOL_VERSION}
-    compatibility_base = {**base, "reset_protocol_version": LEGACY_RESET_PROTOCOL_VERSION}
+    compatibility_journal = {
+        key: item for key, item in journal.items() if key != "fresh_database"
+    }
+    compatibility_journal["reset_protocol_version"] = LEGACY_RESET_PROTOCOL_VERSION
+    compatibility_base = {
+        **base,
+        "audit_version": 1,
+        "reset_protocol_version": LEGACY_RESET_PROTOCOL_VERSION,
+    }
     legacy._validate_audit(compatibility_base, compatibility_journal)
-    if base["reset_protocol_version"] != RESET_PROTOCOL_VERSION:
+    if (
+        base["reset_protocol_version"]
+        != _native_protocol_for_version(store.journal_version)
+        or base["audit_version"]
+        != (
+            NATIVE_AUDIT_VERSION
+            if store.journal_version == JOURNAL_VERSION else 1
+        )
+    ):
         raise _error("reset_recovery_invalid")
+    if store.journal_version == JOURNAL_VERSION:
+        expected_fresh = (
+            journal["fresh_database"] if value["outcome"] == "reset" else None
+        )
+        if value["fresh_database"] != expected_fresh:
+            raise _error("reset_recovery_invalid")
+        if expected_fresh is not None:
+            _validate_fresh_database(expected_fresh, journal["database_path"])
     hashes = store.hashes()
     if (
         not isinstance(value["generation_chain_sha256"], list)
@@ -2485,13 +2844,13 @@ def _install_terminal_audit(
 ) -> dict[str, Any]:
     audit = store.root / journal["audit_path"]
     partial = Path(f"{audit}.partial")
-    if store.origin == "native_v2":
+    if store.origin in {"native_v2", "native_v3"}:
         value = _native_audit_value(store, journal, outcome, terminal)
     else:
         value = legacy._audit_value(journal, outcome, terminal)
     if os.path.lexists(audit):
         existing, existing_raw, _identity = _read_canonical(audit)
-        if store.origin == "native_v2":
+        if store.origin in {"native_v2", "native_v3"}:
             _validate_native_audit(existing, store, journal)
         else:
             legacy._validate_audit(existing, journal)
@@ -2515,7 +2874,7 @@ def _install_terminal_audit(
                     raise
                 canonical_invalid = True
             else:
-                if store.origin == "native_v2":
+                if store.origin in {"native_v2", "native_v3"}:
                     _validate_native_audit(partial_value, store, journal)
                 else:
                     legacy._validate_audit(partial_value, journal)
@@ -2546,10 +2905,19 @@ def _install_terminal_audit(
     return value
 
 
-def _report(journal: dict[str, Any], status: str, *, native: bool = True) -> dict[str, Any]:
+def _report(
+    journal: dict[str, Any],
+    status: str,
+    *,
+    native: bool = True,
+    reset_protocol_version: str | None = None,
+) -> dict[str, Any]:
+    native_protocol = reset_protocol_version or journal.get(
+        "reset_protocol_version", RESET_PROTOCOL_VERSION
+    )
     if status == "reset":
         result = legacy._reset_report({**journal, "reset_protocol_version": LEGACY_RESET_PROTOCOL_VERSION})
-        result["reset_protocol_version"] = RESET_PROTOCOL_VERSION if native else LEGACY_RESET_PROTOCOL_VERSION
+        result["reset_protocol_version"] = native_protocol if native else LEGACY_RESET_PROTOCOL_VERSION
     else:
         result = {
             "audit_path": journal["audit_path"],
@@ -2558,7 +2926,7 @@ def _report(journal: dict[str, Any], status: str, *, native: bool = True) -> dic
             "old_schema_label": journal["source_schema_label"],
             "plan_token": journal["plan_token"],
             "recovery_commit": journal["recovery_commit"],
-            "reset_protocol_version": RESET_PROTOCOL_VERSION if native else LEGACY_RESET_PROTOCOL_VERSION,
+            "reset_protocol_version": native_protocol if native else LEGACY_RESET_PROTOCOL_VERSION,
             "schema_label": journal["source_schema_label"],
             "status": "restored_source",
         }
@@ -2567,7 +2935,10 @@ def _report(journal: dict[str, Any], status: str, *, native: bool = True) -> dic
     return result
 
 
-def _delete_generation_controls(store: GenerationStore) -> None:
+def _delete_generation_controls(
+    store: GenerationStore,
+    before_delete: Callable[[], None] | None = None,
+) -> None:
     if not store.generations:
         return
     terminal = store.generations[-1]
@@ -2598,6 +2969,8 @@ def _delete_generation_controls(store: GenerationStore) -> None:
             or generation.content_hash != store.chain_hashes[generation.sequence - 1]
         ):
             raise _error("reset_recovery_invalid")
+        if before_delete is not None:
+            before_delete()
         _unlink_verified_bytes(path, generation.identity, generation.raw)
         _flush_namespace(store.authority, store.data)
         validate_remaining()
@@ -2605,6 +2978,8 @@ def _delete_generation_controls(store: GenerationStore) -> None:
         store.generations[:-1], key=lambda item: item.sequence
     ):
         if os.path.lexists(generation.path):
+            if before_delete is not None:
+                before_delete()
             _unlink_verified_bytes(
                 generation.path, generation.identity, generation.raw
             )
@@ -2613,6 +2988,8 @@ def _delete_generation_controls(store: GenerationStore) -> None:
     if _enumerate_reserved(store.data) != [terminal.path.name]:
         raise _error("reset_recovery_invalid")
     if os.path.lexists(terminal.path):
+        if before_delete is not None:
+            before_delete()
         _unlink_verified_bytes(terminal.path, terminal.identity, terminal.raw)
         _flush_namespace(store.authority, store.data)
     if _enumerate_reserved(store.data):
@@ -2751,6 +3128,7 @@ def execute_database_reset(
                 "sha256": backup_evidence.sha256,
             },
             "database_path": "data/helios.db",
+            "fresh_database": None,
             "implementation_commit": plan["implementation_commit"],
             "journal_sequence": 0,
             "journal_version": JOURNAL_VERSION,
@@ -2768,7 +3146,8 @@ def execute_database_reset(
         }
         store = GenerationStore(
             root, expected_plan_token, under_lease,
-            origin="native_v2", reviewed_plan_manifest=manifest,
+            origin="native_v3", reviewed_plan_manifest=manifest,
+            journal_version=JOURNAL_VERSION,
         )
         store.append(journal, "ready_to_quarantine", crash_checkpoint)
         for key in ("database", "wal", "shm"):
@@ -2789,6 +3168,7 @@ def execute_database_reset(
                     legacy.DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8")
                 )
                 legacy._seed_initial_room(template)
+                template_digest = legacy.logical_digest(template)
                 fresh = legacy._open_direct(fresh_staging, read_only=False)
                 try:
                     template.backup(fresh)
@@ -2821,6 +3201,8 @@ def execute_database_reset(
                 try:
                     validate_v14_foundation(validation)
                     validate_database_integrity(validation)
+                    if legacy.logical_digest(validation) != template_digest:
+                        raise _error("reset_failed")
                 finally:
                     validation.rollback()
                     validation.close()
@@ -2828,13 +3210,26 @@ def execute_database_reset(
             fresh_evidence = _validate_sqlite_staging(
                 fresh_staging_state, validate_fresh_staging
             )
-            store.append(journal, "installing_fresh", crash_checkpoint)
             _promote_sqlite_staging(
                 fresh_staging_state,
                 database,
                 fresh_evidence,
                 under_lease,
+                require_wal_header=True,
             )
+            journal["fresh_database"] = {
+                "identity": fresh_evidence.identity,
+                "journal_mode": "wal",
+                "logical_digest": template_digest,
+                "path": "data/helios.db",
+                "schema_label": "1.4",
+                "sha256": fresh_evidence.sha256,
+                "size": fresh_evidence.size,
+            }
+            _validate_fresh_database(
+                journal["fresh_database"], journal["database_path"]
+            )
+            store.append(journal, "installing_fresh", crash_checkpoint)
         store.append(journal, "fresh_installed", crash_checkpoint)
         store.append(journal, "validating_fresh", crash_checkpoint)
         store.append(journal, "fresh_validated", crash_checkpoint)
@@ -2843,25 +3238,37 @@ def execute_database_reset(
         ) as held_backup, _hold_file_evidence(
             database, fresh_evidence
         ) as held_fresh:
-            for key in ("database", "wal", "shm"):
-                item = quarantine[key]
-                if item is None or not os.path.lexists(quarantine_paths[key]):
-                    continue
-                store.append(journal, "cleaning_quarantine", crash_checkpoint)
-                _unlink_verified(quarantine_paths[key], item["identity"])
-                _flush_namespace(under_lease, quarantine_paths[key].parent)
+            with _hold_active_sidecar_guards(database, under_lease) as guards:
+                _require_wal_header(held_fresh, recovery=False)
+                _validate_fresh_sqlite(database, journal["fresh_database"])
                 _require_control_evidence(held_backup, backup_evidence)
                 _require_control_evidence(held_fresh, fresh_evidence)
+                _require_sidecar_guards(guards)
+                for key in ("database", "wal", "shm"):
+                    item = quarantine[key]
+                    if item is None or not os.path.lexists(quarantine_paths[key]):
+                        continue
+                    store.append(journal, "cleaning_quarantine", crash_checkpoint)
+                    _unlink_verified(quarantine_paths[key], item["identity"])
+                    _flush_namespace(under_lease, quarantine_paths[key].parent)
+                    _require_control_evidence(held_backup, backup_evidence)
+                    _require_control_evidence(held_fresh, fresh_evidence)
+                    _require_sidecar_guards(guards)
+                _require_control_evidence(held_backup, backup_evidence)
+                _require_control_evidence(held_fresh, fresh_evidence)
+                _require_sidecar_guards(guards)
+                store.append(journal, "finalizing", crash_checkpoint)
+                _install_terminal_audit(
+                    store, journal, "reset", "1.4", crash_checkpoint
+                )
+                installed_audit = _existing_terminal_audit(store, journal)
+                if installed_audit is None or installed_audit["outcome"] != "reset":
+                    raise _error("reset_failed")
+            _validate_fresh_sqlite(database, journal["fresh_database"])
+            _require_wal_header(held_fresh, recovery=False)
             _require_control_evidence(held_backup, backup_evidence)
             _require_control_evidence(held_fresh, fresh_evidence)
-            store.append(journal, "finalizing", crash_checkpoint)
-            _install_terminal_audit(
-                store, journal, "reset", "1.4", crash_checkpoint
-            )
-            installed_audit = _existing_terminal_audit(store, journal)
-            if installed_audit is None or installed_audit["outcome"] != "reset":
-                raise _error("reset_failed")
-            _delete_generation_controls(store)
+        _cleanup_after_audit(store, journal)
         return _report(journal, "reset")
     except legacy.DatabaseResetError as error:
         if store is None:
@@ -2869,7 +3276,11 @@ def execute_database_reset(
                 backup, audit, created_backups,
                 locals().get("under_lease", preliminary),
             )
-        elif not isinstance(error, _DurabilityBoundaryError):
+        elif (
+            not isinstance(error, _DurabilityBoundaryError)
+            and store.generations
+            and not os.path.lexists(root / store.journal["audit_path"])
+        ):
             try:
                 _restore_v2(store, store.journal, crash_checkpoint=None)
             except Exception:
@@ -2881,7 +3292,10 @@ def execute_database_reset(
                 backup, audit, created_backups,
                 locals().get("under_lease", preliminary),
             )
-        elif store.generations:
+        elif (
+            store.generations
+            and not os.path.lexists(root / store.journal["audit_path"])
+        ):
             try:
                 _restore_v2(store, store.journal, crash_checkpoint=None)
             except Exception:
@@ -3188,6 +3602,28 @@ def _validate_evidence_record(
     )
 
 
+def _validate_evidence_record_for_recovery(
+    path: Path,
+    *,
+    partial: bool,
+    expected_token: str,
+    current_commit: str,
+) -> EvidenceRecord:
+    value, raw, identity = _read_canonical(path)
+    converter = value.get("converter_implementation_commit") if isinstance(value, dict) else None
+    if not _converter_is_accepted(converter, current_commit):
+        raise _error("reset_recovery_invalid")
+    return _evidence_record_from_canonical(
+        path,
+        partial=partial,
+        expected_token=expected_token,
+        converter=converter,
+        value=value,
+        raw=raw,
+        identity=identity,
+    )
+
+
 def _stable_partial_snapshot(path: Path) -> tuple[bytes, str, int, int]:
     info = legacy._safe_regular(path)
     if info.st_size < 0 or info.st_size > 1_048_576:
@@ -3239,6 +3675,7 @@ def _revalidate_legacy_context(
     root: Path,
     expected_token: str,
     converter: str,
+    current_commit: str,
     selection: LegacySelection,
     expected_reserved: list[str],
 ) -> None:
@@ -3250,7 +3687,9 @@ def _revalidate_legacy_context(
     if selected.source != selection.source or selected.journal != selection.journal:
         raise _error("reset_recovery_invalid")
     prospective = [f"data/{name}" for name in expected_reserved]
-    if _current_commit(root, prospective) != converter:
+    if not _converter_is_accepted(converter, current_commit):
+        raise _error("reset_recovery_invalid")
+    if _current_commit(root, prospective) != current_commit:
         raise _error("reset_recovery_invalid")
 
 
@@ -3314,7 +3753,7 @@ def _write_evidence_record(
 def _handle_evidence_state(
     root: Path,
     expected_token: str,
-    converter: str,
+    current_commit: str,
     selection: LegacySelection,
     evidence_paths: list[Path],
     generation_partials: list[Path],
@@ -3327,13 +3766,13 @@ def _handle_evidence_state(
     if len(finals) > 1 or len(evidence_partials) > 1:
         raise _error("reset_recovery_invalid")
     if finals and evidence_partials:
-        final_record = _validate_evidence_record(
+        final_record = _validate_evidence_record_for_recovery(
             finals[0], partial=False, expected_token=expected_token,
-            converter=converter,
+            current_commit=current_commit,
         )
-        partial_record = _validate_evidence_record(
+        partial_record = _validate_evidence_record_for_recovery(
             evidence_partials[0], partial=True, expected_token=expected_token,
-            converter=converter,
+            current_commit=current_commit,
         )
         if final_record.raw != partial_record.raw:
             raise _error("reset_recovery_invalid")
@@ -3343,7 +3782,9 @@ def _handle_evidence_state(
             root, final_record.value["legacy_recovery_evidence"]["durability"]
         )
         _revalidate_legacy_context(
-            root, expected_token, converter, selection,
+            root, expected_token,
+            final_record.value["converter_implementation_commit"],
+            current_commit, selection,
             _expected_legacy_names(selection.source)
             + [finals[0].name, evidence_partials[0].name],
         )
@@ -3356,10 +3797,65 @@ def _handle_evidence_state(
         path = evidence_paths[0]
         partial = path.name.endswith(GENERATION_PARTIAL_SUFFIX)
         if partial:
+            final = Path(str(path)[:-len(GENERATION_PARTIAL_SUFFIX)])
+            if not os.path.lexists(final):
+                parsed = False
+                with _open_control_partial(path, create_new=False) as control:
+                    try:
+                        value, raw = _read_canonical_control(control)
+                    except legacy.DatabaseResetError:
+                        pass
+                    else:
+                        parsed = True
+                        converter = (
+                            value.get("converter_implementation_commit")
+                            if isinstance(value, dict) else None
+                        )
+                        if not _converter_is_accepted(
+                            converter, current_commit
+                        ):
+                            raise _error("reset_recovery_invalid")
+                        record = _evidence_record_from_canonical(
+                            path,
+                            partial=True,
+                            expected_token=expected_token,
+                            converter=converter,
+                            value=value,
+                            raw=raw,
+                            identity=control.identity,
+                        )
+                        if record.value["legacy_source"] != selection.source:
+                            raise _error("reset_recovery_invalid")
+                        authority = _revalidate_persisted_authority(
+                            root,
+                            record.value["legacy_recovery_evidence"][
+                                "durability"
+                            ],
+                        )
+                        _revalidate_legacy_context(
+                            root, expected_token, converter, current_commit,
+                            selection,
+                            _expected_legacy_names(selection.source)
+                            + [path.name],
+                        )
+                        _promote_validated_json_control(
+                            control, final, raw, authority
+                        )
+                        return _evidence_record_from_canonical(
+                            final,
+                            partial=False,
+                            expected_token=expected_token,
+                            converter=converter,
+                            value=value,
+                            raw=raw,
+                            identity=control.identity,
+                        ), authority
+                if parsed:
+                    raise _error("reset_recovery_invalid")
             try:
-                record = _validate_evidence_record(
+                record = _validate_evidence_record_for_recovery(
                     path, partial=True, expected_token=expected_token,
-                    converter=converter,
+                    current_commit=current_commit,
                 )
             except legacy.DatabaseResetError as validation_error:
                 if generation_partials:
@@ -3386,7 +3882,7 @@ def _handle_evidence_state(
                 selection_now = _select_legacy(root, expected_token)
                 if selection_now.source != selection.source:
                     raise _error("reset_recovery_invalid")
-                if _current_commit(root, [f"data/{path.name}"]) != converter:
+                if _current_commit(root, [f"data/{path.name}"]) != current_commit:
                     raise _error("reset_recovery_invalid")
                 immediate = _probe_durability(root)
                 if immediate != provisional:
@@ -3418,16 +3914,17 @@ def _handle_evidence_state(
                 except legacy.DatabaseResetError as error:
                     raise _error("reset_failed") from error
                 conversion = _probe_durability(root)
-                value = _evidence_value(selection, expected_token, converter, conversion)
+                value = _evidence_value(
+                    selection, expected_token, current_commit, conversion
+                )
                 return _write_evidence_record(root, value, conversion, crash_checkpoint), conversion
             else:
                 if record.value["legacy_source"] != selection.source:
                     raise _error("reset_recovery_invalid")
-                final = Path(str(path)[:-len(GENERATION_PARTIAL_SUFFIX)])
                 if os.path.lexists(final):
-                    final_record = _validate_evidence_record(
+                    final_record = _validate_evidence_record_for_recovery(
                         final, partial=False, expected_token=expected_token,
-                        converter=converter,
+                        current_commit=current_commit,
                     )
                     if final_record.raw != record.raw:
                         raise _error("reset_recovery_invalid")
@@ -3438,7 +3935,9 @@ def _handle_evidence_state(
                     root, record.value["legacy_recovery_evidence"]["durability"]
                 )
                 _revalidate_legacy_context(
-                    root, expected_token, converter, selection,
+                    root, expected_token,
+                    record.value["converter_implementation_commit"],
+                    current_commit, selection,
                     _expected_legacy_names(selection.source) + [path.name],
                 )
                 with _open_control_partial(path, create_new=False) as control:
@@ -3447,7 +3946,7 @@ def _handle_evidence_state(
                         path,
                         partial=True,
                         expected_token=expected_token,
-                        converter=converter,
+                        converter=record.value["converter_implementation_commit"],
                         value=value,
                         raw=raw,
                         identity=control.identity,
@@ -3464,15 +3963,15 @@ def _handle_evidence_state(
                         final,
                         partial=False,
                         expected_token=expected_token,
-                        converter=converter,
+                        converter=record.value["converter_implementation_commit"],
                         value=value,
                         raw=raw,
                         identity=control.identity,
                     )
                 return installed, authority
-        record = _validate_evidence_record(
+        record = _validate_evidence_record_for_recovery(
             path, partial=False, expected_token=expected_token,
-            converter=converter,
+            current_commit=current_commit,
         )
         if record.value["legacy_source"] != selection.source:
             raise _error("reset_recovery_invalid")
@@ -3484,10 +3983,12 @@ def _handle_evidence_state(
         raise _error("reset_recovery_invalid")
     conversion = _probe_durability(root)
     _revalidate_legacy_context(
-        root, expected_token, converter, selection,
+        root, expected_token, current_commit, current_commit, selection,
         _expected_legacy_names(selection.source),
     )
-    value = _evidence_value(selection, expected_token, converter, conversion)
+    value = _evidence_value(
+        selection, expected_token, current_commit, conversion
+    )
     return _write_evidence_record(root, value, conversion, crash_checkpoint), conversion
 
 
@@ -3519,10 +4020,13 @@ def _promote_or_rebuild_legacy_generation_partial(
     match = GENERATION_RE.fullmatch(partial.name[:-len(GENERATION_PARTIAL_SUFFIX)])
     if match is None or match.groups() != (store.token, "00000000000000000001", expected_hash):
         raise _error("reset_recovery_invalid")
-    raw, identity, size, mtime_ns = _stable_partial_snapshot(partial)
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
-    if raw == expected_raw:
-        with _open_control_partial(partial, create_new=False) as control:
+    raw: bytes
+    identity: str
+    with _open_control_partial(partial, create_new=False) as control:
+        raw = _control_bytes(control)
+        identity = control.identity
+        if raw == expected_raw:
             value, retained_raw = _read_canonical_control(control)
             generation = _generation_from_canonical(
                 partial,
@@ -3543,12 +4047,14 @@ def _promote_or_rebuild_legacy_generation_partial(
                 raw=retained_raw,
                 identity=control.identity,
             )
-        store.generations.append(installed)
-        return
+            store.generations.append(installed)
+            store.chain_hashes.append(installed.content_hash)
+            return
     if len(raw) >= len(expected_raw) or expected_raw[:len(raw)] != raw:
         raise _error("reset_recovery_invalid")
     # Exact Revision 2.6 strict-prefix basename reuse exception.
-    if _stable_partial_snapshot(partial) != (raw, identity, size, mtime_ns):
+    snapshot = _stable_partial_snapshot(partial)
+    if snapshot[0] != raw or snapshot[1] != identity:
         raise _error("reset_recovery_invalid")
     _unlink_verified_bytes(partial, identity, raw)
     _flush_namespace(store.authority, partial.parent)
@@ -3567,7 +4073,7 @@ def _store_from_chain(
     if not chain:
         raise _error("reset_recovery_invalid")
     first = chain[0].envelope
-    if first["origin"] == "native_v2":
+    if first["origin"] in {"native_v2", "native_v3"}:
         authority = first["reviewed_plan_manifest"]["durability"]
     else:
         authority = first["legacy_recovery_evidence"]["durability"]
@@ -3580,6 +4086,11 @@ def _store_from_chain(
         legacy_recovery_evidence=first["legacy_recovery_evidence"],
         legacy_source=first["legacy_source"],
         converter_implementation_commit=first["converter_implementation_commit"],
+        journal_version=(
+            first["journal"]["journal_version"]
+            if first["origin"] in {"native_v2", "native_v3"}
+            else None
+        ),
         generations=chain,
         chain_hashes=chain_hashes,
     )
@@ -3596,7 +4107,7 @@ def _operational_paths(store: GenerationStore, journal: dict[str, Any]) -> tuple
         key: (None if journal["quarantine"][key] is None else root / journal["quarantine"][key]["path"])
         for key in active
     }
-    if store.origin == "native_v2":
+    if store.origin in {"native_v2", "native_v3"}:
         paths = store.reviewed_plan_manifest["artifact_paths"]
         failed = {
             "database": root / paths["failed_new_database_path"],
@@ -3703,6 +4214,7 @@ def _install_legacy_chain_manifest(store: GenerationStore, journal: dict[str, An
 def _cleanup_matching_evidence_records(
     store: GenerationStore,
     evidence_paths: list[Path],
+    before_delete: Callable[[], None] | None = None,
     after_delete: Callable[[], None] | None = None,
 ) -> None:
     if not evidence_paths:
@@ -3728,6 +4240,8 @@ def _cleanup_matching_evidence_records(
     if final_records and partial_records and final_records[0].raw != partial_records[0].raw:
         raise _error("reset_recovery_invalid")
     for record in partial_records + final_records:
+        if before_delete is not None:
+            before_delete()
         _unlink_verified_bytes(record.path, record.identity, record.raw)
         _flush_namespace(store.authority, record.path.parent)
         if after_delete is not None:
@@ -3761,6 +4275,72 @@ def _revalidate_committed_outcome(
         ):
             raise _error("reset_recovery_invalid")
     elif audit["outcome"] == "reset":
+        if store.origin == "native_v3":
+            fresh = _validate_fresh_database(
+                journal["fresh_database"], journal["database_path"]
+            )
+            with _hold_file_identity_hash(
+                database, fresh["identity"], fresh["sha256"]
+            ) as (_held, evidence):
+                if evidence.size != fresh["size"]:
+                    raise _error("reset_recovery_invalid")
+                _require_wal_header(_held, recovery=True)
+                _validate_fresh_sqlite(database, fresh)
+        else:
+            connection = legacy._open_direct(database, read_only=True)
+            try:
+                validate_v14_foundation(connection)
+                validate_database_integrity(connection)
+            finally:
+                connection.rollback()
+                connection.close()
+    else:
+        raise _error("reset_recovery_invalid")
+    if store.origin == "legacy_v1_conversion":
+        _validate_legacy_chain_manifest(store, journal)
+
+
+def _cleanup_after_audit(
+    store: GenerationStore,
+    journal: dict[str, Any],
+    *,
+    historical_reset_cleanup: bool = False,
+) -> None:
+    existing_audit = _existing_terminal_audit(store, journal)
+    if existing_audit is None:
+        raise _error("reset_recovery_invalid")
+    historical_quarantines: dict[str, Path | None] | None = None
+
+    def require_historical_quarantine_absence() -> None:
+        if historical_quarantines is not None and any(
+            path is not None and os.path.lexists(path)
+            for path in historical_quarantines.values()
+        ):
+            raise _error("reset_recovery_invalid")
+
+    if historical_reset_cleanup:
+        if (
+            store.origin not in {"native_v2", "legacy_v1_conversion"}
+            or existing_audit["outcome"] != "reset"
+        ):
+            raise _error("reset_recovery_invalid")
+        backup = store.root / journal["backup"]["path"]
+        if (
+            _verified_file_sha256(
+                backup, journal["backup"]["identity"]
+            )
+            != journal["backup"]["sha256"]
+        ):
+            raise _error("reset_recovery_invalid")
+        terminal = store.generations[-1]
+        installed = _read_generation(terminal.path, partial=False)
+        if installed.raw != terminal.raw or installed.identity != terminal.identity:
+            raise _error("reset_recovery_invalid")
+        _active, historical_quarantines, _failed, _restoring = _operational_paths(
+            store, journal
+        )
+        require_historical_quarantine_absence()
+        database = store.root / journal["database_path"]
         connection = legacy._open_direct(database, read_only=True)
         try:
             validate_v14_foundation(connection)
@@ -3768,29 +4348,22 @@ def _revalidate_committed_outcome(
         finally:
             connection.rollback()
             connection.close()
-    else:
-        raise _error("reset_recovery_invalid")
     if store.origin == "legacy_v1_conversion":
-        _validate_legacy_chain_manifest(store, journal)
-
-
-def _cleanup_after_audit(store: GenerationStore, journal: dict[str, Any]) -> None:
-    existing_audit = _existing_terminal_audit(store, journal)
-    if existing_audit is None:
-        raise _error("reset_recovery_invalid")
-    if store.origin == "legacy_v1_conversion":
+        require_historical_quarantine_absence()
         _install_legacy_chain_manifest(store, journal)
     _revalidate_committed_outcome(store, journal)
     active, quarantines, failed, restoring = _operational_paths(store, journal)
     del active
-    cleanup_collections: list[dict[str, Path | None]] = [quarantines, failed]
-    if store.origin == "native_v2":
+    cleanup_collections: list[dict[str, Path | None]] = [failed]
+    if not historical_reset_cleanup:
+        cleanup_collections.insert(0, quarantines)
+    if store.origin in {"native_v2", "native_v3"}:
         paths = store.reviewed_plan_manifest["artifact_paths"]
         cleanup_collections.append({
             "database": store.root / paths["backup_copy_partial_path"]
         })
     cleanup_collections.append(restoring)
-    if store.origin == "native_v2":
+    if store.origin in {"native_v2", "native_v3"}:
         paths = store.reviewed_plan_manifest["artifact_paths"]
         cleanup_collections.append({
             "database": store.root / paths["fresh_database_staging_path"],
@@ -3800,11 +4373,13 @@ def _cleanup_after_audit(store: GenerationStore, journal: dict[str, Any]) -> Non
     for collection in cleanup_collections:
         for path in collection.values():
             if path is not None and os.path.lexists(path):
+                require_historical_quarantine_absence()
                 _unlink_verified(path, legacy._path_identity(path))
                 _flush_namespace(store.authority, path.parent)
                 _revalidate_committed_outcome(store, journal)
     audit_partial = Path(f"{store.root / journal['audit_path']}.partial")
     if os.path.lexists(audit_partial):
+        require_historical_quarantine_absence()
         _audit_value, audit_raw, _audit_identity = _read_canonical(
             store.root / journal["audit_path"]
         )
@@ -3830,6 +4405,7 @@ def _cleanup_after_audit(store: GenerationStore, journal: dict[str, Any]) -> Non
         _cleanup_matching_evidence_records(
             store,
             evidence_paths,
+            before_delete=require_historical_quarantine_absence,
             after_delete=lambda: _revalidate_committed_outcome(store, journal),
         )
         _validate_legacy_chain_manifest(store, journal)
@@ -3841,6 +4417,7 @@ def _cleanup_after_audit(store: GenerationStore, journal: dict[str, Any]) -> Non
                 continue
             if legacy._stable_sha256(path) != expected_hash:
                 raise _error("reset_recovery_invalid")
+            require_historical_quarantine_absence()
             _unlink_verified(path, legacy._path_identity(path))
             _flush_namespace(store.authority, path.parent)
             _validate_legacy_controls_subset(
@@ -3875,7 +4452,10 @@ def _cleanup_after_audit(store: GenerationStore, journal: dict[str, Any]) -> Non
     if any(name in forbidden_backup_names for name in backup_names):
         raise _error("reset_recovery_invalid")
     _revalidate_committed_outcome(store, journal)
-    _delete_generation_controls(store)
+    require_historical_quarantine_absence()
+    _delete_generation_controls(
+        store, before_delete=require_historical_quarantine_absence
+    )
 
 
 def _existing_terminal_audit(
@@ -3885,7 +4465,7 @@ def _existing_terminal_audit(
     if not os.path.lexists(path):
         return None
     value, _raw, _identity = _read_canonical(path)
-    if store.origin == "native_v2":
+    if store.origin in {"native_v2", "native_v3"}:
         return _validate_native_audit(value, store, journal)
     return legacy._validate_audit(value, journal)
 
@@ -3906,7 +4486,7 @@ def _promote_terminal_audit_partial(
                 raise
             canonical_invalid = True
         else:
-            if store.origin == "native_v2":
+            if store.origin in {"native_v2", "native_v3"}:
                 _validate_native_audit(value, store, journal)
             else:
                 legacy._validate_audit(value, journal)
@@ -3962,7 +4542,7 @@ def _restore_v2(
             target = restoring["database"]
             copy_target = (
                 root / store.reviewed_plan_manifest["artifact_paths"]["backup_copy_partial_path"]
-                if store.origin == "native_v2" else target
+                if store.origin in {"native_v2", "native_v3"} else target
             )
             for candidate in dict.fromkeys((copy_target, target)):
                 if (
@@ -4020,7 +4600,15 @@ def _restore_v2(
     store.append(journal, journal["stage"], crash_checkpoint, "recovery:audit")
     _install_terminal_audit(store, journal, "restored_source", label, crash_checkpoint)
     _cleanup_after_audit(store, journal)
-    return _report(journal, "restored_source", native=store.origin == "native_v2")
+    return _report(
+        journal,
+        "restored_source",
+        native=store.origin in {"native_v2", "native_v3"},
+        reset_protocol_version=(
+            _native_protocol_for_version(store.journal_version)
+            if store.origin in {"native_v2", "native_v3"} else None
+        ),
+    )
 
 
 def _complete_fresh_v2(
@@ -4028,58 +4616,94 @@ def _complete_fresh_v2(
     journal: dict[str, Any],
     crash_checkpoint: Callable[[str], None] | None,
 ) -> dict[str, Any]:
-    if journal["stage"] not in {"fresh_validated", "cleaning_quarantine", "finalizing"}:
+    if (
+        store.origin != "native_v3"
+        or store.journal_version != JOURNAL_VERSION
+        or journal["stage"] not in {
+            "installing_fresh", "fresh_installed", "validating_fresh",
+            "fresh_validated", "cleaning_quarantine", "finalizing",
+        }
+        or journal.get("fresh_database") is None
+    ):
         raise _error("reset_recovery_invalid")
+    fresh_authority = _validate_fresh_database(
+        journal["fresh_database"], journal["database_path"]
+    )
     database = store.root / journal["database_path"]
-    store.append(journal, journal["stage"], crash_checkpoint, "recovery:fresh_validate")
-
-    def validate_fresh(path: Path) -> None:
-        connection = legacy._open_connection(path, immutable=True)
-        try:
-            validate_v14_foundation(connection)
-            validate_database_integrity(connection)
-        finally:
-            connection.rollback()
-            connection.close()
-
     backup = store.root / journal["backup"]["path"]
     _active, quarantines, _failed, _restoring = _operational_paths(store, journal)
     with _hold_file_identity_hash(
         backup,
         journal["backup"]["identity"],
         journal["backup"]["sha256"],
-    ) as (held_backup, backup_evidence), _hold_validated_sqlite_file(
-        database, validate_fresh
+    ) as (held_backup, backup_evidence), _hold_file_identity_hash(
+        database,
+        fresh_authority["identity"],
+        fresh_authority["sha256"],
     ) as (held_fresh, fresh_evidence):
-        for key, path in quarantines.items():
-            if path is not None and os.path.lexists(path):
-                store.append(
-                    journal,
-                    journal["stage"],
-                    crash_checkpoint,
-                    "recovery:fresh_cleanup",
-                )
-                expected = journal["quarantine"][key]["identity"]
-                _unlink_verified(path, expected)
-                _flush_namespace(store.authority, path.parent)
-                _require_control_evidence(held_backup, backup_evidence)
-                _require_control_evidence(held_fresh, fresh_evidence)
+        if fresh_evidence.size != fresh_authority["size"]:
+            raise _error("reset_recovery_invalid")
+        _require_wal_header(held_fresh, recovery=True)
+        _validate_fresh_sqlite(database, fresh_authority)
+        if journal["stage"] == "installing_fresh":
+            store.append(
+                journal, "fresh_installed", crash_checkpoint,
+                "recovery:fresh_installed",
+            )
+        if journal["stage"] == "fresh_installed":
+            store.append(
+                journal, "validating_fresh", crash_checkpoint,
+                "recovery:validating_fresh",
+            )
+        if journal["stage"] == "validating_fresh":
+            _validate_fresh_sqlite(database, fresh_authority)
+            store.append(
+                journal, "fresh_validated", crash_checkpoint,
+                "recovery:fresh_validated",
+            )
+        with _hold_active_sidecar_guards(database, store.authority) as guards:
+            _validate_fresh_sqlite(database, fresh_authority)
+            _require_control_evidence(held_backup, backup_evidence)
+            _require_control_evidence(held_fresh, fresh_evidence)
+            _require_sidecar_guards(guards)
+            for key, path in quarantines.items():
+                if path is not None and os.path.lexists(path):
+                    store.append(
+                        journal,
+                        "cleaning_quarantine",
+                        crash_checkpoint,
+                        "recovery:fresh_cleanup",
+                    )
+                    expected = journal["quarantine"][key]["identity"]
+                    _unlink_verified(path, expected)
+                    _flush_namespace(store.authority, path.parent)
+                    _require_control_evidence(held_backup, backup_evidence)
+                    _require_control_evidence(held_fresh, fresh_evidence)
+                    _require_sidecar_guards(guards)
+            _require_control_evidence(held_backup, backup_evidence)
+            _require_control_evidence(held_fresh, fresh_evidence)
+            _require_sidecar_guards(guards)
+            store.append(
+                journal,
+                "finalizing",
+                crash_checkpoint,
+                "recovery:fresh_audit",
+            )
+            _install_terminal_audit(
+                store, journal, "reset", "1.4", crash_checkpoint
+            )
+            installed_audit = _existing_terminal_audit(store, journal)
+            if installed_audit is None or installed_audit["outcome"] != "reset":
+                raise _error("reset_recovery_invalid")
+        _validate_fresh_sqlite(database, fresh_authority)
+        _require_wal_header(held_fresh, recovery=True)
         _require_control_evidence(held_backup, backup_evidence)
         _require_control_evidence(held_fresh, fresh_evidence)
-        store.append(
-            journal,
-            journal["stage"],
-            crash_checkpoint,
-            "recovery:fresh_audit",
-        )
-        _install_terminal_audit(
-            store, journal, "reset", "1.4", crash_checkpoint
-        )
-        installed_audit = _existing_terminal_audit(store, journal)
-        if installed_audit is None or installed_audit["outcome"] != "reset":
-            raise _error("reset_recovery_invalid")
-        _cleanup_after_audit(store, journal)
-    return _report(journal, "reset", native=store.origin == "native_v2")
+    _cleanup_after_audit(store, journal)
+    return _report(
+        journal, "reset", native=True,
+        reset_protocol_version=RESET_PROTOCOL_VERSION,
+    )
 
 
 def _open_reviewed_plan_handle(path: Path) -> int:
@@ -4249,6 +4873,7 @@ def _handle_native_partial_only(
     reviewed_plan_manifest: str | None,
     current_commit: str,
     preliminary: dict[str, Any],
+    action: str,
 ) -> dict[str, Any] | Generation:
     match = GENERATION_RE.fullmatch(
         partial.name[:-len(GENERATION_PARTIAL_SUFFIX)]
@@ -4259,9 +4884,55 @@ def _handle_native_partial_only(
         or match.group(2) != "00000000000000000001"
     ):
         raise _error("reset_recovery_invalid")
+    canonical_complete = False
     try:
-        complete = _read_generation(partial, partial=True)
+        with _open_control_partial(partial, create_new=False) as control:
+            value, raw = _read_canonical_control(control)
+            canonical_complete = True
+            complete = _generation_from_canonical(
+                partial,
+                partial=True,
+                value=value,
+                raw=raw,
+                identity=control.identity,
+            )
+            if (
+                complete.sequence != 1
+                or complete.token != expected_token
+                or complete.envelope["origin"]
+                not in {"native_v2", "native_v3"}
+            ):
+                raise _error("reset_recovery_invalid")
+            if (
+                action != "restore-source"
+                and (
+                    complete.envelope["origin"] != "native_v3"
+                    or complete.envelope["journal"]["fresh_database"] is None
+                )
+            ):
+                raise _error("reset_recovery_invalid")
+            final = Path(
+                str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)]
+            )
+            authority = complete.envelope[
+                "reviewed_plan_manifest"
+            ]["durability"]
+            _revalidate_persisted_authority(root, authority)
+            _promote_validated_json_control(
+                control, final, raw, authority
+            )
+            return _generation_from_canonical(
+                final,
+                partial=False,
+                value=value,
+                raw=raw,
+                identity=control.identity,
+            )
     except legacy.DatabaseResetError as error:
+        if canonical_complete:
+            raise
+        if action != "restore-source":
+            raise _error("reset_recovery_invalid") from error
         if legacy._stable_sha256(partial) == match.group(3):
             raise error
         if reviewed_plan_manifest is None:
@@ -4324,35 +4995,6 @@ def _handle_native_partial_only(
             "reset_protocol_version": RESET_PROTOCOL_VERSION,
             "status": "prejournal_aborted",
         }
-    if complete.sequence != 1 or complete.token != expected_token or complete.envelope["origin"] != "native_v2":
-        raise _error("reset_recovery_invalid")
-    final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
-    authority = complete.envelope["reviewed_plan_manifest"]["durability"]
-    _revalidate_persisted_authority(root, authority)
-    with _open_control_partial(partial, create_new=False) as control:
-        value, raw = _read_canonical_control(control)
-        retained = _generation_from_canonical(
-            partial,
-            partial=True,
-            value=value,
-            raw=raw,
-            identity=control.identity,
-        )
-        if (
-            retained.raw != complete.raw
-            or retained.identity != complete.identity
-        ):
-            raise _error("reset_recovery_invalid")
-        _promote_validated_json_control(control, final, raw, authority)
-        return _generation_from_canonical(
-            final,
-            partial=False,
-            value=value,
-            raw=raw,
-            identity=control.identity,
-        )
-
-
 def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
     if not partials:
         return
@@ -4387,43 +5029,48 @@ def _handle_chain_partial(store: GenerationStore, partials: list[Path]) -> None:
         return
     if sequence != len(store.generations) + 1:
         raise _error("reset_recovery_invalid")
-    try:
-        generation = _read_generation(partial, partial=True)
-    except legacy.DatabaseResetError as error:
-        filename_digest = match.group(3)
-        if legacy._stable_sha256(partial) == filename_digest:
-            raise error
-        _unlink_verified(partial, legacy._path_identity(partial))
-        _flush_namespace(store.authority, partial.parent)
-        return
     final = Path(str(partial)[:-len(GENERATION_PARTIAL_SUFFIX)])
+    canonical_complete = False
+    canonical_error: legacy.DatabaseResetError | None = None
     with _open_control_partial(partial, create_new=False) as control:
-        value, raw = _read_canonical_control(control)
-        retained = _generation_from_canonical(
-            partial,
-            partial=True,
-            value=value,
-            raw=raw,
-            identity=control.identity,
-        )
-        if (
-            retained.raw != generation.raw
-            or retained.identity != generation.identity
-            or retained.envelope["previous_generation_sha256"]
-            != store.generations[-1].content_hash
-        ):
-            raise _error("reset_recovery_invalid")
-        _promote_validated_json_control(
-            control, final, raw, store.authority
-        )
-        installed = _generation_from_canonical(
-            final,
-            partial=False,
-            value=value,
-            raw=raw,
-            identity=control.identity,
-        )
-    store.generations.append(installed)
+        try:
+            value, raw = _read_canonical_control(control)
+        except legacy.DatabaseResetError as error:
+            canonical_error = error
+        else:
+            canonical_complete = True
+            generation = _generation_from_canonical(
+                partial,
+                partial=True,
+                value=value,
+                raw=raw,
+                identity=control.identity,
+            )
+            if (
+                generation.envelope["previous_generation_sha256"]
+                != store.generations[-1].content_hash
+            ):
+                raise _error("reset_recovery_invalid")
+            _promote_validated_json_control(
+                control, final, raw, store.authority
+            )
+            installed = _generation_from_canonical(
+                final,
+                partial=False,
+                value=value,
+                raw=raw,
+                identity=control.identity,
+            )
+            store.generations.append(installed)
+            store.chain_hashes.append(installed.content_hash)
+            return
+    if canonical_complete:
+        raise _error("reset_recovery_invalid")
+    filename_digest = match.group(3)
+    if legacy._stable_sha256(partial) == filename_digest:
+        raise canonical_error or _error("reset_recovery_invalid")
+    _unlink_verified(partial, legacy._path_identity(partial))
+    _flush_namespace(store.authority, partial.parent)
 
 
 def recover_database_reset(
@@ -4460,7 +5107,7 @@ def recover_database_reset(
             store = _store_from_chain(root, chain, chain_hashes)
             if store.origin == "legacy_v1_conversion" and reviewed_plan_manifest is not None:
                 raise _error("reset_recovery_invalid")
-            if store.origin == "native_v2" and reviewed_plan_manifest is not None:
+            if store.origin in {"native_v2", "native_v3"} and reviewed_plan_manifest is not None:
                 supplied = _read_reviewed_plan(reviewed_plan_manifest, expected_plan_token, current_commit)
                 if supplied["reviewed_plan_manifest"] != store.reviewed_plan_manifest:
                     raise _error("reset_recovery_invalid")
@@ -4477,21 +5124,37 @@ def recover_database_reset(
                     ),
                 )
             store.authority = _revalidate_persisted_authority(root, store.authority)
-            _cleanup_matching_evidence_records(store, evidence_paths)
             journal = store.journal
             expected_outcome = "restored_source" if action == "restore-source" else "reset"
-            promoted_audit = _promote_terminal_audit_partial(
-                store, journal, expected_outcome
-            )
             terminal_audit = _existing_terminal_audit(store, journal)
             if terminal_audit is not None:
                 if terminal_audit["outcome"] != expected_outcome:
                     raise _error("reset_recovery_invalid")
-                _cleanup_after_audit(store, journal)
+                historical = store.origin in {
+                    "native_v2", "legacy_v1_conversion"
+                }
+                _cleanup_after_audit(
+                    store,
+                    journal,
+                    historical_reset_cleanup=(
+                        historical and terminal_audit["outcome"] == "reset"
+                    ),
+                )
                 return _report(
                     journal, expected_outcome,
-                    native=store.origin == "native_v2",
+                    native=store.origin in {"native_v2", "native_v3"},
+                    reset_protocol_version=(
+                        _native_protocol_for_version(store.journal_version)
+                        if store.origin in {"native_v2", "native_v3"}
+                        else None
+                    ),
                 )
+            if (
+                store.origin in {"native_v2", "legacy_v1_conversion"}
+                and action != "restore-source"
+            ):
+                raise _error("reset_recovery_invalid")
+            _cleanup_matching_evidence_records(store, evidence_paths)
             _handle_chain_partial(store, partials)
             journal = store.journal
             backup = root / journal["backup"]["path"]
@@ -4508,6 +5171,8 @@ def recover_database_reset(
         if legacy_paths or evidence_paths:
             if reviewed_plan_manifest is not None:
                 raise _error("reset_recovery_invalid")
+            if action != "restore-source":
+                raise _error("reset_recovery_invalid")
             selection = _select_legacy(root, expected_plan_token)
             record, authority = _handle_evidence_state(
                 root, expected_plan_token, current_commit, selection,
@@ -4518,10 +5183,14 @@ def recover_database_reset(
                 origin="legacy_v1_conversion", reviewed_plan_manifest=None,
                 legacy_recovery_evidence=record.value["legacy_recovery_evidence"],
                 legacy_source=record.value["legacy_source"],
-                converter_implementation_commit=current_commit,
+                converter_implementation_commit=record.value[
+                    "converter_implementation_commit"
+                ],
             )
             _revalidate_legacy_context(
-                root, expected_plan_token, current_commit, selection,
+                root, expected_plan_token,
+                record.value["converter_implementation_commit"],
+                current_commit, selection,
                 _expected_legacy_names(selection.source)
                 + [record.path.name]
                 + [path.name for path in partials],
@@ -4542,27 +5211,29 @@ def recover_database_reset(
                 raise _error("reset_recovery_invalid")
             if os.path.lexists(record.path):
                 _revalidate_legacy_context(
-                    root, expected_plan_token, current_commit, selection,
+                    root, expected_plan_token,
+                    record.value["converter_implementation_commit"],
+                    current_commit, selection,
                     _expected_legacy_names(selection.source)
                     + [record.path.name, generation.path.name],
                 )
                 reread_record = _validate_evidence_record(
                     record.path, partial=False,
                     expected_token=expected_plan_token,
-                    converter=current_commit,
+                    converter=record.value[
+                        "converter_implementation_commit"
+                    ],
                 )
                 if reread_record.raw != record.raw:
                     raise _error("reset_recovery_invalid")
                 _unlink_verified_bytes(record.path, record.identity, record.raw)
                 _flush_namespace(authority, record.path.parent)
             journal = store.journal
-            if action == "restore-source":
-                return _restore_v2(store, journal, crash_checkpoint)
-            return _complete_fresh_v2(store, journal, crash_checkpoint)
+            return _restore_v2(store, journal, crash_checkpoint)
         if len(partials) == 1:
             handled = _handle_native_partial_only(
                 root, partials[0], expected_plan_token,
-                reviewed_plan_manifest, current_commit, preliminary,
+                reviewed_plan_manifest, current_commit, preliminary, action,
             )
             if isinstance(handled, dict):
                 return handled

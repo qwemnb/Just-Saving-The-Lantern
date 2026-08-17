@@ -1043,6 +1043,7 @@ def _windows_create_relative(
     create_new: bool = True,
     desired_access: int | None = None,
     share_access: int = 0x1 | 0x2 | 0x4,
+    collision_error: str | None = None,
 ) -> int:
     import ctypes
     from ctypes import wintypes
@@ -1107,6 +1108,12 @@ def _windows_create_relative(
         ctypes.byref(status_block), None, 0x10 if directory else 0x80,
         share_access, 2 if create_new else 1, options, None, 0,
     )
+    if (
+        status < 0
+        and (int(status) & 0xFFFFFFFF) == 0xC0000035
+        and collision_error is not None
+    ):
+        raise _error(collision_error)
     if status < 0 or not handle.value:
         raise _error("reset_failed")
     return int(handle.value)

@@ -154,6 +154,101 @@ class ResetProtocolTests(unittest.TestCase):
         self.make_v12_at(self.database)
 
     @staticmethod
+    def make_v14_at(database: Path) -> None:
+        if database.exists():
+            database.unlink()
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            connection.executescript(
+                reset_module.DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8")
+            )
+            reset_module._seed_initial_room(connection)
+            connection.commit()
+            self_mode = connection.execute(
+                "PRAGMA journal_mode=WAL"
+            ).fetchone()[0]
+            if str(self_mode).lower() != "wal":
+                raise AssertionError("fixture did not enter WAL mode")
+        finally:
+            connection.close()
+
+    def rewrite_single_native_generation_as_v2(
+        self,
+        generation: reset_v2.Generation,
+        implementation_commit: str,
+        *,
+        stage: str | None = None,
+        root: Path | None = None,
+    ) -> tuple[str, reset_v2.Generation]:
+        target_root = self.root if root is None else root
+        envelope = json.loads(json.dumps(generation.envelope))
+        manifest = envelope["reviewed_plan_manifest"]
+        manifest["implementation_commit"] = implementation_commit
+        manifest["journal_version"] = reset_v2.NATIVE_V2_JOURNAL_VERSION
+        manifest["reset_protocol_version"] = (
+            reset_v2.NATIVE_V2_RESET_PROTOCOL_VERSION
+        )
+        token = reset_v2._sha256(reset_v2._canonical_bytes(manifest))
+        journal = envelope["journal"]
+        journal.pop("fresh_database", None)
+        journal["implementation_commit"] = implementation_commit
+        journal["journal_version"] = reset_v2.NATIVE_V2_JOURNAL_VERSION
+        journal["plan_manifest_sha256"] = token
+        journal["plan_token"] = token
+        journal["reset_protocol_version"] = (
+            reset_v2.NATIVE_V2_RESET_PROTOCOL_VERSION
+        )
+        if stage is not None:
+            journal["stage"] = stage
+        envelope["origin"] = "native_v2"
+        envelope["reviewed_plan_manifest"] = manifest
+        raw = reset_v2._canonical_bytes(envelope)
+        digest = reset_v2._sha256(raw)
+        path = target_root / "data" / reset_v2._generation_name(
+            token, 1, digest
+        )
+        generation.path.unlink()
+        path.write_bytes(raw)
+        return token, reset_v2._read_generation(path, partial=False)
+
+    def crash_native_at(
+        self, checkpoint: str, *, occurrence: int = 1
+    ) -> tuple[dict[str, object], list[reset_v2.Generation]]:
+        plan = plan_database_reset(
+            "data/helios.db", repository_root=self.root
+        )
+        reached = 0
+
+        def stop(name: str) -> None:
+            nonlocal reached
+            if name == checkpoint:
+                reached += 1
+                if reached == occurrence:
+                    raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            execute_database_reset(
+                "data/helios.db",
+                expected_plan_token=plan["plan_token"],
+                expected_backup_path=plan["backup_path"],
+                expected_audit_path=plan["audit_path"],
+                confirm_destroy_canonical_history=True,
+                repository_root=self.root,
+                crash_checkpoint=stop,
+            )
+        generations = sorted(
+            (
+                reset_v2._read_generation(path, partial=False)
+                for path in (self.root / "data").iterdir()
+                if reset_v2.GENERATION_RE.fullmatch(path.name)
+            ),
+            key=lambda item: item.sequence,
+        )
+        return plan, generations
+
+    @staticmethod
     def make_v12_at(database: Path) -> None:
         schema = Path(__file__).parents[1] / "schema" / "helios_room_schema_v1_2.sql"
         connection = sqlite3.connect(database)
@@ -207,10 +302,20 @@ class ResetProtocolTests(unittest.TestCase):
             "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"
         )
 
-    def make_legacy_ready_journal(self, token: str, backup_relative: str, audit_relative: str) -> Path:
-        backup = self.root / backup_relative
+    def make_legacy_ready_journal(
+        self,
+        token: str,
+        backup_relative: str,
+        audit_relative: str,
+        *,
+        root: Path | None = None,
+        database: Path | None = None,
+    ) -> Path:
+        fixture_root = self.root if root is None else root
+        fixture_database = self.database if database is None else database
+        backup = fixture_root / backup_relative
         backup.parent.mkdir(exist_ok=True)
-        source = reset_module._open_reset_source(self.database)
+        source = reset_module._open_reset_source(fixture_database)
         try:
             source_label, digest = reset_module._validate_source(source)
             target = sqlite3.connect(backup)
@@ -221,11 +326,11 @@ class ResetProtocolTests(unittest.TestCase):
         finally:
             source.rollback()
             source.close()
-        observations = reset_module._observations(self.database)
+        observations = reset_module._observations(fixture_database)
         active = {
-            "database": self.database,
-            "wal": Path(f"{self.database}-wal"),
-            "shm": Path(f"{self.database}-shm"),
+            "database": fixture_database,
+            "wal": Path(f"{fixture_database}-wal"),
+            "shm": Path(f"{fixture_database}-shm"),
         }
         components = {
             key: (reset_module._component(path, f"data/{path.name}") if path.exists() else None)
@@ -265,7 +370,7 @@ class ResetProtocolTests(unittest.TestCase):
             "stage": "ready_to_quarantine",
             "updated_at": "2026-08-14T12:00:00.000Z",
         }
-        path = self.root / "data" / ".helios-room-reset-state.json"
+        path = fixture_root / "data" / ".helios-room-reset-state.json"
         path.write_bytes(reset_v2._canonical_bytes(journal))
         return path
 
@@ -452,6 +557,18 @@ class ResetProtocolTests(unittest.TestCase):
             for path in (self.root / "data").iterdir()
         ))
         self.assertTrue(Path(f"{self.root / audit}.generation-chain.json").is_file())
+        current_commit = self.git("rev-parse", "HEAD").strip()
+        self.assertNotIn(
+            current_commit, reset_v2.LEGACY_CONVERSION_RECOVERY_COMMITS
+        )
+        retained = json.loads(
+            Path(f"{self.root / audit}.generation-chain.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            retained["converter_implementation_commit"], current_commit
+        )
 
     def test_interrupted_legacy_evidence_partial_recovers_with_changed_transient_probe(self) -> None:
         token = "b" * 64
@@ -490,6 +607,246 @@ class ResetProtocolTests(unittest.TestCase):
             )
         self.assertEqual(report["status"], "restored_source")
         self.assertFalse(old_partial.exists())
+        retained = json.loads(
+            Path(f"{self.root / audit}.generation-chain.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            retained["converter_implementation_commit"],
+            self.git("rev-parse", "HEAD").strip(),
+        )
+
+    def test_historical_legacy_evidence_completes_under_a_different_current_commit(self) -> None:
+        for index, historical_commit in enumerate(
+            sorted(reset_v2.LEGACY_CONVERSION_RECOVERY_COMMITS)
+        ):
+            with self.subTest(commit=historical_commit):
+                root, database = self.make_isolated_fixture(
+                    f"legacy-historical-{index}"
+                )
+                token = f"{index + 1:x}" * 64
+                stem = "helios-pre-room-shared-reset-20260814T120000010Z"
+                backup = f"backups/{stem}.db"
+                audit = f"backups/{stem}.audit.json"
+                self.make_legacy_ready_journal(
+                    token,
+                    backup,
+                    audit,
+                    root=root,
+                    database=database,
+                )
+                with patch(
+                    "app.reset_protocol_v2._current_commit",
+                    return_value=historical_commit,
+                ), patch.object(
+                    reset_v2.GenerationStore,
+                    "append",
+                    side_effect=KeyboardInterrupt(),
+                ):
+                    with self.assertRaises(KeyboardInterrupt):
+                        recover_database_reset(
+                            "data/helios.db",
+                            expected_plan_token=token,
+                            action="restore-source",
+                            confirm_reset_recovery=True,
+                            repository_root=root,
+                        )
+                evidence = next(
+                    path
+                    for path in (root / "data").iterdir()
+                    if reset_v2.EVIDENCE_RE.fullmatch(path.name)
+                )
+                record = json.loads(evidence.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    record["converter_implementation_commit"],
+                    historical_commit,
+                )
+                with self.assertRaises(KeyboardInterrupt):
+                    recover_database_reset(
+                        "data/helios.db",
+                        expected_plan_token=token,
+                        action="restore-source",
+                        confirm_reset_recovery=True,
+                        repository_root=root,
+                        crash_checkpoint=lambda name: (
+                            (_ for _ in ()).throw(KeyboardInterrupt())
+                            if name == "recovery:validate_source" else None
+                        ),
+                    )
+                generations = [
+                    reset_v2._read_generation(path, partial=False)
+                    for path in (root / "data").iterdir()
+                    if reset_v2.GENERATION_RE.fullmatch(path.name)
+                ]
+                self.assertTrue(generations)
+                self.assertTrue(all(
+                    item.envelope["converter_implementation_commit"]
+                    == historical_commit
+                    and item.envelope["legacy_recovery_evidence"][
+                        "converter_implementation_commit"
+                    ] == historical_commit
+                    for item in generations
+                ))
+                report = recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=token,
+                    action="restore-source",
+                    confirm_reset_recovery=True,
+                    repository_root=root,
+                )
+                self.assertEqual(report["status"], "restored_source")
+                retained = json.loads(
+                    Path(f"{root / audit}.generation-chain.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    retained["converter_implementation_commit"],
+                    historical_commit,
+                )
+
+    def test_historical_legacy_complete_evidence_and_generation_partials_preserve_converter(self) -> None:
+        historical_commit = sorted(
+            reset_v2.LEGACY_CONVERSION_RECOVERY_COMMITS
+        )[0]
+        for suffix, interrupt_install in (
+            ("evidence", True),
+            ("generation", False),
+        ):
+            with self.subTest(artifact=suffix):
+                root, database = self.make_isolated_fixture(
+                    f"legacy-{suffix}-partial"
+                )
+                token = ("a" if interrupt_install else "b") * 64
+                stem = "helios-pre-room-shared-reset-20260814T120000011Z"
+                self.make_legacy_ready_journal(
+                    token,
+                    f"backups/{stem}.db",
+                    f"backups/{stem}.audit.json",
+                    root=root,
+                    database=database,
+                )
+                original_promote = reset_v2._promote_open_control
+
+                def stop_evidence_install(
+                    control: object,
+                    final: Path,
+                    expected_raw: bytes | None,
+                    **kwargs: object,
+                ) -> str:
+                    if ".legacy-evidence." in final.name:
+                        raise KeyboardInterrupt()
+                    return original_promote(
+                        control, final, expected_raw, **kwargs
+                    )
+
+                current_patch = patch(
+                    "app.reset_protocol_v2._current_commit",
+                    return_value=historical_commit,
+                )
+                promotion_patch = (
+                    patch(
+                        "app.reset_protocol_v2._promote_open_control",
+                        side_effect=stop_evidence_install,
+                    )
+                    if interrupt_install
+                    else patch(
+                        "app.reset_protocol_v2._promote_open_control",
+                        wraps=original_promote,
+                    )
+                )
+                with current_patch, promotion_patch, self.assertRaises(
+                    KeyboardInterrupt
+                ):
+                    recover_database_reset(
+                        "data/helios.db",
+                        expected_plan_token=token,
+                        action="restore-source",
+                        confirm_reset_recovery=True,
+                        repository_root=root,
+                        crash_checkpoint=(
+                            None
+                            if interrupt_install
+                            else lambda name: (
+                                (_ for _ in ()).throw(KeyboardInterrupt())
+                                if name
+                                == "legacy_conversion:generation_partial_write"
+                                else None
+                            )
+                        ),
+                    )
+                report = recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=token,
+                    action="restore-source",
+                    confirm_reset_recovery=True,
+                    repository_root=root,
+                )
+                self.assertEqual(report["status"], "restored_source")
+                manifest = json.loads(
+                    (root / f"backups/{stem}.audit.json.generation-chain.json")
+                    .read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    manifest["converter_implementation_commit"],
+                    historical_commit,
+                )
+
+    def test_legacy_complete_fresh_and_unlisted_converter_fail_before_mutation(self) -> None:
+        token = "d" * 64
+        stem = "helios-pre-room-shared-reset-20260814T120000012Z"
+        backup = f"backups/{stem}.db"
+        audit = f"backups/{stem}.audit.json"
+        self.make_legacy_ready_journal(token, backup, audit)
+
+        def snapshot() -> dict[str, bytes]:
+            return {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for parent in (self.root / "data", self.root / "backups")
+                for path in parent.iterdir()
+                if path.is_file()
+                and path.name != ".helios-room-database.lock"
+            }
+
+        before = snapshot()
+        with self.assertRaises(DatabaseResetError) as invalid:
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="complete-fresh",
+                confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
+        self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+        self.assertEqual(snapshot(), before)
+
+        with patch(
+            "app.reset_protocol_v2._current_commit", return_value="1" * 40
+        ), patch.object(
+            reset_v2.GenerationStore,
+            "append",
+            side_effect=KeyboardInterrupt(),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=token,
+                    action="restore-source",
+                    confirm_reset_recovery=True,
+                    repository_root=self.root,
+                )
+        before_rejection = snapshot()
+        with self.assertRaises(DatabaseResetError) as rejected:
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="restore-source",
+                confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
+        self.assertEqual(rejected.exception.code, "reset_recovery_invalid")
+        self.assertEqual(snapshot(), before_rejection)
 
     def test_evidence_partial_post_disposition_failure_stops_before_regeneration(self) -> None:
         token = "c" * 64
@@ -1492,6 +1849,143 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertGreaterEqual(len(guarded_deletions), 1)
         self.assertTrue(all(path in quarantine_paths for path in guarded_deletions))
 
+    def test_wal_evidence_uses_writable_result_and_retained_header_not_immutable_pragma(self) -> None:
+        header_path = self.root / "data" / "header-evidence.db"
+        valid_header = b"SQLite format 3\x00" + b"\x00\x00\x02\x02"
+
+        def check(raw: bytes, *, recovery: bool) -> str | None:
+            header_path.write_bytes(raw)
+            descriptor = os.open(header_path, os.O_RDONLY)
+            try:
+                control = reset_v2._ControlPartial(
+                    header_path,
+                    descriptor,
+                    0,
+                    "",
+                    reset_module._path_identity(header_path),
+                )
+                try:
+                    reset_v2._require_wal_header(
+                        control, recovery=recovery
+                    )
+                except DatabaseResetError as error:
+                    return error.code
+                return None
+            finally:
+                os.close(descriptor)
+
+        self.assertIsNone(check(valid_header, recovery=False))
+        for raw in (
+            valid_header[:18] + b"\x01\x02",
+            valid_header[:19] + b"\x01",
+            valid_header[:19],
+            b"Not SQLite data!!!!",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(check(raw, recovery=False), "reset_failed")
+                self.assertEqual(
+                    check(raw, recovery=True), "reset_recovery_invalid"
+                )
+
+        class ImmutableConnection:
+            def __init__(self) -> None:
+                self.executed: list[str] = []
+
+            def execute(self, sql: str) -> object:
+                self.executed.append(sql)
+                raise AssertionError(
+                    "immutable PRAGMA journal_mode must not be queried"
+                )
+
+            def rollback(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        immutable = ImmutableConnection()
+        evidence = {
+            "identity": "windows:0000000000000001:" + "1" * 32,
+            "journal_mode": "wal",
+            "logical_digest": "2" * 64,
+            "path": "data/helios.db",
+            "schema_label": "1.4",
+            "sha256": "3" * 64,
+            "size": 8192,
+        }
+        with patch(
+            "app.reset_protocol_v2.legacy._open_connection",
+            return_value=immutable,
+        ), patch(
+            "app.reset_protocol_v2.validate_v14_foundation"
+        ) as foundation, patch(
+            "app.reset_protocol_v2.validate_database_integrity"
+        ) as integrity, patch(
+            "app.reset_protocol_v2.legacy.logical_digest",
+            return_value=evidence["logical_digest"],
+        ):
+            reset_v2._validate_fresh_sqlite(self.database, evidence)
+        self.assertEqual(immutable.executed, [])
+        foundation.assert_called_once_with(immutable)
+        integrity.assert_called_once_with(immutable)
+        header_path.unlink()
+
+        plan = plan_database_reset(
+            "data/helios.db", repository_root=self.root
+        )
+        fresh_path = self.root / plan["reviewed_plan_manifest"][
+            "artifact_paths"
+        ]["fresh_database_staging_path"]
+        real_open_direct = reset_module._open_direct
+        matching_opens = 0
+        executed: list[str] = []
+
+        class NonWalConnection:
+            def execute(self, sql: str) -> object:
+                executed.append(sql)
+
+                class Result:
+                    @staticmethod
+                    def fetchone() -> tuple[str]:
+                        return ("delete",)
+
+                return Result()
+
+            def close(self) -> None:
+                pass
+
+        def open_direct(path: Path, *, read_only: bool) -> object:
+            nonlocal matching_opens
+            if Path(path) == fresh_path and not read_only:
+                matching_opens += 1
+                if matching_opens == 2:
+                    return NonWalConnection()
+            return real_open_direct(path, read_only=read_only)
+
+        with patch(
+            "app.reset_database._open_direct",
+            side_effect=open_direct,
+        ):
+            with self.assertRaises(DatabaseResetError) as failed:
+                execute_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=plan["plan_token"],
+                    expected_backup_path=plan["backup_path"],
+                    expected_audit_path=plan["audit_path"],
+                    confirm_destroy_canonical_history=True,
+                    repository_root=self.root,
+                )
+        self.assertEqual(failed.exception.code, "reset_failed")
+        self.assertEqual(executed, ["PRAGMA journal_mode=WAL"])
+        for path in (self.root / "data").iterdir():
+            if reset_v2.GENERATION_RE.fullmatch(path.name):
+                generation = reset_v2._read_generation(
+                    path, partial=False
+                )
+                self.assertIsNone(
+                    generation.envelope["journal"]["fresh_database"]
+                )
+
     def test_failed_backup_or_fresh_hold_prevents_all_quarantine_deletion(self) -> None:
         real_hold = reset_v2._hold_file_evidence
         real_unlink = reset_v2._unlink_verified
@@ -1545,6 +2039,85 @@ class ResetProtocolTests(unittest.TestCase):
                 self.assertEqual(failed.exception.code, "reset_path_unsafe")
                 self.assertEqual(quarantine_deletions, [])
 
+    def test_sidecar_guards_reserve_all_names_and_collisions_fail_closed(self) -> None:
+        authority = self.synthetic_durability(self.root)
+        sidecars = [
+            Path(f"{self.database}-wal"),
+            Path(f"{self.database}-shm"),
+            Path(f"{self.database}-journal"),
+        ]
+        self.assertTrue(all(not os.path.lexists(path) for path in sidecars))
+        with reset_v2._hold_active_sidecar_guards(
+            self.database, authority
+        ) as guards:
+            self.assertEqual(
+                [guard.name for guard in guards],
+                [path.name for path in sidecars],
+            )
+            reset_v2._require_sidecar_guards(guards)
+            for path in sidecars:
+                with self.assertRaises(OSError):
+                    path.write_bytes(b"attacker")
+        self.assertTrue(all(not os.path.lexists(path) for path in sidecars))
+
+        for path in sidecars:
+            with self.subTest(sidecar=path.name):
+                path.write_bytes(b"hostile")
+                before = path.read_bytes()
+                with self.assertRaises(DatabaseResetError) as collision:
+                    with reset_v2._hold_active_sidecar_guards(
+                        self.database, authority
+                    ):
+                        self.fail("collision must prevent guard entry")
+                self.assertEqual(
+                    collision.exception.code, "reset_recovery_invalid"
+                )
+                self.assertEqual(path.read_bytes(), before)
+                path.unlink()
+
+    def test_sidecar_guard_failure_precedes_every_quarantine_deletion(self) -> None:
+        plan = plan_database_reset(
+            "data/helios.db", repository_root=self.root
+        )
+        quarantine_paths = {
+            self.root / relative
+            for name, relative in plan["reviewed_plan_manifest"][
+                "artifact_paths"
+            ].items()
+            if name.startswith("original_quarantine_")
+        }
+        real_unlink = reset_v2._unlink_verified
+        deleted: list[Path] = []
+
+        def record_unlink(path: Path, identity: str) -> None:
+            if path in quarantine_paths:
+                deleted.append(path)
+            real_unlink(path, identity)
+
+        @contextmanager
+        def fail_guards(_database: Path, _authority: dict[str, object]):
+            raise reset_v2._error("reset_failed")
+            yield []
+
+        with patch(
+            "app.reset_protocol_v2._hold_active_sidecar_guards",
+            side_effect=fail_guards,
+        ), patch(
+            "app.reset_protocol_v2._unlink_verified",
+            side_effect=record_unlink,
+        ):
+            with self.assertRaises(DatabaseResetError) as failed:
+                execute_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=plan["plan_token"],
+                    expected_backup_path=plan["backup_path"],
+                    expected_audit_path=plan["audit_path"],
+                    confirm_destroy_canonical_history=True,
+                    repository_root=self.root,
+                )
+        self.assertEqual(failed.exception.code, "reset_failed")
+        self.assertEqual(deleted, [])
+
     def test_crash_journal_blocks_startup_and_restore_source_is_repeatable(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
         with self.assertRaises(KeyboardInterrupt):
@@ -1576,7 +2149,7 @@ class ResetProtocolTests(unittest.TestCase):
                 "legacy_source", "origin", "previous_generation_sha256",
                 "reviewed_plan_manifest",
             })
-            self.assertEqual(generation.envelope["origin"], "native_v2")
+            self.assertEqual(generation.envelope["origin"], "native_v3")
             self.assertEqual(
                 generation.envelope["reviewed_plan_manifest"],
                 plan["reviewed_plan_manifest"],
@@ -1609,6 +2182,406 @@ class ResetProtocolTests(unittest.TestCase):
             ).fetchone()[0], "1.2")
         finally:
             connection.close()
+
+    def test_native_v2_historical_commits_restore_without_schema_upgrade(self) -> None:
+        for index, historical_commit in enumerate(
+            sorted(reset_v2.NATIVE_V2_RECOVERY_SOURCE_COMMITS)
+        ):
+            with self.subTest(commit=historical_commit):
+                root, database = self.make_isolated_fixture(
+                    f"native-v2-{index}"
+                )
+                plan = plan_database_reset(
+                    "data/helios.db", repository_root=root
+                )
+                with self.assertRaises(KeyboardInterrupt):
+                    execute_database_reset(
+                        "data/helios.db",
+                        expected_plan_token=plan["plan_token"],
+                        expected_backup_path=plan["backup_path"],
+                        expected_audit_path=plan["audit_path"],
+                        confirm_destroy_canonical_history=True,
+                        repository_root=root,
+                        crash_checkpoint=lambda name: (
+                            (_ for _ in ()).throw(KeyboardInterrupt())
+                            if name == "ready_to_quarantine" else None
+                        ),
+                    )
+                native_v3 = next(
+                    reset_v2._read_generation(path, partial=False)
+                    for path in (root / "data").iterdir()
+                    if reset_v2.GENERATION_RE.fullmatch(path.name)
+                )
+                token, _native_v2 = self.rewrite_single_native_generation_as_v2(
+                    native_v3,
+                    historical_commit,
+                    root=root,
+                )
+                with self.assertRaises(KeyboardInterrupt):
+                    recover_database_reset(
+                        "data/helios.db",
+                        expected_plan_token=token,
+                        action="restore-source",
+                        confirm_reset_recovery=True,
+                        repository_root=root,
+                        crash_checkpoint=lambda name: (
+                            (_ for _ in ()).throw(KeyboardInterrupt())
+                            if name == "recovery:validate_source" else None
+                        ),
+                    )
+                retained = [
+                    reset_v2._read_generation(path, partial=False)
+                    for path in (root / "data").iterdir()
+                    if reset_v2.GENERATION_RE.fullmatch(path.name)
+                ]
+                self.assertGreaterEqual(len(retained), 2)
+                for generation in retained:
+                    self.assertEqual(generation.envelope["origin"], "native_v2")
+                    self.assertEqual(
+                        generation.envelope["journal"]["journal_version"], 2
+                    )
+                    self.assertEqual(
+                        generation.envelope["journal"][
+                            "implementation_commit"
+                        ],
+                        historical_commit,
+                    )
+                    self.assertNotIn(
+                        "fresh_database", generation.envelope["journal"]
+                    )
+                report = recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=token,
+                    action="restore-source",
+                    confirm_reset_recovery=True,
+                    repository_root=root,
+                )
+                self.assertEqual(report["status"], "restored_source")
+                audit = json.loads(
+                    (root / plan["audit_path"]).read_text(encoding="utf-8")
+                )
+                self.assertEqual(audit["audit_version"], 1)
+                self.assertEqual(
+                    audit["implementation_commit"], historical_commit
+                )
+                self.assertNotIn("fresh_database", audit)
+                connection = sqlite3.connect(database)
+                try:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT schema_label FROM schema_migrations "
+                            "ORDER BY migration_no DESC LIMIT 1"
+                        ).fetchone()[0],
+                        "1.2",
+                    )
+                finally:
+                    connection.close()
+
+    def test_native_v2_unlisted_commit_and_complete_fresh_fail_before_mutation(self) -> None:
+        _plan, generations = self.crash_native_at("ready_to_quarantine")
+        token, _generation = self.rewrite_single_native_generation_as_v2(
+            generations[0], "1" * 40
+        )
+
+        def snapshot() -> dict[str, bytes]:
+            return {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for parent in (self.root / "data", self.root / "backups")
+                for path in parent.iterdir()
+                if path.is_file()
+                and path.name != ".helios-room-database.lock"
+            }
+
+        before = snapshot()
+        for action in ("restore-source", "complete-fresh"):
+            with self.subTest(action=action), self.assertRaises(
+                DatabaseResetError
+            ) as invalid:
+                recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=token,
+                    action=action,
+                    confirm_reset_recovery=True,
+                    repository_root=self.root,
+                )
+            self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+            self.assertEqual(snapshot(), before)
+
+    def test_historical_restored_audits_require_matching_action_and_append_nothing(self) -> None:
+        plan, generations = self.crash_native_at("ready_to_quarantine")
+        token, _generation = self.rewrite_single_native_generation_as_v2(
+            generations[0],
+            sorted(reset_v2.NATIVE_V2_RECOVERY_SOURCE_COMMITS)[0],
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="restore-source",
+                confirm_reset_recovery=True,
+                repository_root=self.root,
+                crash_checkpoint=lambda name: (
+                    (_ for _ in ()).throw(KeyboardInterrupt())
+                    if name == "recovery:audit_partial_durable" else None
+                ),
+            )
+        audit_path = self.root / plan["audit_path"]
+        audit_raw = audit_path.read_bytes()
+        generations_before = sorted(
+            path.read_bytes()
+            for path in (self.root / "data").iterdir()
+            if reset_v2.GENERATION_RE.fullmatch(path.name)
+        )
+        with self.assertRaises(DatabaseResetError) as mismatch:
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="complete-fresh",
+                confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
+        self.assertEqual(mismatch.exception.code, "reset_recovery_invalid")
+        self.assertEqual(audit_path.read_bytes(), audit_raw)
+        self.assertEqual(
+            sorted(
+                path.read_bytes()
+                for path in (self.root / "data").iterdir()
+                if reset_v2.GENERATION_RE.fullmatch(path.name)
+            ),
+            generations_before,
+        )
+        report = recover_database_reset(
+            "data/helios.db",
+            expected_plan_token=token,
+            action="restore-source",
+            confirm_reset_recovery=True,
+            repository_root=self.root,
+        )
+        self.assertEqual(report["status"], "restored_source")
+        self.assertEqual(audit_path.read_bytes(), audit_raw)
+        self.assertFalse(any(
+            reset_v2.GENERATION_RE.fullmatch(path.name)
+            for path in (self.root / "data").iterdir()
+        ))
+
+    def test_historical_reset_audits_only_authorize_control_cleanup(self) -> None:
+        historical_commit = sorted(
+            reset_v2.NATIVE_V2_RECOVERY_SOURCE_COMMITS
+        )[0]
+        plan, generations = self.crash_native_at("ready_to_quarantine")
+        token, native_v2 = self.rewrite_single_native_generation_as_v2(
+            generations[0], historical_commit
+        )
+        self.make_v14_at(self.database)
+        native_store = reset_v2._store_from_chain(self.root, [native_v2])
+        native_audit = reset_v2._native_audit_value(
+            native_store, native_v2.envelope["journal"], "reset", "1.4"
+        )
+        audit_path = self.root / plan["audit_path"]
+        audit_path.write_bytes(reset_v2._canonical_bytes(native_audit))
+        generation_raw = native_v2.path.read_bytes()
+        database_raw = self.database.read_bytes()
+        with self.assertRaises(DatabaseResetError) as mismatch:
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="restore-source",
+                confirm_reset_recovery=True,
+                repository_root=self.root,
+            )
+        self.assertEqual(mismatch.exception.code, "reset_recovery_invalid")
+        self.assertEqual(native_v2.path.read_bytes(), generation_raw)
+        self.assertEqual(self.database.read_bytes(), database_raw)
+        report = recover_database_reset(
+            "data/helios.db",
+            expected_plan_token=token,
+            action="complete-fresh",
+            confirm_reset_recovery=True,
+            repository_root=self.root,
+        )
+        self.assertEqual(report["status"], "reset")
+        self.assertEqual(self.database.read_bytes(), database_raw)
+        self.assertFalse(native_v2.path.exists())
+        self.assertEqual(
+            json.loads(audit_path.read_text(encoding="utf-8"))[
+                "implementation_commit"
+            ],
+            historical_commit,
+        )
+
+        root, database = self.make_isolated_fixture(
+            "converted-terminal-reset"
+        )
+        legacy_token = "e" * 64
+        stem = "helios-pre-room-shared-reset-20260814T120000013Z"
+        legacy_audit_relative = f"backups/{stem}.audit.json"
+        self.make_legacy_ready_journal(
+            legacy_token,
+            f"backups/{stem}.db",
+            legacy_audit_relative,
+            root=root,
+            database=database,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=legacy_token,
+                action="restore-source",
+                confirm_reset_recovery=True,
+                repository_root=root,
+                crash_checkpoint=lambda name: (
+                    (_ for _ in ()).throw(KeyboardInterrupt())
+                    if name == "recovery:validate_source" else None
+                ),
+            )
+        converted = sorted(
+            (
+                reset_v2._read_generation(path, partial=False)
+                for path in (root / "data").iterdir()
+                if reset_v2.GENERATION_RE.fullmatch(path.name)
+            ),
+            key=lambda item: item.sequence,
+        )
+        converted_store = reset_v2._store_from_chain(root, converted)
+        converted_journal = converted_store.journal
+        self.make_v14_at(database)
+        converted_audit_path = root / legacy_audit_relative
+        converted_audit_path.write_bytes(reset_v2._canonical_bytes(
+            reset_module._audit_value(
+                converted_journal, "reset", "1.4"
+            )
+        ))
+        converted_database_raw = database.read_bytes()
+        converted_hashes = converted_store.hashes()
+        report = recover_database_reset(
+            "data/helios.db",
+            expected_plan_token=legacy_token,
+            action="complete-fresh",
+            confirm_reset_recovery=True,
+            repository_root=root,
+        )
+        self.assertEqual(report["status"], "reset")
+        self.assertEqual(database.read_bytes(), converted_database_raw)
+        manifest = json.loads(
+            Path(f"{converted_audit_path}.generation-chain.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            manifest["generation_chain_sha256"], converted_hashes
+        )
+        self.assertEqual(
+            manifest["converter_implementation_commit"],
+            converted_store.converter_implementation_commit,
+        )
+        self.assertFalse(any(
+            reset_v2.GENERATION_RE.fullmatch(path.name)
+            for path in (root / "data").iterdir()
+        ))
+
+    def test_historical_invalid_audit_partial_and_remaining_quarantine_never_authorize_cleanup(self) -> None:
+        historical_commit = sorted(
+            reset_v2.NATIVE_V2_RECOVERY_SOURCE_COMMITS
+        )[0]
+
+        def prepare(name: str) -> tuple[
+            Path, Path, dict[str, object], str, reset_v2.Generation
+        ]:
+            root, database = self.make_isolated_fixture(name)
+            plan = plan_database_reset(
+                "data/helios.db", repository_root=root
+            )
+            with self.assertRaises(KeyboardInterrupt):
+                execute_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=plan["plan_token"],
+                    expected_backup_path=plan["backup_path"],
+                    expected_audit_path=plan["audit_path"],
+                    confirm_destroy_canonical_history=True,
+                    repository_root=root,
+                    crash_checkpoint=lambda reached: (
+                        (_ for _ in ()).throw(KeyboardInterrupt())
+                        if reached == "ready_to_quarantine" else None
+                    ),
+                )
+            generation = next(
+                reset_v2._read_generation(path, partial=False)
+                for path in (root / "data").iterdir()
+                if reset_v2.GENERATION_RE.fullmatch(path.name)
+            )
+            token, native_v2 = self.rewrite_single_native_generation_as_v2(
+                generation, historical_commit, root=root
+            )
+            return root, database, plan, token, native_v2
+
+        def snapshot(root: Path) -> dict[str, bytes]:
+            return {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for parent in (root / "data", root / "backups")
+                for path in parent.iterdir()
+                if path.is_file()
+                and path.name != ".helios-room-database.lock"
+            }
+
+        root, _database, plan, token, _generation = prepare(
+            "historical-invalid-audit"
+        )
+        (root / plan["audit_path"]).write_bytes(b"{}\n")
+        before = snapshot(root)
+        with self.assertRaises(DatabaseResetError) as invalid:
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="restore-source",
+                confirm_reset_recovery=True,
+                repository_root=root,
+            )
+        self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+        self.assertEqual(snapshot(root), before)
+
+        root, _database, plan, token, _generation = prepare(
+            "historical-audit-partial"
+        )
+        Path(f"{root / plan['audit_path']}.partial").write_bytes(b"{}\n")
+        before = snapshot(root)
+        with self.assertRaises(DatabaseResetError) as partial_only:
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="complete-fresh",
+                confirm_reset_recovery=True,
+                repository_root=root,
+            )
+        self.assertEqual(
+            partial_only.exception.code, "reset_recovery_invalid"
+        )
+        self.assertEqual(snapshot(root), before)
+
+        root, database, plan, token, generation = prepare(
+            "historical-remaining-quarantine"
+        )
+        journal = generation.envelope["journal"]
+        quarantine = root / journal["quarantine"]["database"]["path"]
+        os.replace(database, quarantine)
+        self.make_v14_at(database)
+        store = reset_v2._store_from_chain(root, [generation])
+        audit = reset_v2._native_audit_value(
+            store, journal, "reset", "1.4"
+        )
+        (root / plan["audit_path"]).write_bytes(
+            reset_v2._canonical_bytes(audit)
+        )
+        before = snapshot(root)
+        with self.assertRaises(DatabaseResetError) as remaining:
+            recover_database_reset(
+                "data/helios.db",
+                expected_plan_token=token,
+                action="complete-fresh",
+                confirm_reset_recovery=True,
+                repository_root=root,
+            )
+        self.assertEqual(remaining.exception.code, "reset_recovery_invalid")
+        self.assertEqual(snapshot(root), before)
 
     def test_incomplete_first_generation_requires_reviewed_plan_and_aborts_safely(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
@@ -2087,6 +3060,90 @@ class ResetProtocolTests(unittest.TestCase):
             validate_v14_foundation(connection)
         finally:
             connection.close()
+
+    def test_v3_fresh_evidence_transition_and_complete_fresh_stage_matrix(self) -> None:
+        cases = (
+            ("installing_fresh", 2),
+            ("fresh_installed", 1),
+            ("validating_fresh", 1),
+        )
+        for index, (checkpoint, occurrence) in enumerate(cases):
+            with self.subTest(checkpoint=checkpoint):
+                root, database = self.make_isolated_fixture(
+                    f"fresh-stage-{index}"
+                )
+                plan = plan_database_reset(
+                    "data/helios.db", repository_root=root
+                )
+                reached = 0
+
+                def stop(name: str) -> None:
+                    nonlocal reached
+                    if name == checkpoint:
+                        reached += 1
+                        if reached == occurrence:
+                            raise KeyboardInterrupt()
+
+                with self.assertRaises(KeyboardInterrupt):
+                    execute_database_reset(
+                        "data/helios.db",
+                        expected_plan_token=plan["plan_token"],
+                        expected_backup_path=plan["backup_path"],
+                        expected_audit_path=plan["audit_path"],
+                        confirm_destroy_canonical_history=True,
+                        repository_root=root,
+                        crash_checkpoint=stop,
+                    )
+                generations = sorted(
+                    (
+                        reset_v2._read_generation(path, partial=False)
+                        for path in (root / "data").iterdir()
+                        if reset_v2.GENERATION_RE.fullmatch(path.name)
+                    ),
+                    key=lambda item: item.sequence,
+                )
+                first_evidence = next(
+                    position
+                    for position, generation in enumerate(generations)
+                    if generation.envelope["journal"]["fresh_database"]
+                    is not None
+                )
+                self.assertGreater(first_evidence, 0)
+                before = generations[first_evidence - 1].envelope["journal"]
+                after = generations[first_evidence].envelope["journal"]
+                self.assertEqual(before["stage"], "installing_fresh")
+                self.assertIsNone(before["fresh_database"])
+                self.assertEqual(after["stage"], "installing_fresh")
+                evidence = after["fresh_database"]
+                self.assertEqual(set(evidence), reset_v2.FRESH_DATABASE_FIELDS)
+                self.assertEqual(evidence["journal_mode"], "wal")
+                self.assertEqual(evidence["path"], "data/helios.db")
+                self.assertEqual(evidence["schema_label"], "1.4")
+                self.assertTrue(
+                    all(
+                        item.envelope["journal"]["fresh_database"]
+                        == evidence
+                        for item in generations[first_evidence:]
+                    )
+                )
+                with database.open("rb") as fresh:
+                    header = fresh.read(20)
+                self.assertEqual(header[:16], b"SQLite format 3\x00")
+                self.assertEqual(header[18:20], b"\x02\x02")
+
+                report = recover_database_reset(
+                    "data/helios.db",
+                    expected_plan_token=plan["plan_token"],
+                    action="complete-fresh",
+                    confirm_reset_recovery=True,
+                    repository_root=root,
+                )
+                self.assertEqual(report["status"], "reset")
+                audit = json.loads(
+                    (root / plan["audit_path"]).read_text(encoding="utf-8")
+                )
+                self.assertEqual(audit["audit_version"], 2)
+                self.assertEqual(audit["fresh_database"], evidence)
 
     def test_complete_fresh_recovers_from_interrupted_audit_write(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
