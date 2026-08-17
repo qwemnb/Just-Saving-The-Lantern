@@ -4218,6 +4218,117 @@ class ResetProtocolTests(unittest.TestCase):
         self.assertTrue(all(mock.call_count == 0 for mock in mocks))
         self.assertEqual(snapshot(), before)
 
+    def test_native_v3_terminal_cleanup_rejects_quarantine_recreation_race(self) -> None:
+        plan, generations = self.crash_native_at("finalizing")
+        store = reset_v2._store_from_chain(self.root, generations)
+        journal = store.journal
+        audit_path = self.root / plan["audit_path"]
+        audit_value = reset_v2._native_audit_value(
+            store, journal, "reset", "1.4"
+        )
+        audit_path.write_bytes(reset_v2._canonical_bytes(audit_value))
+        quarantine = next(
+            self.root / value["path"]
+            for value in journal["quarantine"].values()
+            if value is not None
+        )
+        self.assertFalse(os.path.lexists(quarantine))
+        hostile_raw = b"recreated between authorization and cleanup"
+
+        def snapshot() -> dict[str, bytes]:
+            return {
+                path.relative_to(self.root).as_posix(): path.read_bytes()
+                for parent in (self.root / "data", self.root / "backups")
+                for path in parent.rglob("*")
+                if path.is_file()
+                and path.name != ".helios-room-database.lock"
+            }
+
+        before = snapshot()
+        real_cleanup = reset_v2._cleanup_after_audit
+        injected = 0
+
+        def inject_race(
+            cleanup_store: reset_v2.GenerationStore,
+            cleanup_journal: dict[str, object],
+            **kwargs: object,
+        ) -> None:
+            nonlocal injected
+            injected += 1
+            self.assertEqual(injected, 1)
+            self.assertFalse(os.path.lexists(quarantine))
+            quarantine.write_bytes(hostile_raw)
+            real_cleanup(cleanup_store, cleanup_journal, **kwargs)
+
+        forbidden = (
+            patch(
+                "app.reset_protocol_v2._unlink_verified",
+                side_effect=AssertionError("unlink forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._unlink_verified_bytes",
+                side_effect=AssertionError("unlink forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._move_verified",
+                side_effect=AssertionError("rename forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._write_and_install_json",
+                side_effect=AssertionError("audit rewrite forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._promote_validated_json_control",
+                side_effect=AssertionError("audit promotion forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._delete_generation_controls",
+                side_effect=AssertionError(
+                    "generation-control deletion forbidden"
+                ),
+            ),
+            patch.object(
+                reset_v2.GenerationStore,
+                "append",
+                side_effect=AssertionError("generation append forbidden"),
+            ),
+            patch(
+                "app.reset_protocol_v2._hold_active_sidecar_guards",
+                side_effect=AssertionError("sidecar activity forbidden"),
+            ),
+        )
+        forbidden_mocks = [boundary.start() for boundary in forbidden]
+        try:
+            with patch(
+                "app.reset_protocol_v2._cleanup_after_audit",
+                side_effect=inject_race,
+            ) as cleanup:
+                with self.assertRaises(DatabaseResetError) as invalid:
+                    recover_database_reset(
+                        "data/helios.db",
+                        expected_plan_token=plan["plan_token"],
+                        action="complete-fresh",
+                        confirm_reset_recovery=True,
+                        repository_root=self.root,
+                    )
+        finally:
+            for boundary in reversed(forbidden):
+                boundary.stop()
+        self.assertEqual(invalid.exception.code, "reset_recovery_invalid")
+        cleanup.assert_called_once()
+        self.assertEqual(injected, 1)
+        self.assertTrue(all(
+            mock.call_count == 0 for mock in forbidden_mocks
+        ))
+        self.assertTrue(os.path.lexists(quarantine))
+        self.assertEqual(quarantine.read_bytes(), hostile_raw)
+        after = snapshot()
+        self.assertEqual(
+            after.pop(quarantine.relative_to(self.root).as_posix()),
+            hostile_raw,
+        )
+        self.assertEqual(after, before)
+
     def test_recovery_schema_failure_is_sanitized_not_name_error(self) -> None:
         plan = plan_database_reset("data/helios.db", repository_root=self.root)
         with self.assertRaises(KeyboardInterrupt):

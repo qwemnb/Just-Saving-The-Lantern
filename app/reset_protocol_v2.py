@@ -4385,6 +4385,7 @@ def _cleanup_after_audit(
     if existing_audit is None:
         raise _error("reset_recovery_invalid")
     historical_quarantines: dict[str, Path | None] | None = None
+    native_v3_terminal_quarantines: dict[str, Path | None] | None = None
 
     def require_historical_quarantine_absence() -> None:
         if historical_quarantines is not None and any(
@@ -4392,6 +4393,23 @@ def _cleanup_after_audit(
             for path in historical_quarantines.values()
         ):
             raise _error("reset_recovery_invalid")
+
+    def require_native_v3_terminal_quarantine_absence() -> None:
+        if native_v3_terminal_quarantines is not None and any(
+            path is not None and os.path.lexists(path)
+            for path in native_v3_terminal_quarantines.values()
+        ):
+            raise _error("reset_recovery_invalid")
+
+    def require_terminal_quarantine_absence() -> None:
+        require_historical_quarantine_absence()
+        require_native_v3_terminal_quarantine_absence()
+
+    if store.origin == "native_v3" and existing_audit["outcome"] == "reset":
+        _active, native_v3_terminal_quarantines, _failed, _restoring = (
+            _operational_paths(store, journal)
+        )
+        require_native_v3_terminal_quarantine_absence()
 
     if historical_reset_cleanup:
         if (
@@ -4424,13 +4442,16 @@ def _cleanup_after_audit(
             connection.rollback()
             connection.close()
     if store.origin == "legacy_v1_conversion":
-        require_historical_quarantine_absence()
+        require_terminal_quarantine_absence()
         _install_legacy_chain_manifest(store, journal)
     _revalidate_committed_outcome(store, journal)
     active, quarantines, failed, restoring = _operational_paths(store, journal)
     del active
     cleanup_collections: list[dict[str, Path | None]] = [failed]
-    if not historical_reset_cleanup:
+    if (
+        not historical_reset_cleanup
+        and native_v3_terminal_quarantines is None
+    ):
         cleanup_collections.insert(0, quarantines)
     if store.origin in {"native_v2", "native_v3"}:
         paths = store.reviewed_plan_manifest["artifact_paths"]
@@ -4448,13 +4469,13 @@ def _cleanup_after_audit(
     for collection in cleanup_collections:
         for path in collection.values():
             if path is not None and os.path.lexists(path):
-                require_historical_quarantine_absence()
+                require_terminal_quarantine_absence()
                 _unlink_verified(path, legacy._path_identity(path))
                 _flush_namespace(store.authority, path.parent)
                 _revalidate_committed_outcome(store, journal)
     audit_partial = Path(f"{store.root / journal['audit_path']}.partial")
     if os.path.lexists(audit_partial):
-        require_historical_quarantine_absence()
+        require_terminal_quarantine_absence()
         _audit_value, audit_raw, _audit_identity = _read_canonical(
             store.root / journal["audit_path"]
         )
@@ -4480,7 +4501,7 @@ def _cleanup_after_audit(
         _cleanup_matching_evidence_records(
             store,
             evidence_paths,
-            before_delete=require_historical_quarantine_absence,
+            before_delete=require_terminal_quarantine_absence,
             after_delete=lambda: _revalidate_committed_outcome(store, journal),
         )
         _validate_legacy_chain_manifest(store, journal)
@@ -4492,7 +4513,7 @@ def _cleanup_after_audit(
                 continue
             if legacy._stable_sha256(path) != expected_hash:
                 raise _error("reset_recovery_invalid")
-            require_historical_quarantine_absence()
+            require_terminal_quarantine_absence()
             _unlink_verified(path, legacy._path_identity(path))
             _flush_namespace(store.authority, path.parent)
             _validate_legacy_controls_subset(
@@ -4527,9 +4548,9 @@ def _cleanup_after_audit(
     if any(name in forbidden_backup_names for name in backup_names):
         raise _error("reset_recovery_invalid")
     _revalidate_committed_outcome(store, journal)
-    require_historical_quarantine_absence()
+    require_terminal_quarantine_absence()
     _delete_generation_controls(
-        store, before_delete=require_historical_quarantine_absence
+        store, before_delete=require_terminal_quarantine_absence
     )
 
 
