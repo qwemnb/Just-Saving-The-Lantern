@@ -24,6 +24,121 @@ const READ_ERROR_LITERALS = Object.freeze({
     participant_directory_invalid: 'The participant directory data is invalid.',
     participant_directory_unavailable: 'The participant directory is unavailable.'
 });
+const PARTICIPANT_COLOR_STORAGE_KEY = 'helios-room.participant-colors.v1';
+const PARTICIPANT_COLOR_PATTERN = /^#[0-9A-Fa-f]{6}$/;
+const DEFAULT_PARTICIPANT_COLORS = Object.freeze({
+    room: '#7C5CC4',
+    gemini: '#4F8FEA',
+    helios: '#D39A2C',
+    peter: '#2F9E8F'
+});
+const NEUTRAL_PARTICIPANT_COLOR = '#D8D8E0';
+const AUTHOR_COLOR_KEYS = Object.freeze({
+    'room-system': 'room',
+    gemini: 'gemini',
+    helios: 'helios',
+    peter: 'peter'
+});
+
+function normalizeParticipantColor(value) {
+    return typeof value === 'string' && PARTICIPANT_COLOR_PATTERN.test(value)
+        ? value.toUpperCase()
+        : null;
+}
+
+function isPlainObject(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
+
+function loadParticipantColorOverrides(storage) {
+    if (!storage) return {};
+    let raw;
+    try {
+        if (typeof storage.getItem !== 'function') return {};
+        raw = storage.getItem(PARTICIPANT_COLOR_STORAGE_KEY);
+    } catch (_error) {
+        return {};
+    }
+    if (raw === null) return {};
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (_error) {
+        return {};
+    }
+    if (!isPlainObject(parsed)) return {};
+    const overrides = {};
+    Object.keys(DEFAULT_PARTICIPANT_COLORS).forEach(key => {
+        if (!Object.prototype.hasOwnProperty.call(parsed, key)) return;
+        const normalized = normalizeParticipantColor(parsed[key]);
+        if (normalized !== null) overrides[key] = normalized;
+    });
+    return overrides;
+}
+
+function createParticipantColorPreferences(storage = null) {
+    const overrides = loadParticipantColorOverrides(storage);
+    const colors = { ...DEFAULT_PARTICIPANT_COLORS, ...overrides };
+
+    function persist() {
+        if (!storage) return;
+        try {
+            if (typeof storage.setItem !== 'function') return;
+            storage.setItem(PARTICIPANT_COLOR_STORAGE_KEY, JSON.stringify(overrides));
+        } catch (_error) {
+            // A valid color remains active in memory when browser persistence is unavailable.
+        }
+    }
+
+    function setColor(key, value) {
+        if (!Object.prototype.hasOwnProperty.call(DEFAULT_PARTICIPANT_COLORS, key)) return false;
+        const normalized = normalizeParticipantColor(value);
+        if (normalized === null) return false;
+        overrides[key] = normalized;
+        colors[key] = normalized;
+        persist();
+        return true;
+    }
+
+    function resetColor(key) {
+        if (!Object.prototype.hasOwnProperty.call(DEFAULT_PARTICIPANT_COLORS, key)) return false;
+        delete overrides[key];
+        colors[key] = DEFAULT_PARTICIPANT_COLORS[key];
+        persist();
+        return true;
+    }
+
+    return { colors, overrides, setColor, resetColor };
+}
+
+function browserLocalStorage() {
+    try {
+        return typeof window === 'undefined' ? null : window.localStorage;
+    } catch (_error) {
+        return null;
+    }
+}
+
+function authorColorKey(authorKey) {
+    return typeof authorKey === 'string'
+        && Object.prototype.hasOwnProperty.call(AUTHOR_COLOR_KEYS, authorKey)
+        ? AUTHOR_COLOR_KEYS[authorKey]
+        : null;
+}
+
+function participantColorForAuthor(authorKey, colors = DEFAULT_PARTICIPANT_COLORS) {
+    const key = authorColorKey(authorKey);
+    if (key === null) return NEUTRAL_PARTICIPANT_COLOR;
+    const normalized = normalizeParticipantColor(colors && colors[key]);
+    return normalized === null ? DEFAULT_PARTICIPANT_COLORS[key] : normalized;
+}
+
+function setParticipantColorStyle(element, colorKey, color) {
+    element.setAttribute('data-participant-color-key', colorKey || 'neutral');
+    element.style.setProperty('--participant-color', color);
+}
 
 function classifyTraceCommand(text) {
     const stripped = text.trim();
@@ -42,7 +157,11 @@ function classifyTraceCommand(text) {
     return { kind: 'message', turnIdText: null };
 }
 
-async function loadMessages(fetchImpl = fetch, doc = document) {
+async function loadMessages(
+    fetchImpl = fetch,
+    doc = document,
+    colors = DEFAULT_PARTICIPANT_COLORS
+) {
     const status = doc.getElementById('history-read-status');
     let response;
     try {
@@ -68,7 +187,7 @@ async function loadMessages(fetchImpl = fetch, doc = document) {
         if (status) status.textContent = HISTORY_READ_FALLBACK;
         return false;
     }
-    displayMessages(messages, doc);
+    displayMessages(messages, doc, colors);
     if (status) status.textContent = '';
     return true;
 }
@@ -86,7 +205,7 @@ async function localReadError(response, fallback) {
     return fallback;
 }
 
-function displayMessages(messages, doc = document) {
+function displayMessages(messages, doc = document, colors = DEFAULT_PARTICIPANT_COLORS) {
     const messagesContainer = doc.getElementById('messages');
     messagesContainer.replaceChildren();
 
@@ -98,6 +217,12 @@ function displayMessages(messages, doc = document) {
     messages.forEach(msg => {
         const messageDiv = doc.createElement('div');
         messageDiv.className = 'message canonical-message';
+        const colorKey = authorColorKey(msg.participant_key);
+        setParticipantColorStyle(
+            messageDiv,
+            colorKey,
+            participantColorForAuthor(msg.participant_key, colors)
+        );
 
         const contentDiv = doc.createElement('div');
         contentDiv.className = 'message-content';
@@ -122,6 +247,7 @@ function showSystemMessage(text, doc = document) {
     const messagesContainer = doc.getElementById('messages');
     const messageDiv = doc.createElement('div');
     messageDiv.className = 'message system';
+    setParticipantColorStyle(messageDiv, null, NEUTRAL_PARTICIPANT_COLOR);
 
     const contentDiv = doc.createElement('div');
     contentDiv.className = 'message-content';
@@ -374,7 +500,10 @@ function renderTrace(trace, doc = document) {
     }
 }
 
-function setupApp(doc = document, fetchImpl = fetch) {
+function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
+    const colorPreferences = createParticipantColorPreferences(
+        arguments.length >= 3 ? storage : browserLocalStorage()
+    );
     const form = doc.getElementById('message-form');
     const input = doc.getElementById('message-input');
     const sendButton = form.querySelector('.send-button');
@@ -401,9 +530,109 @@ function setupApp(doc = document, fetchImpl = fetch) {
     let composing = false;
     let filteredDestinations = [];
     let activeOptionIndex = 0;
+    let activeColorEditor = null;
+    const colorSwatches = new Map();
 
     function destinationLabel(destination) {
         return destination.kind === 'room' ? destination.label : destination.primary_name;
+    }
+
+    function destinationColorKey(destination) {
+        if (destination.kind === 'room') return 'room';
+        return destination.kind === 'participant'
+            && Object.prototype.hasOwnProperty.call(
+                DEFAULT_PARTICIPANT_COLORS, destination.participant_key
+            )
+            ? destination.participant_key
+            : null;
+    }
+
+    function closeColorEditor(returnFocus = true) {
+        if (!activeColorEditor) return;
+        const closing = activeColorEditor;
+        activeColorEditor = null;
+        closing.editor.hidden = true;
+        closing.swatch.setAttribute('aria-expanded', 'false');
+        if (returnFocus) closing.swatch.focus();
+    }
+
+    function updateParticipantColorPresentation(colorKey) {
+        const color = colorPreferences.colors[colorKey];
+        const swatch = colorSwatches.get(colorKey);
+        if (swatch) setParticipantColorStyle(swatch, colorKey, color);
+        const messagesContainer = doc.getElementById('messages');
+        if (!messagesContainer) return;
+        Array.from(messagesContainer.children).forEach(message => {
+            if (message.getAttribute('data-participant-color-key') === colorKey) {
+                message.style.setProperty('--participant-color', color);
+            }
+        });
+    }
+
+    function createColorEditor(colorKey, label, swatch) {
+        const editor = doc.createElement('div');
+        editor.id = `participant-color-editor-${colorKey}`;
+        editor.className = 'participant-color-editor';
+        editor.setAttribute('role', 'group');
+        editor.setAttribute('aria-label', `Color editor for ${label}`);
+        editor.hidden = true;
+
+        const colorInput = doc.createElement('input');
+        colorInput.type = 'color';
+        colorInput.className = 'participant-color-picker';
+        colorInput.value = colorPreferences.colors[colorKey];
+        colorInput.setAttribute('aria-label', `Color picker for ${label}`);
+
+        const hexInput = doc.createElement('input');
+        hexInput.type = 'text';
+        hexInput.className = 'participant-color-hex';
+        hexInput.value = colorPreferences.colors[colorKey];
+        hexInput.maxLength = 7;
+        hexInput.autocomplete = 'off';
+        hexInput.spellcheck = false;
+        hexInput.setAttribute('aria-label', `Hex color for ${label}`);
+
+        const resetButton = doc.createElement('button');
+        resetButton.type = 'button';
+        resetButton.className = 'participant-color-reset';
+        resetButton.textContent = 'Reset';
+        resetButton.setAttribute('aria-label', `Reset color for ${label}`);
+
+        const closeButton = doc.createElement('button');
+        closeButton.type = 'button';
+        closeButton.className = 'participant-color-close';
+        closeButton.textContent = 'Close';
+        closeButton.setAttribute('aria-label', `Close color editor for ${label}`);
+
+        colorInput.addEventListener('input', () => {
+            const normalized = normalizeParticipantColor(colorInput.value);
+            if (normalized === null) return;
+            colorInput.value = normalized;
+            hexInput.value = normalized;
+            colorPreferences.setColor(colorKey, normalized);
+            updateParticipantColorPresentation(colorKey);
+        });
+        hexInput.addEventListener('input', () => {
+            const normalized = normalizeParticipantColor(hexInput.value);
+            if (normalized === null) return;
+            hexInput.value = normalized;
+            colorInput.value = normalized;
+            colorPreferences.setColor(colorKey, normalized);
+            updateParticipantColorPresentation(colorKey);
+        });
+        resetButton.addEventListener('click', () => {
+            colorPreferences.resetColor(colorKey);
+            colorInput.value = colorPreferences.colors[colorKey];
+            hexInput.value = colorPreferences.colors[colorKey];
+            updateParticipantColorPresentation(colorKey);
+        });
+        closeButton.addEventListener('click', () => closeColorEditor(true));
+
+        editor.appendChild(colorInput);
+        editor.appendChild(hexInput);
+        editor.appendChild(resetButton);
+        editor.appendChild(closeButton);
+        return editor;
     }
 
     function updateSendButtonState() {
@@ -413,12 +642,17 @@ function setupApp(doc = document, fetchImpl = fetch) {
 
     function renderParticipantPanel() {
         if (!participantList) return;
+        closeColorEditor(false);
+        colorSwatches.clear();
         participantList.replaceChildren();
         if (!directory) {
             participantList.textContent = 'No verified participants.';
             return;
         }
         directory.destinations.forEach(destination => {
+            const row = doc.createElement('div');
+            row.className = 'participant-row';
+
             const item = doc.createElement('button');
             item.type = 'button';
             item.className = 'participant-entry';
@@ -439,7 +673,33 @@ function setupApp(doc = document, fetchImpl = fetch) {
             } else {
                 item.addEventListener('click', () => selectDestination(destination));
             }
-            participantList.appendChild(item);
+            row.appendChild(item);
+
+            const colorKey = destinationColorKey(destination);
+            if (colorKey !== null) {
+                const label = destinationLabel(destination);
+                const swatch = doc.createElement('button');
+                swatch.type = 'button';
+                swatch.className = 'participant-color-swatch';
+                swatch.setAttribute('aria-label', `Choose color for ${label}`);
+                swatch.setAttribute('aria-expanded', 'false');
+                swatch.setAttribute('aria-controls', `participant-color-editor-${colorKey}`);
+                setParticipantColorStyle(swatch, colorKey, colorPreferences.colors[colorKey]);
+                colorSwatches.set(colorKey, swatch);
+
+                const editor = createColorEditor(colorKey, label, swatch);
+                swatch.addEventListener('click', event => {
+                    if (typeof event.stopPropagation === 'function') event.stopPropagation();
+                    closeColorEditor(false);
+                    editor.hidden = false;
+                    swatch.setAttribute('aria-expanded', 'true');
+                    activeColorEditor = { editor, swatch };
+                    editor.querySelector('.participant-color-picker').focus();
+                });
+                row.appendChild(swatch);
+                row.appendChild(editor);
+            }
+            participantList.appendChild(row);
         });
     }
 
@@ -621,13 +881,18 @@ function setupApp(doc = document, fetchImpl = fetch) {
     });
     closeButton.addEventListener('click', closeTracePanel);
     doc.addEventListener('keydown', event => {
+        if (activeColorEditor && event.key === 'Escape') {
+            event.preventDefault();
+            closeColorEditor(true);
+            return;
+        }
         if (!overlay.hidden && event.key === 'Escape') {
             event.preventDefault();
             closeTracePanel();
         }
     });
     updateSendButtonState();
-    loadMessages(fetchImpl, doc);
+    loadMessages(fetchImpl, doc, colorPreferences.colors);
     loadDirectory();
 
     form.addEventListener('submit', async (e) => {
@@ -672,12 +937,12 @@ function setupApp(doc = document, fetchImpl = fetch) {
         try {
             await sendMessage(messageText, selectedDestination, fetchImpl);
             input.value = '';
-            await loadMessages(fetchImpl, doc);
+            await loadMessages(fetchImpl, doc, colorPreferences.colors);
         } catch (error) {
             console.error('Error sending message:', error);
             if (error.postAccepted) {
                 input.value = '';
-                await loadMessages(fetchImpl, doc);
+                await loadMessages(fetchImpl, doc, colorPreferences.colors);
             } else {
                 pendingMessage.remove();
             }
@@ -694,7 +959,13 @@ function setupApp(doc = document, fetchImpl = fetch) {
         }
     });
 
-    return { closeTracePanel, runTraceCommand, loadDirectory, openPicker };
+    return {
+        closeTracePanel,
+        runTraceCommand,
+        loadDirectory,
+        openPicker,
+        participantColors: colorPreferences.colors
+    };
 }
 
 if (typeof document !== 'undefined') {
@@ -717,6 +988,16 @@ if (typeof module !== 'undefined' && module.exports) {
         DIRECTORY_READ_FALLBACK,
         POST_ERROR_LITERALS,
         POST_ERROR_FALLBACK,
-        sendMessage
+        sendMessage,
+        PARTICIPANT_COLOR_STORAGE_KEY,
+        DEFAULT_PARTICIPANT_COLORS,
+        NEUTRAL_PARTICIPANT_COLOR,
+        normalizeParticipantColor,
+        loadParticipantColorOverrides,
+        createParticipantColorPreferences,
+        authorColorKey,
+        participantColorForAuthor,
+        displayMessages,
+        showSystemMessage
     };
 }

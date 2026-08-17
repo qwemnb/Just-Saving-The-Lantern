@@ -14,8 +14,33 @@ const {
     HISTORY_READ_FALLBACK,
     DIRECTORY_READ_FALLBACK,
     POST_ERROR_FALLBACK,
-    sendMessage
+    sendMessage,
+    PARTICIPANT_COLOR_STORAGE_KEY,
+    DEFAULT_PARTICIPANT_COLORS,
+    NEUTRAL_PARTICIPANT_COLOR,
+    normalizeParticipantColor,
+    loadParticipantColorOverrides,
+    createParticipantColorPreferences,
+    authorColorKey,
+    participantColorForAuthor,
+    displayMessages,
+    showSystemMessage
 } = require('../static/app.js');
+
+
+class FakeStyle {
+    constructor() {
+        this.values = new Map();
+    }
+
+    setProperty(name, value) {
+        this.values.set(name, String(value));
+    }
+
+    getPropertyValue(name) {
+        return this.values.get(name) || '';
+    }
+}
 
 
 class FakeElement {
@@ -34,6 +59,7 @@ class FakeElement {
         this.scrollTop = 0;
         this.scrollHeight = 0;
         this.attributes = new Map();
+        this.style = new FakeStyle();
         this.classList = {
             toggle: name => {
                 const names = new Set(this.className.split(/\s+/).filter(Boolean));
@@ -77,12 +103,18 @@ class FakeElement {
         this.attributes.set(name, String(value));
     }
 
+    getAttribute(name) {
+        return this.attributes.has(name) ? this.attributes.get(name) : null;
+    }
+
     async dispatch(type, extra = {}) {
         const event = {
             type,
             key: undefined,
             preventDefault() { this.defaultPrevented = true; },
+            stopPropagation() { this.propagationStopped = true; },
             defaultPrevented: false,
+            propagationStopped: false,
             ...extra
         };
         for (const listener of this.listeners.get(type) || []) {
@@ -208,10 +240,34 @@ const DIRECTORY = {
     room: { room_key: 'main', name: 'The Room' },
     destinations: [
         { kind: 'room', label: 'Room', addressable: true },
+        { kind: 'participant', participant_key: 'gemini', primary_name: 'Gemini', aliases: ['Gemini'], participant_type: 'ai', addressable: true },
         { kind: 'participant', participant_key: 'helios', primary_name: 'Helios', aliases: ['Helios', 'Sol'], participant_type: 'ai', addressable: true },
         { kind: 'participant', participant_key: 'peter', primary_name: 'Peter', aliases: ['Peter'], participant_type: 'human', addressable: false }
     ]
 };
+
+
+class SyntheticStorage {
+    constructor(raw = null, { throwOnGet = false, throwOnSet = false } = {}) {
+        this.raw = raw;
+        this.throwOnGet = throwOnGet;
+        this.throwOnSet = throwOnSet;
+        this.getCalls = [];
+        this.setCalls = [];
+    }
+
+    getItem(key) {
+        this.getCalls.push(key);
+        if (this.throwOnGet) throw new Error('synthetic get failure');
+        return this.raw;
+    }
+
+    setItem(key, value) {
+        this.setCalls.push([key, value]);
+        if (this.throwOnSet) throw new Error('synthetic set failure');
+        this.raw = value;
+    }
+}
 
 
 function response(ok, payload, status = 200) {
@@ -248,6 +304,279 @@ async function settle() {
     await new Promise(resolve => setImmediate(resolve));
     await new Promise(resolve => setImmediate(resolve));
 }
+
+
+function syntheticMessage(author, destination = 'Helios', text = `${author} message`) {
+    return {
+        participant_key: author,
+        message_text: text,
+        created_at: '2026-08-17T12:00:00.000Z',
+        routing: {
+            sender: { participant_key: author, display_name: author },
+            destination: { kind: 'participant', display_name: destination }
+        }
+    };
+}
+
+
+function participantRow(doc, label) {
+    return doc.getElementById('participant-list').children.find(row => {
+        const button = row.querySelector('.participant-entry');
+        return button && button.children[0] && button.children[0].textContent === label;
+    });
+}
+
+
+test('participant color constants, normalization, and author mapping are closed and exact', () => {
+    assert.deepEqual(DEFAULT_PARTICIPANT_COLORS, {
+        room: '#7C5CC4',
+        gemini: '#4F8FEA',
+        helios: '#D39A2C',
+        peter: '#2F9E8F'
+    });
+    assert.equal(NEUTRAL_PARTICIPANT_COLOR, '#D8D8E0');
+    assert.equal(normalizeParticipantColor('#8b5cf6'), '#8B5CF6');
+    for (const invalid of ['8B5CF6', '#ABC', '#ABCDEG', '#1234567', '', null, 7]) {
+        assert.equal(normalizeParticipantColor(invalid), null);
+    }
+    assert.equal(authorColorKey('peter'), 'peter');
+    assert.equal(authorColorKey('helios'), 'helios');
+    assert.equal(authorColorKey('gemini'), 'gemini');
+    assert.equal(authorColorKey('room-system'), 'room');
+    assert.equal(authorColorKey('future-participant'), null);
+    assert.equal(participantColorForAuthor('future-participant'), '#D8D8E0');
+});
+
+
+test('participant color storage loads valid entries independently and fails safely', () => {
+    assert.equal(PARTICIPANT_COLOR_STORAGE_KEY, 'helios-room.participant-colors.v1');
+    for (const raw of [null, '{broken', 'null', '[]', '"text"', '42']) {
+        assert.deepEqual(loadParticipantColorOverrides(new SyntheticStorage(raw)), {});
+    }
+    const storage = new SyntheticStorage(JSON.stringify({
+        room: '#123abc',
+        gemini: 'blue',
+        helios: '#112233',
+        peter: '#ABCDEF',
+        future: '#000000'
+    }));
+    assert.deepEqual(loadParticipantColorOverrides(storage), {
+        room: '#123ABC',
+        helios: '#112233',
+        peter: '#ABCDEF'
+    });
+    assert.deepEqual(storage.getCalls, [PARTICIPANT_COLOR_STORAGE_KEY]);
+    assert.deepEqual(
+        loadParticipantColorOverrides(new SyntheticStorage(null, { throwOnGet: true })),
+        {}
+    );
+});
+
+
+test('participant color writes retain valid memory, reject invalid input, and reset overrides', () => {
+    const storage = new SyntheticStorage(null);
+    const preferences = createParticipantColorPreferences(storage);
+    assert.deepEqual(preferences.colors, { ...DEFAULT_PARTICIPANT_COLORS });
+    assert.equal(preferences.setColor('gemini', '#a1b2c3'), true);
+    assert.equal(preferences.colors.gemini, '#A1B2C3');
+    assert.deepEqual(JSON.parse(storage.raw), { gemini: '#A1B2C3' });
+    const writes = storage.setCalls.length;
+    assert.equal(preferences.setColor('gemini', 'not-a-color'), false);
+    assert.equal(preferences.colors.gemini, '#A1B2C3');
+    assert.equal(storage.setCalls.length, writes);
+    assert.equal(preferences.resetColor('gemini'), true);
+    assert.equal(preferences.colors.gemini, '#4F8FEA');
+    assert.deepEqual(JSON.parse(storage.raw), {});
+
+    const failing = new SyntheticStorage(null, { throwOnSet: true });
+    const inMemory = createParticipantColorPreferences(failing);
+    assert.equal(inMemory.setColor('peter', '#010203'), true);
+    assert.equal(inMemory.colors.peter, '#010203');
+    assert.equal(failing.setCalls.length, 1);
+});
+
+
+test('canonical message accents use authors while unknown authors and system notices stay neutral', () => {
+    const doc = makeDocument();
+    const colors = { ...DEFAULT_PARTICIPANT_COLORS, peter: '#010203', helios: '#AABBCC' };
+    displayMessages([
+        syntheticMessage('peter', 'Helios'),
+        syntheticMessage('helios', 'Peter'),
+        syntheticMessage('peter', 'Gemini'),
+        syntheticMessage('gemini', 'Peter'),
+        syntheticMessage('room-system', 'Room'),
+        syntheticMessage('future-participant', 'Room')
+    ], doc, colors);
+    const rendered = doc.getElementById('messages').children;
+    assert.deepEqual(rendered.map(message => message.style.getPropertyValue('--participant-color')), [
+        '#010203', '#AABBCC', '#010203', '#4F8FEA', '#7C5CC4', '#D8D8E0'
+    ]);
+    assert.deepEqual(rendered.map(message => message.getAttribute('data-participant-color-key')), [
+        'peter', 'helios', 'peter', 'gemini', 'room', 'neutral'
+    ]);
+    const system = showSystemMessage('Local notice', doc);
+    assert.equal(system.className, 'message system');
+    assert.equal(system.style.getPropertyValue('--participant-color'), '#D8D8E0');
+});
+
+
+test('participant rows keep destination and accessible color controls independent', async () => {
+    const doc = makeDirectoryDocument();
+    const storage = new SyntheticStorage(null);
+    const calls = [];
+    const fetchStub = async url => {
+        calls.push(url);
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages') return response(true, []);
+        throw new Error(`Unexpected synthetic URL ${url}`);
+    };
+    setupApp(doc, fetchStub, storage);
+    await settle();
+    assert.deepEqual(calls.sort(), ['/api/messages', '/api/participants']);
+
+    for (const [label, color, disabled] of [
+        ['Room', '#7C5CC4', false],
+        ['Gemini', '#4F8FEA', false],
+        ['Helios', '#D39A2C', false],
+        ['Peter', '#2F9E8F', true]
+    ]) {
+        const row = participantRow(doc, label);
+        const destination = row.querySelector('.participant-entry');
+        const swatch = row.querySelector('.participant-color-swatch');
+        assert.equal(destination.disabled, disabled);
+        assert.equal(swatch.disabled, false);
+        assert.equal(swatch.parentNode, row);
+        assert.notEqual(swatch.parentNode, destination);
+        assert.equal(swatch.getAttribute('aria-label'), `Choose color for ${label}`);
+        assert.equal(swatch.style.getPropertyValue('--participant-color'), color);
+    }
+    const roomRow = participantRow(doc, 'Room');
+    await roomRow.querySelector('.participant-entry').dispatch('click');
+    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+    const peterRow = participantRow(doc, 'Peter');
+    assert.match(allText(peterRow), /Not addressable/);
+    const before = doc.getElementById('destination-button').textContent;
+    const peterSwatch = peterRow.querySelector('.participant-color-swatch');
+    await peterSwatch.dispatch('click');
+    assert.equal(doc.getElementById('destination-button').textContent, before);
+    assert.equal(peterSwatch.getAttribute('aria-expanded'), 'true');
+    const peterHex = peterRow.querySelector('.participant-color-hex');
+    peterHex.value = '#123456';
+    await peterHex.dispatch('input');
+    assert.equal(peterSwatch.style.getPropertyValue('--participant-color'), '#123456');
+    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+    assert.equal(peterRow.querySelector('.participant-entry').disabled, true);
+});
+
+
+test('color editor synchronizes valid input, preserves invalid state, resets, and restores focus', async () => {
+    const doc = makeDirectoryDocument();
+    const storage = new SyntheticStorage(null);
+    const messages = [
+        syntheticMessage('gemini', 'Peter'),
+        syntheticMessage('peter', 'Gemini'),
+        syntheticMessage('room-system', 'Room')
+    ];
+    const fetchStub = async url => url === '/api/participants'
+        ? response(true, DIRECTORY)
+        : response(true, messages);
+    const controller = setupApp(doc, fetchStub, storage);
+    await settle();
+
+    const geminiRow = participantRow(doc, 'Gemini');
+    const swatch = geminiRow.querySelector('.participant-color-swatch');
+    const editor = geminiRow.querySelector('.participant-color-editor');
+    const picker = editor.querySelector('.participant-color-picker');
+    const hex = editor.querySelector('.participant-color-hex');
+    const reset = editor.querySelector('.participant-color-reset');
+    const close = editor.querySelector('.participant-color-close');
+    assert.equal(picker.getAttribute('aria-label'), 'Color picker for Gemini');
+    assert.equal(hex.getAttribute('aria-label'), 'Hex color for Gemini');
+    assert.equal(close.getAttribute('aria-label'), 'Close color editor for Gemini');
+
+    await swatch.dispatch('click');
+    assert.equal(editor.hidden, false);
+    assert.equal(doc.activeElement, picker);
+    picker.value = '#aabbcc';
+    await picker.dispatch('input');
+    assert.equal(picker.value, '#AABBCC');
+    assert.equal(hex.value, '#AABBCC');
+    assert.equal(controller.participantColors.gemini, '#AABBCC');
+    assert.equal(swatch.style.getPropertyValue('--participant-color'), '#AABBCC');
+    assert.equal(doc.getElementById('messages').children[0].style.getPropertyValue('--participant-color'), '#AABBCC');
+    assert.equal(doc.getElementById('messages').children[1].style.getPropertyValue('--participant-color'), '#2F9E8F');
+
+    const writesAfterValid = storage.setCalls.length;
+    hex.value = '#12';
+    await hex.dispatch('input');
+    assert.equal(picker.value, '#AABBCC');
+    assert.equal(controller.participantColors.gemini, '#AABBCC');
+    assert.equal(storage.setCalls.length, writesAfterValid);
+    hex.value = '#ZZZZZZ';
+    await hex.dispatch('input');
+    assert.equal(picker.value, '#AABBCC');
+    assert.equal(storage.setCalls.length, writesAfterValid);
+
+    hex.value = '#0a1b2c';
+    await hex.dispatch('input');
+    assert.equal(hex.value, '#0A1B2C');
+    assert.equal(picker.value, '#0A1B2C');
+    assert.equal(controller.participantColors.gemini, '#0A1B2C');
+
+    await reset.dispatch('click');
+    assert.equal(hex.value, '#4F8FEA');
+    assert.equal(picker.value, '#4F8FEA');
+    assert.equal(controller.participantColors.gemini, '#4F8FEA');
+    assert.equal(Object.hasOwn(JSON.parse(storage.raw), 'gemini'), false);
+    assert.equal(editor.hidden, false);
+
+    await close.dispatch('click');
+    assert.equal(editor.hidden, true);
+    assert.equal(doc.activeElement, swatch);
+    await swatch.dispatch('click');
+    await doc.dispatch('keydown', { key: 'Escape' });
+    assert.equal(editor.hidden, true);
+    assert.equal(doc.activeElement, swatch);
+
+    const roomRow = participantRow(doc, 'Room');
+    await roomRow.querySelector('.participant-color-swatch').dispatch('click');
+    const roomHex = roomRow.querySelector('.participant-color-hex');
+    roomHex.value = '#102030';
+    await roomHex.dispatch('input');
+    assert.equal(doc.getElementById('messages').children[2].style.getPropertyValue('--participant-color'), '#102030');
+    assert.equal(doc.getElementById('messages').children[0].style.getPropertyValue('--participant-color'), '#4F8FEA');
+});
+
+
+test('switching editors closes the previous editor and future messages use the live color', async () => {
+    const doc = makeDirectoryDocument();
+    const storage = new SyntheticStorage(null, { throwOnSet: true });
+    const fetchStub = async url => url === '/api/participants'
+        ? response(true, DIRECTORY)
+        : response(true, []);
+    const controller = setupApp(doc, fetchStub, storage);
+    await settle();
+    const geminiRow = participantRow(doc, 'Gemini');
+    const heliosRow = participantRow(doc, 'Helios');
+    const geminiSwatch = geminiRow.querySelector('.participant-color-swatch');
+    const heliosSwatch = heliosRow.querySelector('.participant-color-swatch');
+    const geminiEditor = geminiRow.querySelector('.participant-color-editor');
+    await geminiSwatch.dispatch('click');
+    const geminiHex = geminiEditor.querySelector('.participant-color-hex');
+    geminiHex.value = '#334455';
+    await geminiHex.dispatch('input');
+    assert.equal(controller.participantColors.gemini, '#334455');
+    assert.equal(storage.setCalls.length, 1);
+    await heliosSwatch.dispatch('click');
+    assert.equal(geminiEditor.hidden, true);
+    assert.equal(heliosRow.querySelector('.participant-color-editor').hidden, false);
+
+    displayMessages([syntheticMessage('gemini', 'Peter')], doc, controller.participantColors);
+    assert.equal(
+        doc.getElementById('messages').children[0].style.getPropertyValue('--participant-color'),
+        '#334455'
+    );
+});
 
 
 test('browser classifier mirrors exact command grammar and preserves decimal text', () => {
@@ -701,8 +1030,9 @@ test('static read statuses, cache tokens, and focus-visible selectors are presen
     const css = fs.readFileSync(path.join(__dirname, '..', 'static', 'style.css'), 'utf8');
     assert.match(html, /id="history-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
     assert.match(html, /id="participant-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
-    assert.match(html, /style\.css\?v=gemini-participant-v1/);
-    assert.match(html, /app\.js\?v=gemini-participant-v1/);
+    assert.match(html, /style\.css\?v=participant-colors-v1/);
+    assert.match(html, /app\.js\?v=participant-colors-v1/);
+    assert.doesNotMatch(html, /gemini-participant-v1/);
     assert.match(css, /button:focus-visible/);
     assert.match(css, /input:focus-visible/);
 });
