@@ -2865,6 +2865,8 @@ def _validate_native_audit(value: Any, store: GenerationStore, journal: dict[str
     ):
         raise _error("reset_recovery_invalid")
     if store.journal_version == JOURNAL_VERSION:
+        if value["outcome"] == "reset" and journal["stage"] != "finalizing":
+            raise _error("reset_recovery_invalid")
         expected_fresh = (
             journal["fresh_database"] if value["outcome"] == "reset" else None
         )
@@ -5275,6 +5277,18 @@ def recover_database_reset(
             if terminal_audit is not None:
                 if terminal_audit["outcome"] != expected_outcome:
                     raise _error("reset_recovery_invalid")
+                if (
+                    store.origin == "native_v3"
+                    and terminal_audit["outcome"] == "reset"
+                ):
+                    _active, quarantines, _failed, _restoring = (
+                        _operational_paths(store, journal)
+                    )
+                    if any(
+                        path is not None and os.path.lexists(path)
+                        for path in quarantines.values()
+                    ):
+                        raise _error("reset_recovery_invalid")
                 historical = store.origin in {
                     "native_v2", "legacy_v1_conversion"
                 }
