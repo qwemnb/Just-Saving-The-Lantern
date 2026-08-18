@@ -793,7 +793,7 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
 
     function selectDestination(destination, preferredResponseKey = 'peter') {
         selectedDestination = destination;
-        if (destinationButton) destinationButton.textContent = `Ask: ${destinationLabel(destination)}`;
+        if (destinationButton) destinationButton.textContent = destinationLabel(destination);
         if (destination.kind === 'room') {
             selectedResponseDestination = null;
             if (responseDestinationControl) responseDestinationControl.hidden = true;

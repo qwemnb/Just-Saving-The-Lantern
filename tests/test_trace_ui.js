@@ -455,7 +455,7 @@ test('participant rows keep destination and accessible color controls independen
     }
     const roomRow = participantRow(doc, 'Room');
     await roomRow.querySelector('.participant-entry').dispatch('click');
-    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Room');
     const peterRow = participantRow(doc, 'Peter');
     assert.match(allText(peterRow), /Not addressable/);
     const before = doc.getElementById('destination-button').textContent;
@@ -467,7 +467,7 @@ test('participant rows keep destination and accessible color controls independen
     peterHex.value = '#123456';
     await peterHex.dispatch('input');
     assert.equal(peterSwatch.style.getPropertyValue('--participant-color'), '#123456');
-    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Room');
     assert.equal(peterRow.querySelector('.participant-entry').disabled, true);
 });
 
@@ -835,7 +835,7 @@ test('directory initializes Helios, bracket opens searchable picker, and Room PO
     };
     setupApp(doc, fetchStub);
     await settle();
-    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Helios');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Helios');
     assert.match(allText(doc.getElementById('participant-list')), /Previously: Sol/);
     assert.match(allText(doc.getElementById('participant-list')), /Not addressable/);
 
@@ -849,7 +849,7 @@ test('directory initializes Helios, bracket opens searchable picker, and Room PO
 
     const roomOption = doc.getElementById('destination-options').children[0];
     await roomOption.dispatch('click');
-    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Room');
     input.value = '  exact room text  ';
     await input.dispatch('input');
     calls.length = 0;
@@ -859,7 +859,7 @@ test('directory initializes Helios, bracket opens searchable picker, and Room PO
         message_text: '  exact room text  ',
         destination: { kind: 'room' }
     });
-    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Room');
 });
 
 
@@ -1080,7 +1080,7 @@ test('direct reply picker separates invocation from response routing and resets 
     });
 
     await participantRow(doc, 'Gemini').querySelector('.participant-entry').dispatch('click');
-    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Gemini');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Gemini');
     assert.equal(select.value, 'participant:peter');
     assert.deepEqual(select.children.map(option => option.textContent), ['Room', 'Helios', 'Peter']);
 
