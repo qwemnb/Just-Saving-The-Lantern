@@ -10,6 +10,7 @@ const DIRECTORY_READ_FALLBACK = 'Participant directory unavailable.';
 const POST_ERROR_FALLBACK = 'Failed to send message. Please try again.';
 const POST_ERROR_LITERALS = Object.freeze({
     participant_destination_unavailable: 'The destination changed. Select a destination and try again.',
+    response_destination_unavailable: 'The reply destination changed. Select it again and try again.',
     missing_gemini_api_key: 'Gemini is not configured on this server.',
     missing_gemini_model: 'Gemini is not configured on this server.',
     gemini_provider_timeout: 'Gemini timed out. Your message was saved.',
@@ -269,7 +270,35 @@ function scrollToBottom(doc = document) {
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
 
-async function sendMessage(messageText, destination, fetchImpl = fetch) {
+async function sendMessage(
+    messageText,
+    destination,
+    responseDestination = null,
+    fetchImpl = fetch
+) {
+    if (typeof responseDestination === 'function') {
+        fetchImpl = responseDestination;
+        responseDestination = null;
+    }
+    if (destination.kind === 'participant' && responseDestination === null) {
+        responseDestination = {
+            kind: 'participant', participant_key: 'peter', primary_name: 'Peter'
+        };
+    }
+    const body = {
+        message_text: messageText,
+        destination: destination.kind === 'room'
+            ? { kind: 'room' }
+            : { kind: 'participant', participant_key: destination.participant_key }
+    };
+    if (destination.kind === 'participant') {
+        body.response_destination = responseDestination.kind === 'room'
+            ? { kind: 'room' }
+            : {
+                kind: 'participant',
+                participant_key: responseDestination.participant_key
+            };
+    }
     let response;
     try {
         response = await fetchImpl(`${API_BASE}/messages`, {
@@ -277,12 +306,7 @@ async function sendMessage(messageText, destination, fetchImpl = fetch) {
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({
-                message_text: messageText,
-                destination: destination.kind === 'room'
-                    ? { kind: 'room' }
-                    : { kind: 'participant', participant_key: destination.participant_key }
-            })
+            body: JSON.stringify(body)
         });
     } catch (_error) {
         const error = new Error(POST_ERROR_FALLBACK);
@@ -521,10 +545,15 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
     const participantToggle = doc.getElementById('participants-toggle');
     const participantRefresh = doc.getElementById('participants-refresh');
     const participantStatus = doc.getElementById('participant-read-status');
+    const responseDestinationControl = doc.getElementById('response-destination-control');
+    const responseDestinationSelect = doc.getElementById('response-destination-select');
     const hasDirectoryUi = Boolean(destinationButton && picker && search && options && participantList);
     let directory = null;
     let selectedDestination = hasDirectoryUi ? null : {
         kind: 'participant', participant_key: 'helios', primary_name: 'Helios'
+    };
+    let selectedResponseDestination = hasDirectoryUi ? null : {
+        kind: 'participant', participant_key: 'peter', primary_name: 'Peter'
     };
     let inFlight = false;
     let composing = false;
@@ -535,6 +564,56 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
 
     function destinationLabel(destination) {
         return destination.kind === 'room' ? destination.label : destination.primary_name;
+    }
+
+    function responseDestinationCandidates() {
+        if (!directory || !selectedDestination || selectedDestination.kind !== 'participant') {
+            return [];
+        }
+        return directory.destinations.filter(destination => (
+            destination.kind === 'room'
+            || (
+                destination.kind === 'participant'
+                && destination.participant_type !== 'system'
+                && destination.participant_key !== selectedDestination.participant_key
+            )
+        ));
+    }
+
+    function renderResponseDestinations(preferredKey = 'peter') {
+        const candidates = responseDestinationCandidates();
+        if (responseDestinationSelect) {
+            responseDestinationSelect.replaceChildren();
+            candidates.forEach(destination => {
+                const option = doc.createElement('option');
+                option.value = destination.kind === 'room'
+                    ? 'room'
+                    : `participant:${destination.participant_key}`;
+                option.textContent = destinationLabel(destination);
+                responseDestinationSelect.appendChild(option);
+            });
+        }
+        const preferred = candidates.find(destination => (
+            preferredKey === 'room'
+                ? destination.kind === 'room'
+                : destination.kind === 'participant'
+                    && destination.participant_key === preferredKey
+        ));
+        const peter = candidates.find(destination => (
+            destination.kind === 'participant' && destination.participant_key === 'peter'
+        ));
+        selectedResponseDestination = preferred || peter || null;
+        if (responseDestinationControl) {
+            responseDestinationControl.hidden = selectedDestination === null
+                || selectedDestination.kind === 'room';
+        }
+        if (responseDestinationSelect) {
+            responseDestinationSelect.value = selectedResponseDestination
+                ? (selectedResponseDestination.kind === 'room'
+                    ? 'room'
+                    : `participant:${selectedResponseDestination.participant_key}`)
+                : '';
+        }
     }
 
     function destinationColorKey(destination) {
@@ -636,8 +715,17 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
     }
 
     function updateSendButtonState() {
-        sendButton.disabled = inFlight || input.disabled || input.value.trim().length === 0 || !selectedDestination;
+        const responseReady = selectedDestination && (
+            selectedDestination.kind === 'room' || selectedResponseDestination
+        );
+        sendButton.disabled = inFlight || input.disabled || input.value.trim().length === 0 || !responseReady;
         if (destinationButton) destinationButton.disabled = inFlight || !directory;
+        if (responseDestinationSelect) {
+            responseDestinationSelect.disabled = inFlight
+                || !directory
+                || !selectedDestination
+                || selectedDestination.kind === 'room';
+        }
     }
 
     function renderParticipantPanel() {
@@ -703,9 +791,15 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         });
     }
 
-    function selectDestination(destination) {
+    function selectDestination(destination, preferredResponseKey = 'peter') {
         selectedDestination = destination;
-        if (destinationButton) destinationButton.textContent = `To: ${destinationLabel(destination)}`;
+        if (destinationButton) destinationButton.textContent = `Ask: ${destinationLabel(destination)}`;
+        if (destination.kind === 'room') {
+            selectedResponseDestination = null;
+            if (responseDestinationControl) responseDestinationControl.hidden = true;
+        } else {
+            renderResponseDestinations(preferredResponseKey);
+        }
         closePicker();
         updateSendButtonState();
         input.focus();
@@ -759,6 +853,9 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         if (!hasDirectoryUi) return;
         directory = null;
         selectedDestination = null;
+        selectedResponseDestination = null;
+        if (responseDestinationControl) responseDestinationControl.hidden = true;
+        if (responseDestinationSelect) responseDestinationSelect.replaceChildren();
         destinationButton.textContent = 'Choose destination';
         closePicker();
         updateSendButtonState();
@@ -791,6 +888,7 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         if (payload.directory_version !== 1 || !Array.isArray(payload.destinations)) {
             directory = null;
             selectedDestination = null;
+            selectedResponseDestination = null;
             if (participantStatus) participantStatus.textContent = DIRECTORY_READ_FALLBACK;
             updateSendButtonState();
             return false;
@@ -856,6 +954,20 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         }
     });
     if (destinationButton) destinationButton.addEventListener('click', openPicker);
+    if (responseDestinationSelect) {
+        responseDestinationSelect.addEventListener('change', () => {
+            const candidates = responseDestinationCandidates();
+            selectedResponseDestination = candidates.find(destination => (
+                responseDestinationSelect.value === 'room'
+                    ? destination.kind === 'room'
+                    : destination.kind === 'participant'
+                        && responseDestinationSelect.value
+                        === `participant:${destination.participant_key}`
+            )) || null;
+            if (!selectedResponseDestination) renderResponseDestinations('peter');
+            updateSendButtonState();
+        });
+    }
     if (search) {
         search.addEventListener('input', renderPicker);
         search.addEventListener('keydown', event => {
@@ -922,20 +1034,28 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
             return;
         }
 
-        if (!selectedDestination) return;
+        if (!selectedDestination || (
+            selectedDestination.kind === 'participant' && !selectedResponseDestination
+        )) return;
 
         commandStatus.textContent = '';
         inFlight = true;
         sendButton.disabled = true;
         input.disabled = true;
         if (destinationButton) destinationButton.disabled = true;
+        if (responseDestinationSelect) responseDestinationSelect.disabled = true;
         const pendingText = selectedDestination.kind === 'room'
             ? 'Saving message to the Room...'
-            : `${destinationLabel(selectedDestination)} is responding...`;
+            : `${destinationLabel(selectedDestination)} is responding to ${destinationLabel(selectedResponseDestination)}...`;
         const pendingMessage = showSystemMessage(pendingText, doc);
 
         try {
-            await sendMessage(messageText, selectedDestination, fetchImpl);
+            await sendMessage(
+                messageText,
+                selectedDestination,
+                selectedResponseDestination,
+                fetchImpl
+            );
             input.value = '';
             await loadMessages(fetchImpl, doc, colorPreferences.colors);
         } catch (error) {
@@ -946,9 +1066,10 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
             } else {
                 pendingMessage.remove();
             }
-            if (error.code === 'participant_destination_unavailable') {
+            if (error.code === 'participant_destination_unavailable'
+                || error.code === 'response_destination_unavailable') {
                 await loadDirectory(false);
-                commandStatus.textContent = 'The destination changed. Select a destination and try again.';
+                commandStatus.textContent = POST_ERROR_LITERALS[error.code];
             }
             showSystemMessage(error.message || 'Failed to send message. Please try again.', doc);
         } finally {
@@ -964,7 +1085,9 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         runTraceCommand,
         loadDirectory,
         openPicker,
-        participantColors: colorPreferences.colors
+        participantColors: colorPreferences.colors,
+        getSelectedDestination: () => selectedDestination,
+        getSelectedResponseDestination: () => selectedResponseDestination
     };
 }
 

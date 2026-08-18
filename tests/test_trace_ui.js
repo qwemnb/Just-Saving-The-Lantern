@@ -231,6 +231,9 @@ function makeDirectoryDocument() {
     doc.register('participants-toggle', 'button');
     doc.register('participants-refresh', 'button');
     doc.register('participant-read-status');
+    const responseControl = doc.register('response-destination-control', 'label');
+    responseControl.hidden = true;
+    doc.register('response-destination-select', 'select');
     return doc;
 }
 
@@ -452,7 +455,7 @@ test('participant rows keep destination and accessible color controls independen
     }
     const roomRow = participantRow(doc, 'Room');
     await roomRow.querySelector('.participant-entry').dispatch('click');
-    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
     const peterRow = participantRow(doc, 'Peter');
     assert.match(allText(peterRow), /Not addressable/);
     const before = doc.getElementById('destination-button').textContent;
@@ -464,7 +467,7 @@ test('participant rows keep destination and accessible color controls independen
     peterHex.value = '#123456';
     await peterHex.dispatch('input');
     assert.equal(peterSwatch.style.getPropertyValue('--participant-color'), '#123456');
-    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
     assert.equal(peterRow.querySelector('.participant-entry').disabled, true);
 });
 
@@ -832,7 +835,7 @@ test('directory initializes Helios, bracket opens searchable picker, and Room PO
     };
     setupApp(doc, fetchStub);
     await settle();
-    assert.equal(doc.getElementById('destination-button').textContent, 'To: Helios');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Helios');
     assert.match(allText(doc.getElementById('participant-list')), /Previously: Sol/);
     assert.match(allText(doc.getElementById('participant-list')), /Not addressable/);
 
@@ -846,7 +849,7 @@ test('directory initializes Helios, bracket opens searchable picker, and Room PO
 
     const roomOption = doc.getElementById('destination-options').children[0];
     await roomOption.dispatch('click');
-    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
     input.value = '  exact room text  ';
     await input.dispatch('input');
     calls.length = 0;
@@ -856,7 +859,7 @@ test('directory initializes Helios, bracket opens searchable picker, and Room PO
         message_text: '  exact room text  ',
         destination: { kind: 'room' }
     });
-    assert.equal(doc.getElementById('destination-button').textContent, 'To: Room');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Room');
 });
 
 
@@ -1030,9 +1033,139 @@ test('static read statuses, cache tokens, and focus-visible selectors are presen
     const css = fs.readFileSync(path.join(__dirname, '..', 'static', 'style.css'), 'utf8');
     assert.match(html, /id="history-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
     assert.match(html, /id="participant-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
-    assert.match(html, /style\.css\?v=participant-colors-v1/);
-    assert.match(html, /app\.js\?v=participant-colors-v1/);
+    assert.match(html, /style\.css\?v=direct-participant-addressing-v1/);
+    assert.match(html, /app\.js\?v=direct-participant-addressing-v1/);
     assert.doesNotMatch(html, /gemini-participant-v1/);
     assert.match(css, /button:focus-visible/);
     assert.match(css, /input:focus-visible/);
+    assert.match(css, /select:focus-visible/);
+});
+
+
+test('direct reply picker separates invocation from response routing and resets safely', async () => {
+    const doc = makeDirectoryDocument();
+    const calls = [];
+    const fetchStub = async (url, options = {}) => {
+        calls.push({ url, options });
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages' && options.method === 'POST') {
+            return response(true, { status: 'completed' });
+        }
+        if (url === '/api/messages') return response(true, []);
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    const controller = setupApp(doc, fetchStub);
+    await settle();
+
+    const control = doc.getElementById('response-destination-control');
+    const select = doc.getElementById('response-destination-select');
+    assert.equal(control.hidden, false);
+    assert.equal(select.value, 'participant:peter');
+    assert.deepEqual(select.children.map(option => option.textContent), ['Room', 'Gemini', 'Peter']);
+    assert.equal(select.children.some(option => option.textContent === 'Helios'), false);
+
+    select.value = 'participant:gemini';
+    await select.dispatch('change');
+    assert.equal(controller.getSelectedResponseDestination().participant_key, 'gemini');
+    const input = doc.getElementById('message-input');
+    input.value = 'Say hello.';
+    await input.dispatch('input');
+    calls.length = 0;
+    await doc.getElementById('message-form').dispatch('submit');
+    const post = calls.find(call => call.options.method === 'POST');
+    assert.deepEqual(JSON.parse(post.options.body), {
+        message_text: 'Say hello.',
+        destination: { kind: 'participant', participant_key: 'helios' },
+        response_destination: { kind: 'participant', participant_key: 'gemini' }
+    });
+
+    await participantRow(doc, 'Gemini').querySelector('.participant-entry').dispatch('click');
+    assert.equal(doc.getElementById('destination-button').textContent, 'Ask: Gemini');
+    assert.equal(select.value, 'participant:peter');
+    assert.deepEqual(select.children.map(option => option.textContent), ['Room', 'Helios', 'Peter']);
+
+    await participantRow(doc, 'Room').querySelector('.participant-entry').dispatch('click');
+    assert.equal(control.hidden, true);
+    assert.equal(controller.getSelectedResponseDestination(), null);
+});
+
+
+test('direct routing controls remain disabled for the full provider request', async () => {
+    const doc = makeDirectoryDocument();
+    let releasePost;
+    const blocked = new Promise(resolve => { releasePost = resolve; });
+    const fetchStub = async (url, options = {}) => {
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages' && options.method === 'POST') {
+            await blocked;
+            return response(true, { status: 'completed' });
+        }
+        if (url === '/api/messages') return response(true, []);
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    setupApp(doc, fetchStub);
+    await settle();
+    const input = doc.getElementById('message-input');
+    input.value = 'Wait for provider.';
+    await input.dispatch('input');
+    const submission = doc.getElementById('message-form').dispatch('submit');
+    await settle();
+    assert.equal(input.disabled, true);
+    assert.equal(doc.getElementById('destination-button').disabled, true);
+    assert.equal(doc.getElementById('response-destination-select').disabled, true);
+    assert.match(allText(doc.getElementById('messages')), /Helios is responding to Peter/);
+    releasePost();
+    await submission;
+    assert.equal(input.disabled, false);
+    assert.equal(doc.getElementById('response-destination-select').disabled, false);
+});
+
+
+test('participant refresh resets a stale response target to Peter without selecting another AI', async () => {
+    const doc = makeDirectoryDocument();
+    let directory = DIRECTORY;
+    const fetchStub = async url => {
+        if (url === '/api/participants') return response(true, directory);
+        if (url === '/api/messages') return response(true, []);
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    const controller = setupApp(doc, fetchStub);
+    await settle();
+    const select = doc.getElementById('response-destination-select');
+    select.value = 'participant:gemini';
+    await select.dispatch('change');
+    directory = {
+        ...DIRECTORY,
+        destinations: DIRECTORY.destinations.filter(item => item.participant_key !== 'gemini')
+    };
+    await controller.loadDirectory();
+    assert.equal(controller.getSelectedDestination().participant_key, 'helios');
+    assert.equal(controller.getSelectedResponseDestination().participant_key, 'peter');
+    assert.equal(select.children.some(option => option.textContent === 'Gemini'), false);
+});
+
+
+test('canonical direct routes render naturally while bubble color remains author-derived', () => {
+    const doc = makeDocument();
+    displayMessages([
+        {
+            ...syntheticMessage('helios', 'Gemini', 'Hello Gemini'),
+            routing: {
+                sender: { participant_key: 'helios', display_name: 'Helios' },
+                destination: { kind: 'participant', participant_key: 'gemini', display_name: 'Gemini' }
+            }
+        },
+        {
+            ...syntheticMessage('gemini', 'Helios', 'Hello Helios'),
+            routing: {
+                sender: { participant_key: 'gemini', display_name: 'Gemini' },
+                destination: { kind: 'participant', participant_key: 'helios', display_name: 'Helios' }
+            }
+        }
+    ], doc);
+    const messages = doc.getElementById('messages').children;
+    assert.match(allText(messages[0]), /Helios -> Gemini/);
+    assert.match(allText(messages[1]), /Gemini -> Helios/);
+    assert.equal(messages[0].style.getPropertyValue('--participant-color'), '#D39A2C');
+    assert.equal(messages[1].style.getPropertyValue('--participant-color'), '#4F8FEA');
 });

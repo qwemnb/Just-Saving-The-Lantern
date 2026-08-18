@@ -25,9 +25,10 @@ from app.maintenance_lock import MaintenanceLockError, acquire_database_lease
 from app.provider_history import load_provider_history
 from app.request_validation import (
     HISTORY_VISIBILITY,
+    OPENAI_SYSTEM_INSTRUCTIONS_V1,
     validate_recorded_openai_shared_request_payload,
 )
-from app.room_service import RESPONSE_SETTINGS, RESPONSE_TOOLS, SYSTEM_INSTRUCTIONS
+from app.room_service import RESPONSE_SETTINGS, RESPONSE_TOOLS
 from app.schema_validation import SchemaValidationError, validate_v14_foundation
 from app.seed_memory import build_fts_query, tokenize_memory_query
 
@@ -155,7 +156,7 @@ class RoomSharedFoundationTests(unittest.TestCase):
         }
         payload = {
             "request": {
-                "model": "model", "instructions": SYSTEM_INSTRUCTIONS,
+                "model": "model", "instructions": OPENAI_SYSTEM_INSTRUCTIONS_V1,
                 "input": [{"role": "user", "content": "hello"}],
                 "store": False, "reasoning": dict(RESPONSE_SETTINGS["reasoning"]),
                 "max_output_tokens": 2048, "tools": list(RESPONSE_TOOLS),

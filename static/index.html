@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Helios Room</title>
-    <link rel="stylesheet" href="/static/style.css?v=participant-colors-v1">
+    <link rel="stylesheet" href="/static/style.css?v=direct-participant-addressing-v1">
 </head>
 <body>
     <main class="container" id="app-shell">
@@ -37,13 +37,18 @@
 
             <div class="input-area">
                 <form id="message-form" class="message-form">
-                    <div class="destination-control">
+                    <div class="destination-control" aria-label="Ask participant">
+                        <span class="routing-label">Ask:</span>
                         <button id="destination-button" type="button" disabled aria-haspopup="listbox" aria-expanded="false" aria-controls="destination-options">Choose destination</button>
                         <div id="destination-picker" class="destination-picker" hidden>
                             <input id="destination-search" type="search" placeholder="Find a participant" aria-label="Find a destination" autocomplete="off">
                             <div id="destination-options" role="listbox"></div>
                         </div>
                     </div>
+                    <label id="response-destination-control" class="response-destination-control" hidden>
+                        <span class="routing-label">Reply to:</span>
+                        <select id="response-destination-select" disabled aria-label="Response destination"></select>
+                    </label>
                     <input
                         type="text"
                         id="message-input"
@@ -77,6 +82,6 @@
         </section>
     </div>
 
-    <script src="/static/app.js?v=participant-colors-v1"></script>
+    <script src="/static/app.js?v=direct-participant-addressing-v1"></script>
 </body>
 </html>

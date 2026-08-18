@@ -8,7 +8,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .commands import classify_local_command, is_reserved_local_command
 from .database import (
@@ -32,11 +32,20 @@ from .openai_client import (
 from .identity_service import current_alias, resolve_room_post_context
 from .provider_history import ProviderHistoryError, load_provider_history
 from .request_validation import (
-    HISTORY_VISIBILITY,
+    HISTORY_VISIBILITY_V3,
     OPENAI_RESPONSE_SETTINGS as RESPONSE_SETTINGS,
     OPENAI_RESPONSE_TOOLS as RESPONSE_TOOLS,
-    OPENAI_SYSTEM_INSTRUCTIONS as SYSTEM_INSTRUCTIONS,
+    OPENAI_SYSTEM_INSTRUCTIONS_V2 as SYSTEM_INSTRUCTIONS,
     validate_recorded_openai_shared_request_payload,
+)
+from .turn_routing import (
+    BoundResponseDestination,
+    PROVIDER_HISTORY_V3,
+    ResponseDestinationUnavailable,
+    TURN_ROUTING_VERSION,
+    build_openai_provider_input,
+    resolve_response_destination,
+    validate_bound_response_destination,
 )
 from .seed_memory import (
     RESULT_LIMIT as MEMORY_RESULT_LIMIT,
@@ -99,6 +108,10 @@ class AcceptedTurn:
     helios_id: int
     peter_id: int
     helios_config_id: int
+    helios_alias_id: int
+    response_destination: BoundResponseDestination
+    request_event_id: int
+    request_payload_json: str
     provider_request: dict[str, Any]
     api_key: str
 
@@ -134,6 +147,7 @@ async def run_helios_turn(
     message_text: str,
     *,
     destination_participant_key: str = HELIOS_KEY,
+    response_destination: Mapping[str, Any] | None = None,
     database_path: Path | str = DEFAULT_DATABASE_PATH,
     client_factory: Callable[[str], Any] | None = None,
     dotenv_path: Path | str | None = None,
@@ -154,6 +168,7 @@ async def run_helios_turn(
         database_path,
         message_text,
         destination_participant_key,
+        response_destination,
         dotenv_path,
     )
 
@@ -355,6 +370,7 @@ def _accept_turn(
     database_path: Path | str,
     message_text: str,
     destination_participant_key: str,
+    response_destination: Mapping[str, Any] | None,
     dotenv_path: Path | str | None,
 ) -> AcceptedTurn:
     try:
@@ -416,6 +432,19 @@ def _accept_turn(
             helios_id=destination["id"],
         )
         helios_alias = current_alias(connection, identity.helios_id)
+        try:
+            response_route = resolve_response_destination(
+                connection,
+                room_id=identity.room_id,
+                responding_participant_id=identity.helios_id,
+                requested=response_destination,
+            )
+        except ResponseDestinationUnavailable:
+            raise TurnServiceError(
+                status_code=409,
+                code="response_destination_unavailable",
+                message="The selected response destination is unavailable.",
+            ) from None
         turn_id = create_turn(connection, identity.room_id, identity.peter_id)
         peter_message_id = store_message(
             connection,
@@ -446,17 +475,16 @@ def _accept_turn(
                 result_limit=MEMORY_RESULT_LIMIT,
                 text_budget_chars=MEMORY_TEXT_BUDGET_CHARS,
             )
-            provider_input = list(canonical_input)
-            if memory_search.selected:
-                provider_input.insert(
-                    len(provider_input) - 1,
-                    {
-                        "role": "user",
-                        "content": serialize_inherited_memory_context(
-                            memory_search.selected
-                        ),
-                    },
-                )
+            inherited_memory_context = (
+                serialize_inherited_memory_context(memory_search.selected)
+                if memory_search.selected
+                else None
+            )
+            provider_input = build_openai_provider_input(
+                canonical_input,
+                inherited_memory_context=inherited_memory_context,
+                response_destination=response_route.evidence(),
+            )
             memory_retrieval = memory_search.audit_envelope(
                 owner_participant_id=identity.helios_id,
                 query_source_message_id=peter_message_id,
@@ -490,7 +518,7 @@ def _accept_turn(
             instructions=SYSTEM_INSTRUCTIONS,
             settings=RESPONSE_SETTINGS,
             tools=RESPONSE_TOOLS,
-            label_family="seed-memory-openai",
+            label_family="direct-address-openai",
         )
         provider_request = {
             "model": model,
@@ -511,11 +539,13 @@ def _accept_turn(
                 "timeout_seconds": int(OPENAI_TIMEOUT_SECONDS),
                 "max_retries": OPENAI_MAX_RETRIES,
                 "memory_retrieval": memory_retrieval,
-                "history_visibility": dict(HISTORY_VISIBILITY),
+                "history_visibility": dict(HISTORY_VISIBILITY_V3),
+                "turn_routing_version": TURN_ROUTING_VERSION,
+                "response_destination": response_route.evidence(),
             },
         }
         validate_recorded_openai_shared_request_payload(request_event_payload)
-        _insert_api_event(
+        request_event_id = _insert_api_event(
             connection,
             turn_id=turn_id,
             room_id=identity.room_id,
@@ -534,6 +564,10 @@ def _accept_turn(
             helios_id=identity.helios_id,
             peter_id=identity.peter_id,
             helios_config_id=config_id,
+            helios_alias_id=helios_alias["id"],
+            response_destination=response_route,
+            request_event_id=request_event_id,
+            request_payload_json=canonical_json(request_event_payload),
             provider_request=provider_request,
             api_key=environment.api_key,
         )
@@ -649,6 +683,7 @@ def _load_and_validate_history(
             room_id=room_id,
             boundary=boundary,
             provider_participant_key=HELIOS_KEY,
+            projection_version=PROVIDER_HISTORY_V3,
         )
     except ProviderHistoryError as error:
         raise TurnServiceError(
@@ -670,6 +705,7 @@ def _finalize_success(
         connection.execute("BEGIN IMMEDIATE")
         validate_phase_a_foundation(connection)
         _assert_turn_open(connection, accepted)
+        route = accepted.response_destination
         helios_message_id = store_message(
             connection,
             room_id=accepted.room_id,
@@ -679,10 +715,10 @@ def _finalize_success(
             turn_id=accepted.turn_id,
             reply_to_id=accepted.peter_message_id,
             message_type="chat",
-            sender_alias_id=current_alias(connection, accepted.helios_id)["id"],
-            destination_kind="participant",
-            destination_alias_id=current_alias(connection, accepted.peter_id)["id"],
-            recipient_participant_id=accepted.peter_id,
+            sender_alias_id=accepted.helios_alias_id,
+            destination_kind=route.kind,
+            destination_alias_id=route.destination_alias_id,
+            recipient_participant_id=route.recipient_participant_id,
         )
         _insert_api_event(
             connection,
@@ -771,6 +807,37 @@ def _assert_turn_open(
         or row["status"] != "open"
     ):
         raise RuntimeError("Turn is no longer open for finalization")
+    validate_bound_response_destination(connection, accepted.response_destination)
+    events = connection.execute(
+        """SELECT id, participant_id, participant_config_id, sequence_no,
+                  event_type, related_message_id, payload_json, is_redacted,
+                  tool_invocation_id
+           FROM api_events WHERE turn_id=?""",
+        (accepted.turn_id,),
+    ).fetchall()
+    if len(events) != 1:
+        raise RuntimeError("OpenAI request evidence changed")
+    event = events[0]
+    if (
+        event["id"] != accepted.request_event_id
+        or event["participant_id"] != accepted.helios_id
+        or event["participant_config_id"] != accepted.helios_config_id
+        or event["sequence_no"] != 1
+        or event["event_type"] != "openai.responses.request"
+        or event["related_message_id"] != accepted.peter_message_id
+        or event["payload_json"] != accepted.request_payload_json
+        or event["is_redacted"]
+        or event["tool_invocation_id"] is not None
+    ):
+        raise RuntimeError("OpenAI request evidence changed")
+    payload = json.loads(event["payload_json"])
+    validate_recorded_openai_shared_request_payload(payload)
+    if (
+        payload["request"] != accepted.provider_request
+        or payload["local_context"]["response_destination"]
+        != accepted.response_destination.evidence()
+    ):
+        raise RuntimeError("OpenAI routing evidence changed")
 
 
 def _insert_api_event(

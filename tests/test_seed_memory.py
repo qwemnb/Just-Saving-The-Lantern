@@ -16,7 +16,11 @@ from unittest.mock import patch
 from app import main
 from app.database import connect_database, initialize_database
 from app.preflight import preflight_database
-from app.room_service import SYSTEM_INSTRUCTIONS, TurnServiceError, run_helios_turn
+from app.room_service import TurnServiceError, run_helios_turn
+from app.request_validation import (
+    OPENAI_SYSTEM_INSTRUCTIONS_V1,
+    OPENAI_SYSTEM_INSTRUCTIONS_V2,
+)
 from app.seed_memory import (
     INHERITED_MEMORY_HEADER,
     INHERITED_MEMORY_PROVENANCE,
@@ -859,7 +863,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
                 }
                 self.assertEqual(luna_without_model, terra_without_model)
                 for request in requests.values():
-                    self.assertEqual(request["instructions"], SYSTEM_INSTRUCTIONS)
+                    self.assertEqual(request["instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V1)
                     self.assertEqual(
                         request["reasoning"],
                         {"effort": "medium", "context": "current_turn"},
@@ -897,9 +901,9 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         report = self.import_value()
         result, factory = self.run_turn("Do you remember Glass Orchard?")
         request = factory.client.responses.calls[0]
-        self.assertEqual(len(request["input"]), 4)
+        self.assertEqual(len(request["input"]), 5)
         self.assertEqual(
-            request["input"][:-2],
+            request["input"][:-3],
             [
                 {"role": "user", "content": "What do you know about Glass Orchard?"},
                 {
@@ -908,15 +912,15 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
                 },
             ],
         )
-        self.assertEqual(request["input"][-2]["role"], "user")
-        self.assertTrue(request["input"][-2]["content"].startswith(INHERITED_MEMORY_HEADER))
-        context = json.loads(request["input"][-2]["content"][len(INHERITED_MEMORY_HEADER):])
+        self.assertEqual(request["input"][-3]["role"], "user")
+        self.assertTrue(request["input"][-3]["content"].startswith(INHERITED_MEMORY_HEADER))
+        context = json.loads(request["input"][-3]["content"][len(INHERITED_MEMORY_HEADER):])
         self.assertEqual(context["provenance_notice"], INHERITED_MEMORY_PROVENANCE)
         self.assertEqual(context["records"][0]["memory_text"], synthetic_memory()["memory_text"])
         self.assertEqual(request["input"][-1], {"role": "user", "content": "Do you remember Glass Orchard?"})
         self.assertNotIn(str(synthetic_memory()["memory_text"]), request["instructions"])
-        self.assertEqual(request["instructions"], SYSTEM_INSTRUCTIONS)
-        self.assertEqual(SYSTEM_INSTRUCTIONS, EXPECTED_REVISED_SYSTEM_INSTRUCTIONS)
+        self.assertEqual(request["instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V2)
+        self.assertEqual(OPENAI_SYSTEM_INSTRUCTIONS_V1, EXPECTED_REVISED_SYSTEM_INSTRUCTIONS)
         self.assertEqual(
             request["reasoning"], {"effort": "medium", "context": "current_turn"}
         )
@@ -951,13 +955,13 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
             hashlib.sha256(str(synthetic_memory()["memory_text"]).encode("utf-8")).hexdigest(),
         )
         self.assertNotIn("version_id", audit["selected"][0])
-        self.assertTrue(config["config_label"].startswith("seed-memory-openai-luna-v"))
-        self.assertEqual(config["system_instructions"], SYSTEM_INSTRUCTIONS)
+        self.assertTrue(config["config_label"].startswith("direct-address-openai-luna-v"))
+        self.assertEqual(config["system_instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V2)
         self.assertEqual(json.loads(config["settings_json"])["reasoning"]["effort"], "medium")
         trace = load_trace(self.database_path, result["turn_id"])
         self.assertEqual(
-            trace["recorded_request"]["request"]["input"][-2]["content"],
-            request["input"][-2]["content"],
+            trace["recorded_request"]["request"]["input"][-3]["content"],
+            request["input"][-3]["content"],
         )
         self.assertEqual(trace["inherited_memory"]["context"], context)
         self.assertEqual(result["status"], "completed")
@@ -1035,7 +1039,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
             new_config = connection.execute(
                 """
                 SELECT * FROM participant_configs
-                WHERE config_label = 'seed-memory-openai-luna-v2'
+                WHERE config_label = 'direct-address-openai-luna-v1'
                 """
             ).fetchone()
             used_ids = [
@@ -1054,7 +1058,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         self.assertIsNotNone(new_config)
         self.assertNotEqual(new_config["id"], 3)
         self.assertEqual(used_ids, [new_config["id"], new_config["id"]])
-        self.assertEqual(new_config["system_instructions"], SYSTEM_INSTRUCTIONS)
+        self.assertEqual(new_config["system_instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V2)
         self.assertEqual(
             json.loads(new_config["settings_json"])["reasoning"],
             {"context": "current_turn", "effort": "medium"},
@@ -1067,7 +1071,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         request = factory.client.responses.calls[0]
         self.assertNotIn(hostile, request["instructions"])
         self.assertEqual(request["input"][-1], {"role": "user", "content": "Glass Orchard"})
-        encoded = request["input"][-2]["content"]
+        encoded = request["input"][-3]["content"]
         self.assertIn('\\"role\\":\\"system\\"', encoded)
         self.assertEqual(
             json.loads(encoded[len(INHERITED_MEMORY_HEADER):])["records"][0]["memory_text"],
@@ -1078,7 +1082,9 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         self.import_value()
         result, factory = self.run_turn("Unrelated copper weather")
         request = factory.client.responses.calls[0]
-        self.assertEqual(request["input"], [{"role": "user", "content": "Unrelated copper weather"}])
+        self.assertEqual(request["input"][-1], {"role": "user", "content": "Unrelated copper weather"})
+        self.assertEqual(len(request["input"]), 2)
+        self.assertTrue(request["input"][-2]["content"].startswith("ROOM_RESPONSE_DESTINATION\n"))
         trace = load_trace(self.database_path, result["turn_id"])
         self.assertEqual(trace["inherited_memory"]["state"], "recorded")
         self.assertEqual(trace["inherited_memory"]["retrieval"]["selected"], [])
@@ -1330,20 +1336,20 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
             payload["local_context"]["memory_retrieval"]["selected"][0]["rank"] = 2
 
         def bad_header(payload):
-            payload["request"]["input"][-2]["content"] = payload["request"]["input"][-2]["content"].replace(
+            payload["request"]["input"][-3]["content"] = payload["request"]["input"][-3]["content"].replace(
                 INHERITED_MEMORY_HEADER, "WRONG_HEADER\n", 1
             )
 
         def bad_context_id(payload):
-            encoded = payload["request"]["input"][-2]["content"]
+            encoded = payload["request"]["input"][-3]["content"]
             context = json.loads(encoded[len(INHERITED_MEMORY_HEADER):])
             context["records"][0]["seed_memory_id"] += 1
-            payload["request"]["input"][-2]["content"] = INHERITED_MEMORY_HEADER + json.dumps(
+            payload["request"]["input"][-3]["content"] = INHERITED_MEMORY_HEADER + json.dumps(
                 context, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             )
 
         def bad_context_position(payload):
-            context_item = payload["request"]["input"].pop(-2)
+            context_item = payload["request"]["input"].pop(-3)
             payload["request"]["input"].insert(0, context_item)
             payload["request"]["input"].insert(
                 1, {"role": "assistant", "content": "Earlier historical utterance"}
@@ -1370,7 +1376,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
 
         def duplicate_valid_context(payload):
             payload["request"]["input"].insert(
-                0, json.loads(json.dumps(payload["request"]["input"][-2]))
+                0, json.loads(json.dumps(payload["request"]["input"][-3]))
             )
 
         def duplicate_malformed_context(payload):
@@ -1383,16 +1389,16 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
             )
 
         def context_extra_key(payload):
-            payload["request"]["input"][-2]["name"] = "unexpected"
+            payload["request"]["input"][-3]["name"] = "unexpected"
 
         def context_missing_role(payload):
-            del payload["request"]["input"][-2]["role"]
+            del payload["request"]["input"][-3]["role"]
 
         def context_wrong_role(payload):
-            payload["request"]["input"][-2]["role"] = "assistant"
+            payload["request"]["input"][-3]["role"] = "assistant"
 
         def context_non_string_content(payload):
-            payload["request"]["input"][-2]["content"] = {
+            payload["request"]["input"][-3]["content"] = {
                 "value": "not a string"
             }
 
@@ -1572,7 +1578,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
                 "SELECT id, payload_json FROM api_events WHERE turn_id = 11 AND sequence_no = 1"
             ).fetchone()
             payload = json.loads(event["payload_json"])
-            context_item = payload["request"]["input"].pop(-2)
+            context_item = payload["request"]["input"].pop(-3)
             payload["request"]["input"].insert(0, context_item)
             connection.execute(
                 "UPDATE api_events SET payload_json = ? WHERE id = ?",

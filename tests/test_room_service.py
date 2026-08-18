@@ -225,7 +225,14 @@ class RoomServiceTests(unittest.TestCase):
         self.assertEqual(provider_request["instructions"], SYSTEM_INSTRUCTIONS)
         self.assertEqual(
             provider_request["input"],
-            [{"role": "user", "content": "  Hello, Helios  "}],
+            [
+                {
+                    "role": "user",
+                    "content": "ROOM_RESPONSE_DESTINATION\n"
+                    '{"display_name":"Peter","kind":"participant","participant_key":"peter"}',
+                },
+                {"role": "user", "content": "  Hello, Helios  "},
+            ],
         )
         self.assertIs(provider_request["store"], False)
         self.assertEqual(
@@ -295,7 +302,10 @@ class RoomServiceTests(unittest.TestCase):
             {
                 key: value
                 for key, value in request_event["local_context"].items()
-                if key not in {"memory_retrieval", "history_visibility"}
+                if key not in {
+                    "memory_retrieval", "history_visibility",
+                    "turn_routing_version", "response_destination",
+                }
             },
             {
                 "provider": "openai",
@@ -311,8 +321,16 @@ class RoomServiceTests(unittest.TestCase):
             {
                 "active_policy_version": "room_shared_v1",
                 "effective_from_room_sequence_no": 1,
-                "projection_version": "provider_history_v2",
+                "projection_version": "provider_history_v3",
             },
+        )
+        self.assertEqual(
+            request_event["local_context"]["turn_routing_version"],
+            "explicit_response_destination_v1",
+        )
+        self.assertEqual(
+            request_event["local_context"]["response_destination"],
+            {"display_name": "Peter", "kind": "participant", "participant_key": "peter"},
         )
         self.assertEqual(
             request_event["local_context"]["memory_retrieval"],
@@ -489,7 +507,14 @@ class RoomServiceTests(unittest.TestCase):
 
         self.assertEqual(
             factory.client.responses.calls[0]["input"],
-            [{"role": "user", "content": "Trigger boundary"}],
+            [
+                {
+                    "role": "user",
+                    "content": "ROOM_RESPONSE_DESTINATION\n"
+                    '{"display_name":"Peter","kind":"participant","participant_key":"peter"}',
+                },
+                {"role": "user", "content": "Trigger boundary"},
+            ],
         )
         with closing(connect_database(self.database_path)) as connection:
             texts = [

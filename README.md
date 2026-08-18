@@ -365,7 +365,7 @@ Enter either local command in the browser message box:
 `/trace` opens the latest turn in the `main` room. `/trace <turn_id>` opens the
 specified positive decimal turn ID. These commands are intercepted locally:
 they are not Peter messages, create no turn, message, API event, or admin event,
-and never reach OpenAI. Malformed `/trace` usage is also rejected before any
+and never reach a provider. Malformed `/trace` usage is also rejected before any
 canonical write.
 
 The accessible trace panel shows the selected turn and room identity, exact
@@ -403,7 +403,9 @@ reasoning-token counts. Omission locations are reported as JSON Pointers.
 Trace exposes the shared canonical room history, exact system instructions,
 request settings, and operational provenance. For unredacted requests it shows
 `Room-wide history`, `room_shared_v1`, effective sequence 1, and
-`provider_history_v2`; redacted requests show only that request details were
+the recorded closed projection version: historical requests retain
+`provider_history_v2`, while direct-addressing requests use
+`provider_history_v3`. Redacted requests show only that request details were
 redacted. Keep the server bound to a trusted local interface; Trace v3 is not
 designed as a public or multi-user diagnostics API.
 
@@ -484,7 +486,9 @@ and seed-memory ID. It selects at most five whole records within an aggregate
 
 If records are selected, one `user` input item beginning with
 `INHERITED_MEMORY_CONTEXT` and canonical JSON is placed after earlier canonical
-chat history and immediately before Peter's triggering canonical message. The
+chat history. For current direct-address turns it is followed by the trusted
+`ROOM_RESPONSE_DESTINATION` routing item and then Peter's triggering canonical
+message. The
 system instructions require Helios to use relevant inherited records, treat an
 earlier assistant claim of ignorance as a historical utterance rather than an
 override, and acknowledge remembered material as inherited continuity. Memory
@@ -507,9 +511,11 @@ the fixture is never submitted automatically.
 - `GET /api/messages` returns messages from the `main` room.
 - `GET /api/participants` returns directory version 1 without provider or memory access.
 - `POST /api/messages` requires exact `message_text` and structured
-  `destination` fields, assigns Peter server-side, and either posts to Room or
-  performs one API-backed turn through the registered Helios or Gemini adapter.
-  Extra fields are rejected.
+  `destination` fields. For an AI turn it also accepts optional
+  `response_destination`, which defaults to Peter. The server assigns Peter's
+  authorship, invokes only `destination`, and routes the resulting AI message to
+  `response_destination`. Extra fields are rejected. Room posts reject a
+  response destination.
 - `GET /api/trace/latest` returns the latest recorded `main`-room turn through
   the read-only Trace v3 projection.
 - `GET /api/trace/{turn_id}` returns one recorded turn for a canonical positive
@@ -528,12 +534,40 @@ Example request body:
   "destination": {
     "kind": "participant",
     "participant_key": "helios"
+  },
+  "response_destination": {
+    "kind": "participant",
+    "participant_key": "gemini"
   }
 }
 ```
 
 A Room destination is exactly `{"kind":"room"}`. Display aliases are never
 accepted as server routing authority.
+
+## Direct participant addressing
+
+The browser presents two distinct choices for AI turns: **Ask** selects the
+single provider Peter authorizes, and **Reply to** selects where that AI's one
+canonical response is addressed. Reply targets may be Peter, the Room, or a
+different active non-system participant. The responding AI cannot address
+itself. Switching the selected provider resets the reply target to Peter.
+
+Every successful provider-backed submission remains exactly two canonical
+messages: Peter to the invoked AI, then that AI to the Phase A-bound reply
+destination. The response still replies to Peter's trigger and the turn is
+still initiated by Peter. Routing to another AI never invokes it, creates a
+follow-up turn, or grants it agency; Peter must explicitly submit a separate
+request for that participant to respond.
+
+New request evidence records `explicit_response_destination_v1`, the exact
+resolved destination snapshot, v2 provider instructions, and
+`provider_history_v3`. Historical v1 instructions and `provider_history_v2`
+requests remain closed, immutable validation contracts. Under v3, a provider's
+own recorded responses remain native assistant/model history whether addressed
+to Peter, another participant, or the Room. Other participants receive those
+messages through the existing `ROOM_PARTICIPANT_MESSAGE` shared-history
+envelope.
 
 ## Run tests
 

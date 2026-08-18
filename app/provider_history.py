@@ -9,10 +9,23 @@ from typing import Any
 
 from .database import has_exact_room_visibility_policy
 from .gemini_client import (
-    GEMINI_SYSTEM_INSTRUCTIONS,
+    GEMINI_SYSTEM_INSTRUCTIONS_V1,
+    GEMINI_SYSTEM_INSTRUCTIONS_V2,
     model_content_from_stored_response,
     recorded_settings,
     validate_recorded_google_shared_request_payload,
+)
+from .request_validation import (
+    OPENAI_SYSTEM_INSTRUCTIONS_V1,
+    OPENAI_SYSTEM_INSTRUCTIONS_V2,
+    validate_recorded_openai_shared_request_payload,
+)
+from .seed_memory import INHERITED_MEMORY_HEADER
+from .turn_routing import (
+    PROVIDER_HISTORY_V2,
+    PROVIDER_HISTORY_V3,
+    build_gemini_provider_contents,
+    validate_response_destination_evidence,
 )
 
 
@@ -70,11 +83,14 @@ def load_provider_history(
     room_id: int,
     boundary: int,
     provider_participant_key: str,
+    projection_version: str = PROVIDER_HISTORY_V2,
 ) -> list[dict[str, Any]]:
     """Project one validated canonical prefix for Helios or Gemini."""
 
     if provider_participant_key not in {"helios", "gemini"}:
         raise _participant_error()
+    if projection_version not in {PROVIDER_HISTORY_V2, PROVIDER_HISTORY_V3}:
+        raise _policy_error()
     if type(boundary) is not int or boundary <= 0:
         raise _policy_error()
     if not has_exact_room_visibility_policy(connection):
@@ -151,7 +167,9 @@ def load_provider_history(
                 result.append({"role": "user", "content": row["message_text"]})
             elif sender_key == "peter" and destination == "room":
                 result.append({"role": "user", "content": row["message_text"]})
-            elif sender_key == "helios" and _is_native_candidate(row, "peter"):
+            elif sender_key == "helios" and _is_native_candidate(
+                connection, row, projection_version, "openai"
+            ):
                 result.append(_load_helios_native(connection, row, room_id))
             else:
                 result.append(_openai_external_item(row, destination))
@@ -162,11 +180,11 @@ def load_provider_history(
             result.append(_text_content("user", row["message_text"]))
         elif sender_key == "peter" and destination == "room":
             result.append(_text_content("user", row["message_text"]))
-        elif sender_key == "gemini" and _is_native_candidate(row, "peter"):
+        elif sender_key == "gemini" and _is_native_candidate(
+            connection, row, projection_version, "google"
+        ):
             result.append(
-                _load_gemini_replay(
-                    connection, row, room_id, expected_contents=list(result)
-                )
+                _load_gemini_replay(connection, row, room_id)
             )
         else:
             result.append(_external_content(row, destination_kind=destination))
@@ -237,12 +255,27 @@ def _text_content(role: str, text: str) -> dict[str, Any]:
     return {"role": role, "parts": [{"text": text}]}
 
 
-def _is_native_candidate(row: sqlite3.Row, peter_key: str) -> bool:
-    return (
-        row["destination_kind"] == "participant"
-        and row["recipient_key"] == peter_key
-        and (row["turn_id"] is not None or row["reply_to_id"] is not None)
-    )
+def _is_native_candidate(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    projection_version: str,
+    provider_family: str,
+) -> bool:
+    if row["turn_id"] is None and row["reply_to_id"] is None:
+        return False
+    event_prefix = "openai.responses." if provider_family == "openai" else "google.generate_content."
+    recognized = connection.execute(
+        "SELECT count(*) FROM api_events WHERE turn_id=? AND event_type LIKE ?",
+        (row["turn_id"], event_prefix + "%"),
+    ).fetchone()[0]
+    if recognized == 0:
+        return False
+    if projection_version == PROVIDER_HISTORY_V2:
+        return (
+            row["destination_kind"] == "participant"
+            and row["recipient_key"] == "peter"
+        )
+    return projection_version == PROVIDER_HISTORY_V3
 
 
 def _openai_external_item(row: sqlite3.Row, destination_kind: str) -> dict[str, str]:
@@ -266,7 +299,7 @@ def _validate_native_pair(
     room_id: int,
     provider_key: str,
     provider_family: str,
-) -> sqlite3.Row:
+) -> tuple[sqlite3.Row, dict[str, Any]]:
     if message["turn_id"] is None:
         raise ValueError("native response has no turn")
     turns = connection.execute(
@@ -285,12 +318,17 @@ def _validate_native_pair(
                   mr.recipient_participant_id, recipient.participant_key AS recipient_key,
                   mr.sender_participant_id, sa.participant_id AS sender_alias_owner,
                   da.participant_id AS destination_alias_owner,
-                  pc.participant_id AS config_owner, pc.provider
+                  da.display_alias AS destination_display,
+                  da.alias_key AS destination_alias_key,
+                  destination_owner.participant_key AS destination_owner_key,
+                  pc.participant_id AS config_owner, pc.provider,
+                  pc.system_instructions
            FROM messages AS m
            JOIN participants AS p ON p.id=m.participant_id
            JOIN message_routes AS mr ON mr.message_id=m.id AND mr.room_id=m.room_id
            JOIN participant_aliases AS sa ON sa.id=mr.sender_alias_id
            JOIN participant_aliases AS da ON da.id=mr.destination_alias_id
+           JOIN participants AS destination_owner ON destination_owner.id=da.participant_id
            LEFT JOIN participants AS recipient ON recipient.id=mr.recipient_participant_id
            LEFT JOIN participant_configs AS pc ON pc.id=m.participant_config_id
            WHERE m.turn_id=? ORDER BY m.turn_sequence_no""",
@@ -300,6 +338,23 @@ def _validate_native_pair(
         raise ValueError("invalid native turn cardinality")
     turn = turns[0]
     trigger, response = rows
+    events = connection.execute(
+        """SELECT sequence_no, event_type, participant_id,
+                  participant_config_id, related_message_id, payload_json,
+                  is_redacted, tool_invocation_id, room_id
+           FROM api_events WHERE turn_id=? ORDER BY sequence_no""",
+        (message["turn_id"],),
+    ).fetchall()
+    request_type = (
+        "openai.responses.request"
+        if provider_family == "openai"
+        else "google.generate_content.request"
+    )
+    response_type = (
+        "openai.responses.response"
+        if provider_family == "openai"
+        else "google.generate_content.response"
+    )
     if (
         turn["room_id"] != room_id
         or turn["initiator_key"] != "peter"
@@ -327,17 +382,78 @@ def _validate_native_pair(
         or response["reply_to_id"] != trigger["id"]
         or response["message_type"] != "chat"
         or response["routing_mode"] != "explicit"
-        or response["destination_kind"] != "participant"
-        or response["recipient_key"] != "peter"
         or response["sender_participant_id"] != response["participant_id"]
         or response["sender_alias_owner"] != response["participant_id"]
-        or response["destination_alias_owner"] != trigger["participant_id"]
         or response["config_owner"] != response["participant_id"]
         or response["provider"] != provider_family
         or response["message_text"] != message["message_text"]
+        or len(events) != 2
+        or events[0]["sequence_no"] != 1
+        or events[0]["event_type"] != request_type
+        or events[0]["participant_id"] != response["participant_id"]
+        or events[0]["participant_config_id"] != response["participant_config_id"]
+        or events[0]["related_message_id"] != trigger["id"]
+        or events[0]["room_id"] != room_id
+        or events[0]["is_redacted"]
+        or events[0]["tool_invocation_id"] is not None
+        or events[1]["sequence_no"] != 2
+        or events[1]["event_type"] != response_type
+        or events[1]["participant_id"] != response["participant_id"]
+        or events[1]["participant_config_id"] != response["participant_config_id"]
+        or events[1]["related_message_id"] != response["id"]
+        or events[1]["room_id"] != room_id
+        or events[1]["is_redacted"]
+        or events[1]["tool_invocation_id"] is not None
     ):
         raise ValueError("invalid native response")
-    return trigger
+    payload = json.loads(events[0]["payload_json"])
+    if provider_family == "openai":
+        validate_recorded_openai_shared_request_payload(payload)
+        expected_instructions = payload["request"]["instructions"]
+        if expected_instructions not in {
+            OPENAI_SYSTEM_INSTRUCTIONS_V1, OPENAI_SYSTEM_INSTRUCTIONS_V2
+        }:
+            raise ValueError("invalid native OpenAI instructions")
+    else:
+        validate_recorded_google_shared_request_payload(payload)
+        expected_instructions = payload["request"]["config"]["system_instruction"]
+        if expected_instructions not in {
+            GEMINI_SYSTEM_INSTRUCTIONS_V1, GEMINI_SYSTEM_INSTRUCTIONS_V2
+        }:
+            raise ValueError("invalid native Gemini instructions")
+    if response["system_instructions"] != expected_instructions:
+        raise ValueError("native response configuration changed")
+    local = payload["local_context"]
+    if "turn_routing_version" not in local:
+        if (
+            response["destination_kind"] != "participant"
+            or response["recipient_key"] != "peter"
+            or response["destination_alias_owner"] != trigger["participant_id"]
+        ):
+            raise ValueError("invalid legacy native response route")
+    else:
+        destination = validate_response_destination_evidence(
+            local["response_destination"]
+        )
+        if destination["kind"] == "room":
+            matches = (
+                response["destination_kind"] == "room"
+                and response["recipient_participant_id"] is None
+                and response["destination_owner_key"] == "room-system"
+                and response["destination_alias_key"] == "room"
+                and response["destination_display"] == "Room"
+            )
+        else:
+            matches = (
+                response["destination_kind"] == "participant"
+                and response["recipient_key"] == destination["participant_key"]
+                and response["destination_alias_owner"]
+                == response["recipient_participant_id"]
+                and response["destination_display"] == destination["display_name"]
+            )
+        if not matches:
+            raise ValueError("native response route disagrees with request evidence")
+    return trigger, payload
 
 
 def _external_content(row: sqlite3.Row, *, destination_kind: str) -> dict[str, Any]:
@@ -369,11 +485,9 @@ def _load_gemini_replay(
     connection: sqlite3.Connection,
     message: sqlite3.Row,
     room_id: int,
-    *,
-    expected_contents: list[dict[str, Any]],
 ) -> dict[str, Any]:
     try:
-        native_trigger = _validate_native_pair(
+        native_trigger, native_request_payload = _validate_native_pair(
             connection, message, room_id, "gemini", "google"
         )
     except (sqlite3.Error, TypeError, ValueError) as exception:
@@ -434,6 +548,8 @@ def _load_gemini_replay(
         ):
             raise ValueError("invalid request correlation")
         request_payload = json.loads(requests[0]["payload_json"])
+        if request_payload != native_request_payload:
+            raise ValueError("native request evidence changed")
         validate_recorded_google_shared_request_payload(request_payload)
         config_rows = connection.execute(
             """SELECT pc.id, pc.participant_id, pc.provider, pc.model,
@@ -449,14 +565,24 @@ def _load_gemini_replay(
         config = config_rows[0]
         requested_model = request_payload["request"]["model"]
         slug = re.sub(r"[^a-z0-9]+", "-", requested_model.lower()).strip("-") or "model"
-        prefix = f"seed-memory-google-{slug}-v"
+        routed = "turn_routing_version" in request_payload["local_context"]
+        prefix = (
+            f"direct-address-google-{slug}-v"
+            if routed
+            else f"seed-memory-google-{slug}-v"
+        )
         label = config["config_label"]
         if (
             config["participant_id"] != message["participant_id"]
             or config["participant_key"] != "gemini"
             or config["provider"] != "google"
             or config["model"] != requested_model
-            or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS
+            or config["system_instructions"]
+            != (
+                GEMINI_SYSTEM_INSTRUCTIONS_V2
+                if routed
+                else GEMINI_SYSTEM_INSTRUCTIONS_V1
+            )
             or json.loads(config["settings_json"]) != recorded_settings()
             or json.loads(config["tools_json"]) != []
             or not isinstance(label, str)
@@ -481,7 +607,7 @@ def _load_gemini_replay(
         from .trace_service import _validate_inherited_memory_payload
 
         try:
-            retrieval, _context = _validate_inherited_memory_payload(
+            retrieval, context = _validate_inherited_memory_payload(
                 request_payload["request"],
                 request_payload["local_context"],
                 message_evidence,
@@ -489,11 +615,38 @@ def _load_gemini_replay(
             )
         except Exception as exception:
             raise ValueError("invalid Gemini memory evidence") from exception
-        recorded_contents = request_payload["request"]["contents"]
-        comparable_contents = list(recorded_contents)
-        if retrieval["selected"]:
-            del comparable_contents[-2]
-        if comparable_contents != expected_contents:
+        projection_version = request_payload["local_context"]["history_visibility"][
+            "projection_version"
+        ]
+        expected_contents = load_provider_history(
+            connection,
+            room_id=room_id,
+            boundary=native_trigger["room_sequence_no"],
+            provider_participant_key="gemini",
+            projection_version=projection_version,
+        )
+        inherited_context = (
+            INHERITED_MEMORY_HEADER
+            + json.dumps(context, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if retrieval["selected"] and context is not None
+            else None
+        )
+        if routed:
+            expected_recorded_contents = build_gemini_provider_contents(
+                expected_contents,
+                inherited_memory_context=inherited_context,
+                response_destination=request_payload["local_context"][
+                    "response_destination"
+                ],
+            )
+        else:
+            expected_recorded_contents = list(expected_contents)
+            if inherited_context is not None:
+                expected_recorded_contents.insert(
+                    len(expected_recorded_contents) - 1,
+                    {"role": "user", "parts": [{"text": inherited_context}]},
+                )
+        if request_payload["request"]["contents"] != expected_recorded_contents:
             raise ValueError("recorded Gemini contents do not match canonical history")
         payload = json.loads(responses[0]["payload_json"])
         if not isinstance(payload, dict) or set(payload) != {"response"}:

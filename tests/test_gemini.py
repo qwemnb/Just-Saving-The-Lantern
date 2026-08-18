@@ -31,6 +31,7 @@ from app.database import (
 )
 from app.gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS,
+    GEMINI_SYSTEM_INSTRUCTIONS_V2,
     MAX_KEY_LENGTH,
     MAX_SAFE_INTEGER,
     MAX_STRING_LENGTH,
@@ -59,6 +60,7 @@ from app.identity_service import current_alias, post_room_message
 from app.main import app
 from app.provider_history import load_provider_history
 from app.room_service import TurnServiceError
+from app.room_service import run_helios_turn
 from app.seed_memory import import_seed_memories, load_seed_manifest, parse_seed_manifest
 from app.trace_service import TraceServiceError, load_trace, project_trace_json
 
@@ -323,7 +325,7 @@ class GeminiIntegrationTests(unittest.TestCase):
         self.assertTrue(client.aio.closed)
         call = client.aio.models.calls[0]
         self.assertEqual(call["model"], "gemini-test")
-        self.assertEqual(call["config"].system_instruction, GEMINI_SYSTEM_INSTRUCTIONS)
+        self.assertEqual(call["config"].system_instruction, GEMINI_SYSTEM_INSTRUCTIONS_V2)
         self.assertTrue(call["config"].automatic_function_calling.disable)
 
         with closing(connect_database(self.database_path)) as connection:
@@ -1121,42 +1123,36 @@ class GeminiIntegrationTests(unittest.TestCase):
                 (room_turn,),
             )
 
-            helios_turn = create_turn(connection, room_id, participants["peter"])
-            peter_to_helios = store_message(
-                connection,
-                room_id=room_id,
-                participant_id=participants["peter"],
-                message_text="private for Helios",
-                turn_id=helios_turn,
-                message_type="chat",
-                sender_alias_id=current_alias(connection, participants["peter"])["id"],
-                destination_kind="participant",
-                destination_alias_id=current_alias(connection, participants["helios"])["id"],
-                recipient_participant_id=participants["helios"],
-            )
-            store_message(
-                connection,
-                room_id=room_id,
-                participant_id=participants["helios"],
-                participant_config_id=connection.execute(
-                    "SELECT id FROM participant_configs WHERE participant_id=? ORDER BY id LIMIT 1",
-                    (participants["helios"],),
-                ).fetchone()[0],
-                message_text="private Helios reply",
-                turn_id=helios_turn,
-                reply_to_id=peter_to_helios,
-                message_type="chat",
-                sender_alias_id=current_alias(connection, participants["helios"])["id"],
-                destination_kind="participant",
-                destination_alias_id=current_alias(connection, participants["peter"])["id"],
-                recipient_participant_id=participants["peter"],
-            )
-            connection.execute(
-                "UPDATE turns SET status='completed',completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
-                (helios_turn,),
-            )
             connection.commit()
 
+        from tests.test_room_service import FakeClient as OpenAIFakeClient
+        from tests.test_room_service import FakeResponse as OpenAIFakeResponse
+        from tests.test_room_service import FakeResponses as OpenAIFakeResponses
+
+        openai_response = OpenAIFakeResponse(
+            status="completed",
+            output_text="private Helios reply",
+            raw={
+                "id": "history-openai", "object": "response", "status": "completed",
+                "model": "gpt-5.6-luna-resolved", "usage": {},
+                "output": [{
+                    "id": "history-message", "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "private Helios reply"}],
+                }],
+            },
+        )
+        openai_client = OpenAIFakeClient(OpenAIFakeResponses(openai_response))
+        with patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "synthetic-openai", "HELIOS_OPENAI_MODEL": "gpt-5.6-luna"},
+            clear=True,
+        ):
+            asyncio.run(run_helios_turn(
+                "private for Helios",
+                database_path=self.database_path,
+                client_factory=lambda _key: openai_client,
+                dotenv_path=self.dotenv_path,
+            ))
         self.run_turn(success_response("private Gemini reply"), "private for Gemini")
         with closing(connect_database(self.database_path)) as connection:
             boundary = connection.execute(
@@ -1864,14 +1860,14 @@ class GeminiIntegrationTests(unittest.TestCase):
             ]
             self.assertEqual(
                 labels,
-                ["seed-memory-google-model-alpha-v1", "seed-memory-google-model-beta-v1"],
+                ["direct-address-google-model-alpha-v1", "direct-address-google-model-beta-v1"],
             )
             connection.execute(
                 """INSERT INTO participant_configs
                    (participant_id,provider,model,config_label,system_instructions,settings_json,tools_json)
                    VALUES (?, 'google', 'Model / Alpha',
-                           'seed-memory-google-model-alpha-vbad', ?, '{}', '[]')""",
-                (gemini_id, GEMINI_SYSTEM_INSTRUCTIONS),
+                           'direct-address-google-model-alpha-vbad', ?, '{}', '[]')""",
+                (gemini_id, GEMINI_SYSTEM_INSTRUCTIONS_V2),
             )
             connection.commit()
             connection.execute("BEGIN IMMEDIATE")
@@ -1903,7 +1899,7 @@ class GeminiIntegrationTests(unittest.TestCase):
             label = connection.execute(
                 "SELECT config_label FROM participant_configs WHERE id=?", (created,)
             ).fetchone()[0]
-            self.assertEqual(label, "seed-memory-google-model-alpha-v2")
+            self.assertEqual(label, "direct-address-google-model-alpha-v1")
             connection.rollback()
 
     def test_installer_and_welcome_partial_conflict_and_ordering_matrix(self) -> None:

@@ -19,10 +19,10 @@ from app.database import connect_database, initialize_database
 from app.room_service import (
     RESPONSE_SETTINGS,
     RESPONSE_TOOLS,
-    SYSTEM_INSTRUCTIONS,
     TurnServiceError,
     run_helios_turn,
 )
+from app.request_validation import OPENAI_SYSTEM_INSTRUCTIONS_V1 as SYSTEM_INSTRUCTIONS
 from app.seed_memory import build_fts_query, tokenize_memory_query
 from app.trace_service import (
     TraceServiceError,

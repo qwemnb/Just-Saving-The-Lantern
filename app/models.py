@@ -37,4 +37,5 @@ class MessageRequest(BaseModel):
 
     message_text: str
     destination: MessageDestination
+    response_destination: MessageDestination | None = None
 

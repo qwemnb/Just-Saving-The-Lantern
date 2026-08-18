@@ -73,6 +73,18 @@ class MessageApiTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM api_events").fetchone()[0], 0)
 
+    def test_room_post_rejects_response_destination_before_any_write(self) -> None:
+        response = asyncio.run(main.post_message(main.MessageRequest(
+            message_text="invalid routed Room post",
+            destination={"kind": "room"},
+            response_destination={"kind": "participant", "participant_key": "peter"},
+        )))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(json.loads(response.body)["error"], "invalid_request")
+        with closing(connect_database(self.database_path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM turns").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
+
     def test_browser_sends_exact_text_without_authorship(self) -> None:
         javascript = (Path(__file__).parents[1] / "static" / "app.js").read_text(
             encoding="utf-8"

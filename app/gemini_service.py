@@ -8,7 +8,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .commands import classify_local_command, is_reserved_local_command
 from .database import (
@@ -20,7 +20,7 @@ from .database import (
     store_message,
 )
 from .gemini_client import (
-    GEMINI_SYSTEM_INSTRUCTIONS,
+    GEMINI_SYSTEM_INSTRUCTIONS_V2,
     GEMINI_TIMEOUT_SECONDS,
     GEMINI_TOTAL_ATTEMPTS,
     GeminiResponseSerializationError,
@@ -39,7 +39,7 @@ from .gemini_client import (
 from .identity_service import current_alias, resolve_room_post_context
 from .participant_registry import registration_for
 from .provider_history import ProviderHistoryError, load_provider_history
-from .request_validation import HISTORY_VISIBILITY
+from .request_validation import HISTORY_VISIBILITY_V3
 from .room_service import TurnServiceError, canonical_json, validate_phase_a_foundation
 from .schema_validation import validate_database_integrity, validate_v14_foundation
 from .seed_memory import (
@@ -47,6 +47,15 @@ from .seed_memory import (
     TEXT_BUDGET_CHARS as MEMORY_TEXT_BUDGET_CHARS,
     search_seeded_memories,
     serialize_inherited_memory_context,
+)
+from .turn_routing import (
+    BoundResponseDestination,
+    PROVIDER_HISTORY_V3,
+    ResponseDestinationUnavailable,
+    TURN_ROUTING_VERSION,
+    build_gemini_provider_contents,
+    resolve_response_destination,
+    validate_bound_response_destination,
 )
 from .maintenance_lock import MaintenanceLockError, ResetRecoveryRequiredError
 
@@ -66,6 +75,8 @@ class AcceptedGeminiTurn:
     peter_id: int
     gemini_id: int
     config_id: int
+    gemini_alias_id: int
+    response_destination: BoundResponseDestination
     model: str
     recorded_contents: list[dict[str, Any]]
     peter_message_text: str
@@ -85,6 +96,7 @@ async def run_gemini_turn(
     message_text: str,
     *,
     destination_participant_key: str = GEMINI_KEY,
+    response_destination: Mapping[str, Any] | None = None,
     database_path: Path | str = DEFAULT_DATABASE_PATH,
     client_factory: Callable[[str], Any] | None = None,
     dotenv_path: Path | str | None = None,
@@ -103,6 +115,7 @@ async def run_gemini_turn(
         database_path,
         message_text,
         destination_participant_key,
+        response_destination,
         dotenv_path,
     )
     factory = client_factory or create_gemini_client
@@ -166,6 +179,7 @@ def _accept_gemini_turn(
     database_path: Path | str,
     message_text: str,
     destination_participant_key: str,
+    response_destination: Mapping[str, Any] | None,
     dotenv_path: Path | str | None,
 ) -> AcceptedGeminiTurn:
     try:
@@ -226,6 +240,21 @@ def _accept_gemini_turn(
                 message="The selected participant destination is unavailable.",
             )
 
+        gemini_alias = current_alias(connection, destination["id"])
+        try:
+            response_route = resolve_response_destination(
+                connection,
+                room_id=context["room_id"],
+                responding_participant_id=destination["id"],
+                requested=response_destination,
+            )
+        except ResponseDestinationUnavailable:
+            raise TurnServiceError(
+                status_code=409,
+                code="response_destination_unavailable",
+                message="The selected response destination is unavailable.",
+            ) from None
+
         turn_id = create_turn(connection, context["room_id"], context["peter"]["id"])
         peter_message_id = store_message(
             connection,
@@ -236,7 +265,7 @@ def _accept_gemini_turn(
             message_type="chat",
             sender_alias_id=context["peter_alias"]["id"],
             destination_kind="participant",
-            destination_alias_id=current_alias(connection, destination["id"])["id"],
+            destination_alias_id=gemini_alias["id"],
             recipient_participant_id=destination["id"],
         )
         boundary = connection.execute(
@@ -248,6 +277,7 @@ def _accept_gemini_turn(
                 room_id=context["room_id"],
                 boundary=boundary,
                 provider_participant_key=GEMINI_KEY,
+                projection_version=PROVIDER_HISTORY_V3,
             )
         except ProviderHistoryError as error:
             raise TurnServiceError(
@@ -261,20 +291,16 @@ def _accept_gemini_turn(
                 result_limit=MEMORY_RESULT_LIMIT,
                 text_budget_chars=MEMORY_TEXT_BUDGET_CHARS,
             )
-            if memory_search.selected:
-                contents.insert(
-                    len(contents) - 1,
-                    {
-                        "role": "user",
-                        "parts": [
-                            {
-                                "text": serialize_inherited_memory_context(
-                                    memory_search.selected
-                                )
-                            }
-                        ],
-                    },
-                )
+            inherited_memory_context = (
+                serialize_inherited_memory_context(memory_search.selected)
+                if memory_search.selected
+                else None
+            )
+            contents = build_gemini_provider_contents(
+                contents,
+                inherited_memory_context=inherited_memory_context,
+                response_destination=response_route.evidence(),
+            )
             memory_retrieval = memory_search.audit_envelope(
                 owner_participant_id=destination["id"],
                 query_source_message_id=peter_message_id,
@@ -307,7 +333,7 @@ def _accept_gemini_turn(
         # Typed conversion is part of Phase A validation, before durable acceptance.
         contents_from_recorded(contents)
         request = {
-            "config": recorded_request_config(),
+            "config": recorded_request_config(GEMINI_SYSTEM_INSTRUCTIONS_V2),
             "contents": contents,
             "model": model,
         }
@@ -325,7 +351,9 @@ def _accept_gemini_turn(
                 "timeout_seconds": GEMINI_TIMEOUT_SECONDS,
                 "total_attempts": GEMINI_TOTAL_ATTEMPTS,
                 "trigger_message_id": peter_message_id,
-                "history_visibility": dict(HISTORY_VISIBILITY),
+                "history_visibility": dict(HISTORY_VISIBILITY_V3),
+                "turn_routing_version": TURN_ROUTING_VERSION,
+                "response_destination": response_route.evidence(),
             },
             "request": request,
         }
@@ -346,6 +374,8 @@ def _accept_gemini_turn(
             peter_id=context["peter"]["id"],
             gemini_id=destination["id"],
             config_id=config_id,
+            gemini_alias_id=gemini_alias["id"],
+            response_destination=response_route,
             model=model,
             recorded_contents=contents,
             peter_message_text=message_text,
@@ -377,7 +407,7 @@ def find_or_create_gemini_configuration(
     settings = canonical_json(recorded_settings())
     tools = canonical_json([])
     slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-") or "model"
-    prefix = f"seed-memory-google-{slug}-v"
+    prefix = f"direct-address-google-{slug}-v"
     rows = connection.execute(
         """SELECT id, provider, model, config_label, system_instructions,
                   settings_json, tools_json
@@ -400,7 +430,7 @@ def find_or_create_gemini_configuration(
             if (
                 row["provider"] == GOOGLE_PROVIDER
                 and row["model"] == model
-                and row["system_instructions"] == GEMINI_SYSTEM_INSTRUCTIONS
+                and row["system_instructions"] == GEMINI_SYSTEM_INSTRUCTIONS_V2
                 and row["settings_json"] == settings
                 and row["tools_json"] == tools
             ):
@@ -424,7 +454,7 @@ def find_or_create_gemini_configuration(
             GOOGLE_PROVIDER,
             model,
             label,
-            GEMINI_SYSTEM_INSTRUCTIONS,
+            GEMINI_SYSTEM_INSTRUCTIONS_V2,
             settings,
             tools,
         ),
@@ -507,10 +537,12 @@ def _finalize_phase_c(
                         turn_id=accepted.turn_id,
                         reply_to_id=accepted.peter_message_id,
                         message_type="chat",
-                        sender_alias_id=current_alias(connection, accepted.gemini_id)["id"],
-                        destination_kind="participant",
-                        destination_alias_id=current_alias(connection, accepted.peter_id)["id"],
-                        recipient_participant_id=accepted.peter_id,
+                        sender_alias_id=accepted.gemini_alias_id,
+                        destination_kind=accepted.response_destination.kind,
+                        destination_alias_id=accepted.response_destination.destination_alias_id,
+                        recipient_participant_id=(
+                            accepted.response_destination.recipient_participant_id
+                        ),
                     )
                     _insert_event(
                         connection,
@@ -571,6 +603,7 @@ def _insert_terminal_failure(
 def _assert_accepted_evidence(
     connection: sqlite3.Connection, accepted: AcceptedGeminiTurn
 ) -> None:
+    validate_bound_response_destination(connection, accepted.response_destination)
     row = connection.execute(
         "SELECT room_id, initiated_by_participant_id, status FROM turns WHERE id=?",
         (accepted.turn_id,),
@@ -639,6 +672,13 @@ def _assert_accepted_evidence(
     ):
         raise RuntimeError("Gemini request evidence changed")
     validate_recorded_google_shared_request_payload(json.loads(event["payload_json"]))
+    request_payload = json.loads(event["payload_json"])
+    if (
+        request_payload["local_context"]["response_destination"]
+        != accepted.response_destination.evidence()
+        or request_payload["request"]["contents"] != accepted.recorded_contents
+    ):
+        raise RuntimeError("Gemini routing evidence changed")
     config_rows = connection.execute(
         """SELECT participant_id, provider, model, config_label,
                   system_instructions, settings_json, tools_json
@@ -649,13 +689,13 @@ def _assert_accepted_evidence(
         raise RuntimeError("Gemini configuration evidence changed")
     config = config_rows[0]
     slug = re.sub(r"[^a-z0-9]+", "-", accepted.model.lower()).strip("-") or "model"
-    prefix = f"seed-memory-google-{slug}-v"
+    prefix = f"direct-address-google-{slug}-v"
     label = config["config_label"]
     if (
         config["participant_id"] != accepted.gemini_id
         or config["provider"] != GOOGLE_PROVIDER
         or config["model"] != accepted.model
-        or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS
+        or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS_V2
         or config["settings_json"] != canonical_json(recorded_settings())
         or config["tools_json"] != "[]"
         or not isinstance(label, str)

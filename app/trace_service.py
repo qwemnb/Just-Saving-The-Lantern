@@ -15,7 +15,8 @@ from typing import Any, Iterable
 from .identity_service import ParticipantNameError, validate_display_alias
 from .gemini_client import (
     FAILURE_KINDS as GEMINI_FAILURE_KINDS,
-    GEMINI_SYSTEM_INSTRUCTIONS,
+    GEMINI_SYSTEM_INSTRUCTIONS_V1,
+    GEMINI_SYSTEM_INSTRUCTIONS_V2,
     MAX_SAFE_INTEGER,
     TOKEN_COUNT_FIELDS as GEMINI_TOKEN_COUNT_FIELDS,
     content_from_recorded,
@@ -31,7 +32,8 @@ from .request_validation import validate_recorded_openai_shared_request_payload
 from .request_validation import (
     OPENAI_RESPONSE_SETTINGS,
     OPENAI_RESPONSE_TOOLS,
-    OPENAI_SYSTEM_INSTRUCTIONS,
+    OPENAI_SYSTEM_INSTRUCTIONS_V1,
+    OPENAI_SYSTEM_INSTRUCTIONS_V2,
 )
 from .schema_validation import SchemaValidationError, validate_v14_foundation
 from .seed_memory import (
@@ -42,6 +44,14 @@ from .seed_memory import (
     TEXT_BUDGET_CHARS,
     build_fts_query,
     tokenize_memory_query,
+)
+from .turn_routing import (
+    PROVIDER_HISTORY_V2,
+    PROVIDER_HISTORY_V3,
+    build_gemini_provider_contents,
+    build_openai_provider_input,
+    routing_context_text,
+    validate_response_destination_evidence,
 )
 
 
@@ -644,6 +654,26 @@ def _validate_configuration_references(
             raise _data_invalid()
 
 
+def _route_matches_response_destination(
+    route: Any, expected: Any
+) -> bool:
+    if not isinstance(route, dict) or not isinstance(expected, dict):
+        return False
+    if expected.get("kind") == "room":
+        return route == {"kind": "room", "display_name": "Room"}
+    if expected.get("kind") != "participant":
+        return False
+    if (
+        route.get("kind") != "participant"
+        or route.get("participant_key") != expected.get("participant_key")
+    ):
+        return False
+    return (
+        "display_name" not in expected
+        or route.get("display_name") == expected.get("display_name")
+    )
+
+
 def _validate_event_family(
     connection: sqlite3.Connection,
     turn: sqlite3.Row,
@@ -746,20 +776,51 @@ def _validate_event_family(
             validate_recorded_google_shared_request_payload(request_payload)
         else:
             validate_recorded_openai_shared_request_payload(request_payload)
-        boundary = request_payload["local_context"]["room_sequence_boundary"]
+        local_context = request_payload["local_context"]
+        projection_version = local_context["history_visibility"]["projection_version"]
+        boundary = local_context["room_sequence_boundary"]
         expected_history = load_provider_history(
             connection,
             room_id=turn["room_id"],
             boundary=boundary,
             provider_participant_key=expected_key,
+            projection_version=projection_version,
         )
-        actual_history = list(
-            request_payload["request"]["contents" if family == "google" else "input"]
+        retrieval, context = _validate_inherited_memory_payload(
+            request_payload["request"], local_context, messages, request[0]
         )
-        selected = request_payload["local_context"]["memory_retrieval"]["selected"]
-        if selected:
-            del actual_history[-2]
-        if actual_history != expected_history:
+        inherited_context = (
+            INHERITED_MEMORY_HEADER + _canonical_json(context)
+            if retrieval["selected"] and context is not None
+            else None
+        )
+        routed = "turn_routing_version" in local_context
+        if routed:
+            if family == "google":
+                expected_input = build_gemini_provider_contents(
+                    expected_history,
+                    inherited_memory_context=inherited_context,
+                    response_destination=local_context["response_destination"],
+                )
+            else:
+                expected_input = build_openai_provider_input(
+                    expected_history,
+                    inherited_memory_context=inherited_context,
+                    response_destination=local_context["response_destination"],
+                )
+        else:
+            expected_input = list(expected_history)
+            if inherited_context is not None:
+                memory_item = (
+                    {"role": "user", "parts": [{"text": inherited_context}]}
+                    if family == "google"
+                    else {"role": "user", "content": inherited_context}
+                )
+                expected_input.insert(len(expected_input) - 1, memory_item)
+        actual_input = request_payload["request"][
+            "contents" if family == "google" else "input"
+        ]
+        if actual_input != expected_input:
             raise ValueError("recorded provider history mismatch")
     except (ProviderHistoryError, TypeError, ValueError, IndexError) as exception:
         raise _data_invalid() from exception
@@ -771,10 +832,19 @@ def _validate_event_family(
             else ""
         ) or "model"
         label = config["config_label"]
-        prefix = f"seed-memory-google-{slug}-v"
+        prefix = (
+            f"direct-address-google-{slug}-v"
+            if routed
+            else f"seed-memory-google-{slug}-v"
+        )
         if (
             config["model"] != model
-            or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS
+            or config["system_instructions"]
+            != (
+                GEMINI_SYSTEM_INSTRUCTIONS_V2
+                if routed
+                else GEMINI_SYSTEM_INSTRUCTIONS_V1
+            )
             or config["settings"] != gemini_recorded_settings()
             or config["tools"] != []
             or not isinstance(label, str)
@@ -788,10 +858,19 @@ def _validate_event_family(
         label = config["config_label"]
         role = model.removeprefix("gpt-5.6-") if isinstance(model, str) else ""
         role = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "model"
-        prefix = f"seed-memory-openai-{role}-v"
+        prefix = (
+            f"direct-address-openai-{role}-v"
+            if routed
+            else f"seed-memory-openai-{role}-v"
+        )
         if (
             config["model"] != model
-            or config["system_instructions"] != OPENAI_SYSTEM_INSTRUCTIONS
+            or config["system_instructions"]
+            != (
+                OPENAI_SYSTEM_INSTRUCTIONS_V2
+                if routed
+                else OPENAI_SYSTEM_INSTRUCTIONS_V1
+            )
             or config["settings"] != OPENAI_RESPONSE_SETTINGS
             or config["tools"] != OPENAI_RESPONSE_TOOLS
             or not isinstance(label, str)
@@ -820,12 +899,18 @@ def _validate_event_family(
             raise _data_invalid()
         response = ai_messages[0]
         destination = response["routing"]["destination"]
+        expected_destination = (
+            request_payload["local_context"]["response_destination"]
+            if routed
+            else {"kind": "participant", "participant_key": "peter"}
+        )
         if (
             response["turn_sequence_no"] != 2
             or response["reply_to_id"] != peter_messages[0]["id"]
             or response["routing"]["routing_mode"] != "explicit"
-            or destination.get("kind") != "participant"
-            or destination.get("participant_key") != "peter"
+            or not _route_matches_response_destination(
+                destination, expected_destination
+            )
             or response["participant_config_id"] != request[0]["participant_config_id"]
         ):
             raise _data_invalid()
@@ -1419,6 +1504,25 @@ def _validate_inherited_memory_payload(
     if provider_input[-1] != expected_trigger:
         raise _data_invalid()
 
+    routed = "turn_routing_version" in local_context
+    if routed:
+        try:
+            destination = validate_response_destination_evidence(
+                local_context["response_destination"]
+            )
+        except (KeyError, TypeError, ValueError) as exception:
+            raise _data_invalid() from exception
+        expected_routing = (
+            {
+                "role": "user",
+                "parts": [{"text": routing_context_text(destination)}],
+            }
+            if is_gemini
+            else {"role": "user", "content": routing_context_text(destination)}
+        )
+        if len(provider_input) < 2 or provider_input[-2] != expected_routing:
+            raise _data_invalid()
+
     candidates = [
         (index, item)
         for index, item in enumerate(provider_input)
@@ -1442,7 +1546,7 @@ def _validate_inherited_memory_payload(
     ]
     context: dict[str, Any] | None = None
     if selected:
-        expected_position = len(provider_input) - 2
+        expected_position = len(provider_input) - (3 if routed else 2)
         if (
             len(candidates) != 1
             or candidates[0][0] != expected_position

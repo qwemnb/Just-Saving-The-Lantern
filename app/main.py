@@ -125,6 +125,12 @@ async def post_message(request: MessageRequest):
     """Store one explicit Room post or run one explicit Peter/Helios turn."""
     try:
         if request.destination.kind == "room":
+            if request.response_destination is not None:
+                raise TurnServiceError(
+                    status_code=400,
+                    code="invalid_request",
+                    message="Room posts cannot specify a response destination.",
+                )
             result = await asyncio.to_thread(
                 post_room_message, request.message_text, app.state.database_path
             )
@@ -141,6 +147,11 @@ async def post_message(request: MessageRequest):
                 result = await run_helios_turn(
                     request.message_text,
                     destination_participant_key=participant_key,
+                    response_destination=(
+                        None
+                        if request.response_destination is None
+                        else request.response_destination.model_dump()
+                    ),
                     database_path=app.state.database_path,
                     client_factory=app.state.openai_client_factory,
                     dotenv_path=app.state.dotenv_path,
@@ -149,6 +160,11 @@ async def post_message(request: MessageRequest):
                 result = await run_gemini_turn(
                     request.message_text,
                     destination_participant_key=participant_key,
+                    response_destination=(
+                        None
+                        if request.response_destination is None
+                        else request.response_destination.model_dump()
+                    ),
                     database_path=app.state.database_path,
                     client_factory=app.state.gemini_client_factory,
                     dotenv_path=app.state.dotenv_path,
