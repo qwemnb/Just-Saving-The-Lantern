@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from . import windows_native
 from .database import DEFAULT_SCHEMA_PATH, _seed_initial_room
 from .maintenance_lock import (
     MaintenanceLockError,
@@ -166,22 +167,23 @@ def _windows_typed_handle(handle: Any):
     return wintypes.HANDLE(handle)
 
 
+def _windows_binding(getter: Callable[[], Any], error_code: str) -> Any:
+    """Resolve one immutable native binding through an existing safe error."""
+
+    try:
+        return getter()
+    except windows_native.WindowsNativeBindingError as error:
+        raise _error(error_code) from error
+
+
 def _windows_handle_identity(handle: Any) -> str:
     import ctypes
-    from ctypes import wintypes
 
-    class FILE_ID_INFO(ctypes.Structure):
-        _fields_ = [
-            ("VolumeSerialNumber", ctypes.c_ulonglong),
-            ("FileId", ctypes.c_ubyte * 16),
-        ]
-
-    info = FILE_ID_INFO()
-    function = ctypes.windll.kernel32.GetFileInformationByHandleEx
-    function.argtypes = [
-        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-    ]
-    function.restype = wintypes.BOOL
+    info = windows_native.FILE_ID_INFO()
+    function = _windows_binding(
+        windows_native.get_file_information_by_handle_ex,
+        "reset_path_unsafe",
+    )
     if not function(
         _windows_typed_handle(handle), 18,
         ctypes.byref(info), ctypes.sizeof(info),
@@ -777,14 +779,10 @@ def _windows_open_handle(
     path: Path, access: int, flags: int, *, share_access: int = 0x1 | 0x2 | 0x4
 ) -> int:
     import ctypes
-    from ctypes import wintypes
 
-    create_file = ctypes.windll.kernel32.CreateFileW
-    create_file.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    create_file.restype = wintypes.HANDLE
+    create_file = _windows_binding(
+        windows_native.create_file, "reset_path_unsafe"
+    )
     handle = create_file(str(path), access, share_access, None, 3, flags, None)
     invalid = ctypes.c_void_p(-1).value
     if handle in (None, invalid):
@@ -793,16 +791,13 @@ def _windows_open_handle(
 
 
 def _windows_close_handle(handle: Any) -> None:
-    import ctypes
-    from ctypes import wintypes
-
-    close_handle = ctypes.windll.kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
+    close_handle = _windows_binding(
+        windows_native.close_handle, "reset_path_unsafe"
+    )
     if not close_handle(_windows_typed_handle(handle)):
-        get_last_error = ctypes.windll.kernel32.GetLastError
-        get_last_error.argtypes = []
-        get_last_error.restype = wintypes.DWORD
+        get_last_error = _windows_binding(
+            windows_native.get_last_error, "reset_path_unsafe"
+        )
         error_code = int(get_last_error())
         raise _error("reset_path_unsafe") from OSError(
             error_code, "CloseHandle"
@@ -810,12 +805,9 @@ def _windows_close_handle(handle: Any) -> None:
 
 
 def _windows_flush_file_handle(handle: Any) -> None:
-    import ctypes
-    from ctypes import wintypes
-
-    flush = ctypes.windll.kernel32.FlushFileBuffers
-    flush.argtypes = [wintypes.HANDLE]
-    flush.restype = wintypes.BOOL
+    flush = _windows_binding(
+        windows_native.flush_file_buffers, "reset_failed"
+    )
     if not flush(_windows_typed_handle(handle)):
         raise _error("reset_failed")
 
@@ -831,38 +823,13 @@ def _windows_handle_snapshot(handle: int) -> dict[str, Any]:
     import ctypes
     from ctypes import wintypes
 
-    class FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
-        _fields_ = [
-            ("FileAttributes", wintypes.DWORD),
-            ("ReparseTag", wintypes.DWORD),
-        ]
-
-    class FILE_STANDARD_INFO(ctypes.Structure):
-        _fields_ = [
-            ("AllocationSize", ctypes.c_longlong),
-            ("EndOfFile", ctypes.c_longlong),
-            ("NumberOfLinks", wintypes.DWORD),
-            ("DeletePending", wintypes.BOOLEAN),
-            ("Directory", wintypes.BOOLEAN),
-        ]
-
-    class FILE_BASIC_INFO(ctypes.Structure):
-        _fields_ = [
-            ("CreationTime", ctypes.c_longlong),
-            ("LastAccessTime", ctypes.c_longlong),
-            ("LastWriteTime", ctypes.c_longlong),
-            ("ChangeTime", ctypes.c_longlong),
-            ("FileAttributes", wintypes.DWORD),
-        ]
-
-    query = ctypes.windll.kernel32.GetFileInformationByHandleEx
-    query.argtypes = [
-        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-    ]
-    query.restype = wintypes.BOOL
-    attributes = FILE_ATTRIBUTE_TAG_INFO()
-    standard = FILE_STANDARD_INFO()
-    basic = FILE_BASIC_INFO()
+    query = _windows_binding(
+        windows_native.get_file_information_by_handle_ex,
+        "reset_path_unsafe",
+    )
+    attributes = windows_native.FILE_ATTRIBUTE_TAG_INFO()
+    standard = windows_native.FILE_STANDARD_INFO()
+    basic = windows_native.FILE_BASIC_INFO()
     if not query(
         wintypes.HANDLE(handle), 9, ctypes.byref(attributes),
         ctypes.sizeof(attributes),
@@ -893,28 +860,12 @@ def _windows_handle_mode(handle: int) -> int:
     """Return FileModeInformation for diagnostics, never deletion authority."""
 
     import ctypes
-    from ctypes import wintypes
 
-    class IO_STATUS_BLOCK(ctypes.Structure):
-        _fields_ = [
-            ("Status", ctypes.c_void_p),
-            ("Information", ctypes.c_size_t),
-        ]
-
-    class FILE_MODE_INFORMATION(ctypes.Structure):
-        _fields_ = [("Mode", wintypes.ULONG)]
-
-    status_block = IO_STATUS_BLOCK()
-    information = FILE_MODE_INFORMATION()
-    query = ctypes.windll.ntdll.NtQueryInformationFile
-    query.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(IO_STATUS_BLOCK),
-        ctypes.c_void_p,
-        wintypes.ULONG,
-        wintypes.ULONG,
-    ]
-    query.restype = ctypes.c_long
+    status_block = windows_native.IO_STATUS_BLOCK()
+    information = windows_native.FILE_MODE_INFORMATION()
+    query = _windows_binding(
+        windows_native.nt_query_information_file, "reset_failed"
+    )
     status = query(
         _windows_typed_handle(handle),
         ctypes.byref(status_block),
@@ -1089,46 +1040,22 @@ def _windows_create_relative(
     import ctypes
     from ctypes import wintypes
 
-    class UNICODE_STRING(ctypes.Structure):
-        _fields_ = [
-            ("Length", wintypes.USHORT),
-            ("MaximumLength", wintypes.USHORT),
-            ("Buffer", wintypes.LPWSTR),
-        ]
-
-    class OBJECT_ATTRIBUTES(ctypes.Structure):
-        _fields_ = [
-            ("Length", wintypes.ULONG),
-            ("RootDirectory", wintypes.HANDLE),
-            ("ObjectName", ctypes.POINTER(UNICODE_STRING)),
-            ("Attributes", wintypes.ULONG),
-            ("SecurityDescriptor", ctypes.c_void_p),
-            ("SecurityQualityOfService", ctypes.c_void_p),
-        ]
-
-    class IO_STATUS_BLOCK(ctypes.Structure):
-        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
-
     name_buffer = ctypes.create_unicode_buffer(name)
-    name_value = UNICODE_STRING(
+    name_value = windows_native.UNICODE_STRING(
         len(name.encode("utf-16-le")),
         len(name.encode("utf-16-le")) + 2,
         ctypes.cast(name_buffer, wintypes.LPWSTR),
     )
-    attributes = OBJECT_ATTRIBUTES(
-        ctypes.sizeof(OBJECT_ATTRIBUTES), wintypes.HANDLE(parent_handle),
+    attributes = windows_native.OBJECT_ATTRIBUTES(
+        ctypes.sizeof(windows_native.OBJECT_ATTRIBUTES),
+        wintypes.HANDLE(parent_handle),
         ctypes.pointer(name_value), 0x40, None, None,
     )
-    status_block = IO_STATUS_BLOCK()
+    status_block = windows_native.IO_STATUS_BLOCK()
     handle = wintypes.HANDLE()
-    create = ctypes.windll.ntdll.NtCreateFile
-    create.argtypes = [
-        ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD,
-        ctypes.POINTER(OBJECT_ATTRIBUTES), ctypes.POINTER(IO_STATUS_BLOCK),
-        ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG, wintypes.ULONG,
-        wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
-    ]
-    create.restype = ctypes.c_long
+    create = _windows_binding(
+        windows_native.nt_create_file, "reset_failed"
+    )
     if desired_access is None:
         desired_access = (
             0x00100000 | 0x00000080 | 0x00000008
@@ -1202,22 +1129,15 @@ def _windows_enumerate_directory_handle(handle: int) -> list[str]:
     import struct
     from ctypes import wintypes
 
-    class IO_STATUS_BLOCK(ctypes.Structure):
-        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
-
     before = _windows_handle_snapshot(handle)
     names: list[str] = []
-    query = ctypes.windll.ntdll.NtQueryDirectoryFile
-    query.argtypes = [
-        wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.POINTER(IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG,
-        wintypes.ULONG, wintypes.BOOLEAN, ctypes.c_void_p, wintypes.BOOLEAN,
-    ]
-    query.restype = ctypes.c_long
+    query = _windows_binding(
+        windows_native.nt_query_directory_file, "reset_path_unsafe"
+    )
     restart = True
     while True:
         buffer = ctypes.create_string_buffer(65_536)
-        status_block = IO_STATUS_BLOCK()
+        status_block = windows_native.IO_STATUS_BLOCK()
         status = int(query(
             wintypes.HANDLE(handle), None, None, None,
             ctypes.byref(status_block), buffer, len(buffer), 12,
@@ -1287,59 +1207,24 @@ def _windows_relative_entry_identity(
     ):
         raise _error("reset_path_unsafe")
 
-    class FILE_ID_EXTD_DIR_INFO(ctypes.Structure):
-        _fields_ = [
-            ("NextEntryOffset", wintypes.DWORD),
-            ("FileIndex", wintypes.DWORD),
-            ("CreationTime", ctypes.c_longlong),
-            ("LastAccessTime", ctypes.c_longlong),
-            ("LastWriteTime", ctypes.c_longlong),
-            ("ChangeTime", ctypes.c_longlong),
-            ("EndOfFile", ctypes.c_longlong),
-            ("AllocationSize", ctypes.c_longlong),
-            ("FileAttributes", wintypes.DWORD),
-            ("FileNameLength", wintypes.DWORD),
-            ("EaSize", wintypes.DWORD),
-            ("ReparsePointTag", wintypes.DWORD),
-            ("FileId", ctypes.c_ubyte * 16),
-        ]
-
-    class IO_STATUS_BLOCK(ctypes.Structure):
-        _fields_ = [
-            ("Status", ctypes.c_void_p),
-            ("Information", ctypes.c_size_t),
-        ]
-
-    class UNICODE_STRING(ctypes.Structure):
-        _fields_ = [
-            ("Length", wintypes.USHORT),
-            ("MaximumLength", wintypes.USHORT),
-            ("Buffer", wintypes.LPWSTR),
-        ]
-
     name_buffer = ctypes.create_unicode_buffer(entry_name)
     encoded_length = len(entry_name.encode("utf-16-le"))
-    name = UNICODE_STRING(
+    name = windows_native.UNICODE_STRING(
         encoded_length,
         encoded_length,
         ctypes.cast(name_buffer, wintypes.LPWSTR),
     )
-    query = ctypes.windll.ntdll.NtQueryDirectoryFile
-    query.argtypes = [
-        wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.POINTER(IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG,
-        wintypes.ULONG, wintypes.BOOLEAN, ctypes.POINTER(UNICODE_STRING),
-        wintypes.BOOLEAN,
-    ]
-    query.restype = ctypes.c_long
+    query = _windows_binding(
+        windows_native.nt_query_directory_file, "reset_path_unsafe"
+    )
     parent_before = _windows_handle_snapshot(parent_handle)
     volume_serial = parent_before["file_id"].split(":")[1]
     buffer = ctypes.create_string_buffer(65_536)
-    status_block = IO_STATUS_BLOCK()
+    status_block = windows_native.IO_STATUS_BLOCK()
     status = int(query(
         wintypes.HANDLE(parent_handle), None, None, None,
         ctypes.byref(status_block), buffer, len(buffer),
-        60, True, ctypes.byref(name), True,
+        60, True, ctypes.cast(ctypes.byref(name), ctypes.c_void_p), True,
     ))
     unsigned_status = status & 0xFFFFFFFF
     if unsigned_status in {0x80000006, 0xC000000F}:
@@ -1348,10 +1233,13 @@ def _windows_relative_entry_identity(
         raise _error("reset_path_unsafe")
     else:
         length = int(status_block.Information)
-        if length < ctypes.sizeof(FILE_ID_EXTD_DIR_INFO) or length > len(buffer):
+        if (
+            length < ctypes.sizeof(windows_native.FILE_ID_EXTD_DIR_INFO)
+            or length > len(buffer)
+        ):
             raise _error("reset_path_unsafe")
-        item = FILE_ID_EXTD_DIR_INFO.from_buffer(buffer)
-        name_offset = ctypes.sizeof(FILE_ID_EXTD_DIR_INFO)
+        item = windows_native.FILE_ID_EXTD_DIR_INFO.from_buffer(buffer)
+        name_offset = ctypes.sizeof(windows_native.FILE_ID_EXTD_DIR_INFO)
         name_length = int(item.FileNameLength)
         if (
             int(item.NextEntryOffset) != 0
@@ -1525,36 +1413,19 @@ def _windows_rename(
     import ctypes
     from ctypes import wintypes
 
-    class FILE_RENAME_INFO(ctypes.Structure):
-            _fields_ = [
-                ("ReplaceIfExists", wintypes.DWORD),
-                ("RootDirectory", wintypes.HANDLE),
-                ("FileNameLength", wintypes.DWORD),
-                ("FileName", wintypes.WCHAR * 1),
-            ]
-
     encoded = target.name.encode("utf-16-le")
-    offset = FILE_RENAME_INFO.FileName.offset
+    offset = windows_native.FILE_RENAME_INFO.FileName.offset
     buffer = ctypes.create_string_buffer(offset + len(encoded) + 2)
-    header = FILE_RENAME_INFO.from_buffer(buffer)
+    header = windows_native.FILE_RENAME_INFO.from_buffer(buffer)
     header.ReplaceIfExists = 1 if replace else 0
     header.RootDirectory = wintypes.HANDLE(parent_handle)
     header.FileNameLength = len(encoded)
     ctypes.memmove(ctypes.addressof(buffer) + offset, encoded, len(encoded))
 
-    class IO_STATUS_BLOCK(ctypes.Structure):
-        _fields_ = [
-            ("Status", ctypes.c_void_p),
-            ("Information", ctypes.c_size_t),
-        ]
-
-    status_block = IO_STATUS_BLOCK()
-    setter = ctypes.windll.ntdll.NtSetInformationFile
-    setter.argtypes = [
-        wintypes.HANDLE, ctypes.POINTER(IO_STATUS_BLOCK), ctypes.c_void_p,
-        wintypes.ULONG, wintypes.ULONG,
-    ]
-    setter.restype = ctypes.c_long
+    status_block = windows_native.IO_STATUS_BLOCK()
+    setter = _windows_binding(
+        windows_native.nt_set_information_file, "reset_failed"
+    )
     status = setter(
         wintypes.HANDLE(source_handle), ctypes.byref(status_block),
         buffer, len(buffer), 10,
@@ -1567,15 +1438,10 @@ def _windows_unlink_handle(handle: int) -> None:
     import ctypes
     from ctypes import wintypes
 
-    class FILE_DISPOSITION_INFO(ctypes.Structure):
-        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
-
-    disposition = FILE_DISPOSITION_INFO(1)
-    setter = ctypes.windll.kernel32.SetFileInformationByHandle
-    setter.argtypes = [
-        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-    ]
-    setter.restype = wintypes.BOOL
+    disposition = windows_native.FILE_DISPOSITION_INFO(1)
+    setter = _windows_binding(
+        windows_native.set_file_information_by_handle, "reset_failed"
+    )
     if not setter(
         wintypes.HANDLE(handle), 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
     ):
@@ -1616,7 +1482,6 @@ def _posix_rename_no_replace(
 
 def _flush_directory(path: Path) -> None:
     if os.name == "nt":
-        import ctypes
         from ctypes import wintypes
 
         identity = _path_identity(path)
@@ -1628,11 +1493,14 @@ def _flush_directory(path: Path) -> None:
         try:
             if _windows_handle_identity(handle) != identity:
                 raise _error("reset_path_unsafe")
-            flush = ctypes.windll.kernel32.FlushFileBuffers
-            flush.argtypes = [wintypes.HANDLE]
-            flush.restype = wintypes.BOOL
+            flush = _windows_binding(
+                windows_native.flush_file_buffers, "reset_failed"
+            )
             if not flush(wintypes.HANDLE(handle)):
-                error_code = ctypes.windll.kernel32.GetLastError()
+                get_last_error = _windows_binding(
+                    windows_native.get_last_error, "reset_failed"
+                )
+                error_code = get_last_error()
                 raise _error("reset_failed") from OSError(error_code, "FlushFileBuffers")
             if _path_identity(path) != identity:
                 raise _error("reset_path_unsafe")

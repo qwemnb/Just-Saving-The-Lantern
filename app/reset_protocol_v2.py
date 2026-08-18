@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import windows_native
 from .maintenance_lock import (
     MaintenanceLockError,
     ResetRecoveryRequiredError,
@@ -110,6 +111,13 @@ def _error(code: str) -> legacy.DatabaseResetError:
 def _require_windows() -> None:
     if os.name != "nt":
         raise _error("reset_platform_unsupported")
+
+
+def _windows_durability_binding(getter: Callable[[], Any]) -> Any:
+    try:
+        return getter()
+    except windows_native.WindowsNativeBindingError as error:
+        raise _error("reset_durability_unsupported") from error
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -479,14 +487,17 @@ def _directory_probe(
         identity = legacy._windows_handle_identity(handle)
         if expected_identity is None or identity != expected_identity:
             raise _error("reset_durability_unsupported")
-        flush = ctypes.windll.kernel32.FlushFileBuffers
-        flush.argtypes = [wintypes.HANDLE]
-        flush.restype = wintypes.BOOL
+        flush = _windows_durability_binding(
+            windows_native.flush_file_buffers
+        )
         if flush(wintypes.HANDLE(handle)):
             succeeded, error_code = True, None
         else:
             succeeded = False
-            error_code = int(ctypes.windll.kernel32.GetLastError())
+            get_last_error = _windows_durability_binding(
+                windows_native.get_last_error
+            )
+            error_code = int(get_last_error())
             if error_code not in {5, 6}:
                 raise _error("reset_durability_unsupported")
         return {
@@ -504,20 +515,10 @@ def _open_and_flush_volume(guid: str, expected_serial: str) -> None:
     from ctypes import wintypes
 
     path = guid[:-1]
-    get_last_error = ctypes.windll.kernel32.GetLastError
-    get_last_error.argtypes = []
-    get_last_error.restype = wintypes.DWORD
-    create = ctypes.windll.kernel32.CreateFileW
-    create.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    create.restype = wintypes.HANDLE
+    get_last_error = _windows_durability_binding(
+        windows_native.get_last_error
+    )
+    create = _windows_durability_binding(windows_native.create_file)
     raw_handle = create(
         path,
         0x80000000 | 0x40000000,
@@ -539,9 +540,9 @@ def _open_and_flush_volume(guid: str, expected_serial: str) -> None:
             error_code, "CreateFileW"
         )
     handle = wintypes.HANDLE(handle_value)
-    flush = ctypes.windll.kernel32.FlushFileBuffers
-    flush.argtypes = [wintypes.HANDLE]
-    flush.restype = wintypes.BOOL
+    flush = _windows_durability_binding(
+        windows_native.flush_file_buffers
+    )
     try:
         identity = legacy._windows_handle_identity(handle)
         if identity.split(":")[1] != expected_serial:

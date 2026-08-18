@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from . import windows_native
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ACTIVE_DATABASE_PATH = Path(os.path.abspath(PROJECT_ROOT / "data" / "helios.db"))
@@ -174,28 +176,15 @@ def _lock(lease: MaintenanceLease) -> None:
     from ctypes import wintypes
     import msvcrt
 
-    class OVERLAPPED(ctypes.Structure):
-        _fields_ = [
-            ("Internal", ctypes.c_void_p),
-            ("InternalHigh", ctypes.c_void_p),
-            ("Offset", wintypes.DWORD),
-            ("OffsetHigh", wintypes.DWORD),
-            ("hEvent", wintypes.HANDLE),
-        ]
-
-    lock_file_ex = ctypes.windll.kernel32.LockFileEx
-    lock_file_ex.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(OVERLAPPED),
-    ]
-    lock_file_ex.restype = wintypes.BOOL
+    try:
+        lock_file_ex = windows_native.lock_file_ex()
+    except windows_native.WindowsNativeBindingError as error:
+        raise MaintenanceLockError(
+            "database maintenance lock unavailable"
+        ) from error
     handle = wintypes.HANDLE(msvcrt.get_osfhandle(lease.file.fileno()))  # type: ignore[union-attr]
     flags = 0x00000001 | (0 if lease.shared else 0x00000002)
-    overlapped = OVERLAPPED()
+    overlapped = windows_native.OVERLAPPED()
     if not lock_file_ex(handle, flags, 0, 1, 0, ctypes.byref(overlapped)):
         raise MaintenanceLockError("database maintenance lock unavailable")
     lease._overlapped = overlapped
@@ -210,14 +199,11 @@ def _unlock(lease: MaintenanceLease) -> None:
     from ctypes import wintypes
     import msvcrt
 
-    unlock_file_ex = ctypes.windll.kernel32.UnlockFileEx
-    unlock_file_ex.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-    ]
-    unlock_file_ex.restype = wintypes.BOOL
+    try:
+        unlock_file_ex = windows_native.unlock_file_ex()
+    except windows_native.WindowsNativeBindingError as error:
+        raise MaintenanceLockError(
+            "database maintenance lock unavailable"
+        ) from error
     handle = wintypes.HANDLE(msvcrt.get_osfhandle(lease.file.fileno()))  # type: ignore[union-attr]
     unlock_file_ex(handle, 0, 1, 0, ctypes.byref(lease._overlapped))
