@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass, field
 import json
 import re
 import sqlite3
@@ -42,6 +44,19 @@ class ProviderHistoryError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+_NativeReplayKey = tuple[int, int, int, str, str, str]
+
+
+@dataclass
+class _HistoryValidationContext:
+    """Validation results scoped to one canonical-history reconstruction."""
+
+    native_replays: dict[_NativeReplayKey, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    native_replays_in_progress: set[_NativeReplayKey] = field(default_factory=set)
 
 
 def _route_error() -> ProviderHistoryError:
@@ -94,6 +109,27 @@ def load_provider_history(
     projection_version: str = PROVIDER_HISTORY_V2,
 ) -> list[dict[str, Any]]:
     """Project one validated canonical prefix for Helios or Gemini."""
+
+    return _load_provider_history(
+        connection,
+        room_id=room_id,
+        boundary=boundary,
+        provider_participant_key=provider_participant_key,
+        projection_version=projection_version,
+        validation_context=_HistoryValidationContext(),
+    )
+
+
+def _load_provider_history(
+    connection: sqlite3.Connection,
+    *,
+    room_id: int,
+    boundary: int,
+    provider_participant_key: str,
+    projection_version: str,
+    validation_context: _HistoryValidationContext,
+) -> list[dict[str, Any]]:
+    """Project a canonical prefix within one operation-local validation context."""
 
     if provider_participant_key not in {"helios", "gemini"}:
         raise _participant_error()
@@ -180,7 +216,13 @@ def load_provider_history(
             elif sender_key == "helios" and _is_native_candidate(
                 connection, row, projection_version, "openai"
             ):
-                result.append(_load_helios_native(connection, row, room_id))
+                result.append(_load_helios_native(
+                    connection,
+                    row,
+                    room_id,
+                    projection_version,
+                    validation_context,
+                ))
             else:
                 result.append(_openai_external_item(row, destination))
             continue
@@ -194,7 +236,13 @@ def load_provider_history(
             connection, row, projection_version, "google"
         ):
             result.append(
-                _load_gemini_replay(connection, row, room_id)
+                _load_gemini_replay(
+                    connection,
+                    row,
+                    room_id,
+                    projection_version,
+                    validation_context,
+                )
             )
         else:
             result.append(_external_content(row, destination_kind=destination))
@@ -294,13 +342,59 @@ def _openai_external_item(row: sqlite3.Row, destination_kind: str) -> dict[str, 
 
 
 def _load_helios_native(
-    connection: sqlite3.Connection, message: sqlite3.Row, room_id: int
+    connection: sqlite3.Connection,
+    message: sqlite3.Row,
+    room_id: int,
+    projection_version: str,
+    validation_context: _HistoryValidationContext,
 ) -> dict[str, str]:
+    key = _native_replay_key(
+        message,
+        room_id=room_id,
+        provider_key="helios",
+        provider_family="openai",
+        projection_version=projection_version,
+    )
+    if key in validation_context.native_replays:
+        return deepcopy(validation_context.native_replays[key])
+    if key in validation_context.native_replays_in_progress:
+        raise _helios_history_error()
+    validation_context.native_replays_in_progress.add(key)
     try:
-        _validate_native_pair(connection, message, room_id, "helios", "openai")
-        return {"role": "assistant", "content": message["message_text"]}
+        _validate_native_pair(
+            connection,
+            message,
+            room_id,
+            "helios",
+            "openai",
+            projection_version,
+            validation_context,
+        )
+        replay = {"role": "assistant", "content": message["message_text"]}
+        validation_context.native_replays[key] = deepcopy(replay)
+        return replay
     except (sqlite3.Error, TypeError, ValueError) as exception:
         raise _helios_history_error() from exception
+    finally:
+        validation_context.native_replays_in_progress.discard(key)
+
+
+def _native_replay_key(
+    message: sqlite3.Row,
+    *,
+    room_id: int,
+    provider_key: str,
+    provider_family: str,
+    projection_version: str,
+) -> _NativeReplayKey:
+    return (
+        room_id,
+        message["turn_id"],
+        message["id"],
+        provider_key,
+        provider_family,
+        projection_version,
+    )
 
 
 def _validate_native_pair(
@@ -309,6 +403,8 @@ def _validate_native_pair(
     room_id: int,
     provider_key: str,
     provider_family: str,
+    projection_version: str,
+    validation_context: _HistoryValidationContext,
 ) -> tuple[sqlite3.Row, dict[str, Any]]:
     if message["turn_id"] is None:
         raise ValueError("native response has no turn")
@@ -353,6 +449,7 @@ def _validate_native_pair(
             provider_family,
             turns[0],
             rows[0],
+            validation_context,
         )
     if len(turns) != 1 or len(rows) != 2:
         raise ValueError("invalid native turn cardinality")
@@ -488,6 +585,7 @@ def _validate_native_handoff(
     provider_family: str,
     turn: sqlite3.Row,
     response: sqlite3.Row,
+    validation_context: _HistoryValidationContext,
 ) -> tuple[sqlite3.Row, dict[str, Any]]:
     """Validate one-message native history produced by a manual handoff."""
 
@@ -647,12 +745,13 @@ def _validate_native_handoff(
         )
     except Exception as exception:
         raise ValueError("invalid handoff memory evidence") from exception
-    expected_history = load_provider_history(
+    expected_history = _load_provider_history(
         connection,
         room_id=room_id,
         boundary=source["room_sequence_no"],
         provider_participant_key=provider_key,
         projection_version=PROVIDER_HISTORY_V4,
+        validation_context=validation_context,
     )
     inherited = (
         INHERITED_MEMORY_HEADER
@@ -710,10 +809,51 @@ def _load_gemini_replay(
     connection: sqlite3.Connection,
     message: sqlite3.Row,
     room_id: int,
+    projection_version: str,
+    validation_context: _HistoryValidationContext,
+) -> dict[str, Any]:
+    key = _native_replay_key(
+        message,
+        room_id=room_id,
+        provider_key="gemini",
+        provider_family="google",
+        projection_version=projection_version,
+    )
+    if key in validation_context.native_replays:
+        return deepcopy(validation_context.native_replays[key])
+    if key in validation_context.native_replays_in_progress:
+        raise _gemini_history_error()
+    validation_context.native_replays_in_progress.add(key)
+    try:
+        replay = _load_gemini_replay_uncached(
+            connection,
+            message,
+            room_id,
+            projection_version,
+            validation_context,
+        )
+        validation_context.native_replays[key] = deepcopy(replay)
+        return replay
+    finally:
+        validation_context.native_replays_in_progress.discard(key)
+
+
+def _load_gemini_replay_uncached(
+    connection: sqlite3.Connection,
+    message: sqlite3.Row,
+    room_id: int,
+    projection_version: str,
+    validation_context: _HistoryValidationContext,
 ) -> dict[str, Any]:
     try:
         native_trigger, native_request_payload = _validate_native_pair(
-            connection, message, room_id, "gemini", "google"
+            connection,
+            message,
+            room_id,
+            "gemini",
+            "google",
+            projection_version,
+            validation_context,
         )
     except (sqlite3.Error, TypeError, ValueError) as exception:
         raise _gemini_history_error() from exception
@@ -793,7 +933,7 @@ def _load_gemini_replay(
         local_context = request_payload["local_context"]
         routed = "turn_routing_version" in local_context
         handoff = "handoff_version" in local_context
-        projection_version = local_context["history_visibility"][
+        recorded_projection_version = local_context["history_visibility"][
             "projection_version"
         ]
         prefix = (
@@ -810,7 +950,7 @@ def _load_gemini_replay(
             or config["system_instructions"]
             != (
                 GEMINI_SYSTEM_INSTRUCTIONS_V3
-                if handoff or projection_version == PROVIDER_HISTORY_V4
+                if handoff or recorded_projection_version == PROVIDER_HISTORY_V4
                 else GEMINI_SYSTEM_INSTRUCTIONS_V2
                 if routed
                 else GEMINI_SYSTEM_INSTRUCTIONS_V1
@@ -847,12 +987,13 @@ def _load_gemini_replay(
             )
         except Exception as exception:
             raise ValueError("invalid Gemini memory evidence") from exception
-        expected_contents = load_provider_history(
+        expected_contents = _load_provider_history(
             connection,
             room_id=room_id,
             boundary=native_trigger["room_sequence_no"],
             provider_participant_key="gemini",
-            projection_version=projection_version,
+            projection_version=recorded_projection_version,
+            validation_context=validation_context,
         )
         inherited_context = (
             INHERITED_MEMORY_HEADER

@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from pydantic import ValidationError
 
+import app.provider_history as provider_history_module
 from app.database import (
     _ensure_identity_bootstrap,
     _ensure_participant,
@@ -24,8 +25,10 @@ from app.gemini_service import run_gemini_turn
 from app.handoff_contract import HANDOFF_PROTOCOL_VERSION, ROOM_HANDOFF_AUTHORIZATION
 from app.handoff_service import run_manual_handoff
 from app.models import HandoffRequest
+from app.provider_history import load_provider_history
 from app.room_service import TurnServiceError, run_helios_turn
 from app.trace_service import TraceServiceError, load_trace
+from app.turn_routing import PROVIDER_HISTORY_V4
 from tests import test_direct_addressing as direct_fixtures
 from tests.test_gemini import FakeClient as FakeGeminiClient
 from tests.test_gemini import SYNTHETIC_KEY, success_response
@@ -445,6 +448,57 @@ class ManualParticipantHandoffTests(unittest.TestCase):
             item.parts[0].text.startswith(ROOM_HANDOFF_AUTHORIZATION)
             for item in later_contents[:-2]
         ))
+
+    def test_long_alternating_handoff_history_validates_each_native_turn_once(self) -> None:
+        source_id = self.seed_helios_to_gemini("Start long exchange")
+        handoff_count = 12
+        for index in range(handoff_count):
+            if index % 2 == 0:
+                client = FakeGeminiClient(success_response(f"Gemini handoff {index}"))
+                environment = {
+                    "GEMINI_API_KEY": SYNTHETIC_KEY,
+                    "HELIOS_GEMINI_MODEL": "gemini-test",
+                }
+                arguments = {"gemini_client_factory": lambda _key, client=client: client}
+            else:
+                response = direct_fixtures.DirectParticipantAddressingTests.openai_response(
+                    f"Helios handoff {index}"
+                )
+                client = FakeClient(FakeResponses(response))
+                environment = {
+                    "OPENAI_API_KEY": "synthetic-openai",
+                    "HELIOS_OPENAI_MODEL": "gpt-5.6-luna",
+                }
+                arguments = {"openai_client_factory": lambda _key, client=client: client}
+            with patch.dict(os.environ, environment, clear=True):
+                result = asyncio.run(run_manual_handoff(
+                    source_id,
+                    database_path=self.database,
+                    dotenv_path=self.dotenv,
+                    **arguments,
+                ))
+            source_id = result["handoff_message_id"]
+
+        with closing(connect_database(self.database)) as connection:
+            boundary = connection.execute(
+                "SELECT max(room_sequence_no) FROM messages WHERE room_id=1"
+            ).fetchone()[0]
+            for provider_key in ("helios", "gemini"):
+                with self.subTest(provider_key=provider_key), patch(
+                    "app.provider_history._validate_native_handoff",
+                    wraps=provider_history_module._validate_native_handoff,
+                ) as validator:
+                    history = load_provider_history(
+                        connection,
+                        room_id=1,
+                        boundary=boundary,
+                        provider_participant_key=provider_key,
+                        projection_version=PROVIDER_HISTORY_V4,
+                    )
+                    self.assertTrue(history)
+                    self.assertEqual(validator.call_count, handoff_count // 2)
+                    validated_ids = [call.args[1]["id"] for call in validator.call_args_list]
+                    self.assertEqual(len(set(validated_ids)), handoff_count // 2)
 
     def test_ai_to_peter_and_room_are_natural_stopping_conditions(self) -> None:
         factory = Mock(side_effect=AssertionError("handoff provider must not run"))
