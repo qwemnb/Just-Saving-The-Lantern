@@ -809,8 +809,8 @@ class BrowserCacheContractTests(unittest.TestCase):
         response = asyncio.run(self.request("/"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
-        self.assertIn("style.css?v=direct-participant-addressing-v1", response.text)
-        self.assertIn("app.js?v=direct-participant-addressing-v1", response.text)
+        self.assertIn("style.css?v=manual-participant-handoff-v1", response.text)
+        self.assertIn("app.js?v=manual-participant-handoff-v1", response.text)
         self.assertNotIn("gemini-participant-v1", response.text)
 
 

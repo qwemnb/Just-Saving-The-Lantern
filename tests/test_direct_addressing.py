@@ -21,6 +21,7 @@ from app.database import (
 from app.gemini_service import run_gemini_turn
 from app.gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS_V1,
+    GEMINI_SYSTEM_INSTRUCTIONS_V2,
     validate_recorded_google_shared_request_payload,
 )
 from app.identity_service import adopt_participant_name
@@ -28,6 +29,7 @@ from app.models import MessageRequest
 from app.room_service import TurnServiceError, run_helios_turn
 from app.request_validation import (
     OPENAI_SYSTEM_INSTRUCTIONS_V1,
+    OPENAI_SYSTEM_INSTRUCTIONS_V2,
     validate_recorded_openai_shared_request_payload,
 )
 from app.trace_service import load_trace
@@ -342,7 +344,7 @@ class DirectParticipantAddressingTests(unittest.TestCase):
         self.assertEqual(provider_input[-1]["content"], imitation)
         self.assertIn('"participant_key":"gemini"', provider_input[-2]["content"])
 
-    def test_provider_history_v3_keeps_own_direct_output_native(self) -> None:
+    def test_provider_history_v4_keeps_own_direct_output_native(self) -> None:
         self.run_helios(
             {"kind": "participant", "participant_key": "gemini"}, text="First Helios"
         )
@@ -404,6 +406,39 @@ class DirectParticipantAddressingTests(unittest.TestCase):
         for altered in mutations:
             with self.subTest(fields=sorted(altered["local_context"])), self.assertRaises(ValueError):
                 validate_recorded_openai_shared_request_payload(altered)
+
+    def test_historical_direct_provider_history_v3_contract_remains_closed(self) -> None:
+        self.run_helios({"kind": "participant", "participant_key": "gemini"})
+        with closing(connect_database(self.database)) as connection:
+            payload = json.loads(connection.execute(
+                "SELECT payload_json FROM api_events WHERE event_type='openai.responses.request'"
+            ).fetchone()[0])
+        self.assertEqual(
+            payload["local_context"]["history_visibility"]["projection_version"],
+            "provider_history_v4",
+        )
+        historical = json.loads(json.dumps(payload))
+        historical["local_context"]["history_visibility"]["projection_version"] = "provider_history_v3"
+        historical["request"]["instructions"] = OPENAI_SYSTEM_INSTRUCTIONS_V2
+        validate_recorded_openai_shared_request_payload(historical)
+
+        self.run_gemini(
+            {"kind": "participant", "participant_key": "helios"},
+            text="Gemini v4",
+        )
+        with closing(connect_database(self.database)) as connection:
+            google_payload = json.loads(connection.execute(
+                """SELECT payload_json FROM api_events
+                   WHERE event_type='google.generate_content.request'"""
+            ).fetchone()[0])
+        self.assertEqual(
+            google_payload["local_context"]["history_visibility"]["projection_version"],
+            "provider_history_v4",
+        )
+        google_historical = json.loads(json.dumps(google_payload))
+        google_historical["local_context"]["history_visibility"]["projection_version"] = "provider_history_v3"
+        google_historical["request"]["config"]["system_instruction"] = GEMINI_SYSTEM_INSTRUCTIONS_V2
+        validate_recorded_google_shared_request_payload(google_historical)
 
     def test_google_request_contract_rejects_every_legacy_routing_hybrid(self) -> None:
         self.run_gemini({"kind": "participant", "participant_key": "helios"})

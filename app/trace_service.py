@@ -17,6 +17,7 @@ from .gemini_client import (
     FAILURE_KINDS as GEMINI_FAILURE_KINDS,
     GEMINI_SYSTEM_INSTRUCTIONS_V1,
     GEMINI_SYSTEM_INSTRUCTIONS_V2,
+    GEMINI_SYSTEM_INSTRUCTIONS_V3,
     MAX_SAFE_INTEGER,
     TOKEN_COUNT_FIELDS as GEMINI_TOKEN_COUNT_FIELDS,
     content_from_recorded,
@@ -34,6 +35,7 @@ from .request_validation import (
     OPENAI_RESPONSE_TOOLS,
     OPENAI_SYSTEM_INSTRUCTIONS_V1,
     OPENAI_SYSTEM_INSTRUCTIONS_V2,
+    OPENAI_SYSTEM_INSTRUCTIONS_V3,
 )
 from .schema_validation import SchemaValidationError, validate_v14_foundation
 from .seed_memory import (
@@ -48,10 +50,18 @@ from .seed_memory import (
 from .turn_routing import (
     PROVIDER_HISTORY_V2,
     PROVIDER_HISTORY_V3,
+    PROVIDER_HISTORY_V4,
     build_gemini_provider_contents,
     build_openai_provider_input,
     routing_context_text,
     validate_response_destination_evidence,
+)
+from .handoff_contract import (
+    HANDOFF_PROTOCOL_VERSION,
+    build_gemini_handoff_contents,
+    build_openai_handoff_input,
+    handoff_context_text,
+    validate_handoff_authorization,
 )
 
 
@@ -188,8 +198,15 @@ def _load_snapshot(
     if len(request_events) > 1 or len(terminal_events) > 1:
         raise _data_invalid()
 
+    validation_messages = (
+        _messages_with_handoff_source(
+            connection, room_id, messages, request_events[0]
+        )
+        if request_events
+        else messages
+    )
     if request_events:
-        _validate_raw_inherited_memory(request_events[0], messages)
+        _validate_raw_inherited_memory(request_events[0], validation_messages)
 
     configurations = _load_configurations(
         connection, message_config_ids | event_config_ids
@@ -210,7 +227,7 @@ def _load_snapshot(
     )
     inherited_memory = _build_inherited_memory(
         recorded_request,
-        messages,
+        validation_messages,
         request_events[0] if request_events else None,
     )
     provider_outcome = (
@@ -450,6 +467,122 @@ def _load_messages(
             }
         )
     return messages, config_ids
+
+
+def _messages_with_handoff_source(
+    connection: sqlite3.Connection,
+    room_id: int,
+    messages: list[dict[str, Any]],
+    request_event: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if request_event["is_redacted"]:
+        return messages
+    payload = request_event["raw_payload"]
+    local = payload.get("local_context") if isinstance(payload, dict) else None
+    if not isinstance(local, dict) or "handoff_version" not in local:
+        return messages
+    try:
+        authorization = validate_handoff_authorization(
+            local["handoff_authorization"]
+        )
+    except (KeyError, TypeError, ValueError) as exception:
+        raise _data_invalid() from exception
+    source = _load_handoff_source_message(
+        connection, room_id, authorization["source_message_id"]
+    )
+    return [*messages, source]
+
+
+def _load_handoff_source_message(
+    connection: sqlite3.Connection, room_id: int, source_message_id: int
+) -> dict[str, Any]:
+    rows = connection.execute(
+        """SELECT m.id, m.turn_id, m.room_id, m.room_sequence_no,
+                  m.turn_sequence_no, m.participant_id,
+                  m.participant_config_id, m.reply_to_id, m.message_type,
+                  m.message_text, m.created_at, p.participant_key,
+                  p.name AS participant_name, p.participant_type,
+                  mr.routing_mode, mr.destination_kind,
+                  mr.recipient_participant_id,
+                  recipient.participant_key AS recipient_key,
+                  mr.sender_participant_id,
+                  sa.participant_id AS sender_alias_owner,
+                  sa.display_alias AS sender_display_name,
+                  sa.alias_key AS sender_alias_key,
+                  da.participant_id AS destination_alias_owner,
+                  da.display_alias AS destination_display_name,
+                  da.alias_key AS destination_alias_key,
+                  destination_owner.participant_key AS destination_owner_key,
+                  reply.id AS found_reply_id, reply.turn_id AS reply_turn_id,
+                  reply.room_id AS reply_room_id,
+                  pc.participant_id AS config_owner, pc.provider AS config_provider
+           FROM messages AS m
+           JOIN participants AS p ON p.id=m.participant_id
+           JOIN message_routes AS mr ON mr.message_id=m.id AND mr.room_id=m.room_id
+           JOIN participant_aliases AS sa ON sa.id=mr.sender_alias_id
+           JOIN participant_aliases AS da ON da.id=mr.destination_alias_id
+           JOIN participants AS destination_owner ON destination_owner.id=da.participant_id
+           LEFT JOIN participants AS recipient ON recipient.id=mr.recipient_participant_id
+           LEFT JOIN messages AS reply ON reply.id=m.reply_to_id
+           LEFT JOIN participant_configs AS pc ON pc.id=m.participant_config_id
+           WHERE m.id=? AND m.room_id=?""",
+        (source_message_id, room_id),
+    ).fetchall()
+    if len(rows) != 1:
+        raise _data_invalid()
+    row = rows[0]
+    if (
+        row["participant_type"] != "ai"
+        or row["message_type"] != "chat"
+        or row["participant_config_id"] is None
+        or row["config_owner"] != row["participant_id"]
+        or row["config_provider"] not in {"openai", "google"}
+        or row["routing_mode"] != "explicit"
+        or row["destination_kind"] != "participant"
+        or row["recipient_participant_id"] is None
+        or row["recipient_key"] is None
+        or row["recipient_participant_id"] == row["participant_id"]
+        or row["sender_participant_id"] != row["participant_id"]
+        or row["sender_alias_owner"] != row["participant_id"]
+        or row["destination_alias_owner"] != row["recipient_participant_id"]
+    ):
+        raise _data_invalid()
+    _validate_trace_alias(row["sender_display_name"], row["sender_alias_key"])
+    _validate_trace_alias(
+        row["destination_display_name"], row["destination_alias_key"]
+    )
+    if row["reply_to_id"] is not None and (
+        row["found_reply_id"] is None or row["reply_room_id"] != room_id
+    ):
+        raise _data_invalid()
+    return {
+        "id": row["id"],
+        "room_sequence_no": row["room_sequence_no"],
+        "turn_sequence_no": row["turn_sequence_no"],
+        "participant_id": row["participant_id"],
+        "participant_key": row["participant_key"],
+        "participant_name": row["participant_name"],
+        "participant_config_id": row["participant_config_id"],
+        "reply_to_id": row["reply_to_id"],
+        "reply_to_turn_id": row["reply_turn_id"],
+        "reply_to_outside_selected_turn": False,
+        "message_type": row["message_type"],
+        "message_text": row["message_text"],
+        "created_at": row["created_at"],
+        "source_turn_id": row["turn_id"],
+        "routing": {
+            "routing_mode": row["routing_mode"],
+            "sender": {
+                "participant_key": row["participant_key"],
+                "display_name": row["sender_display_name"],
+            },
+            "destination": {
+                "kind": "participant",
+                "participant_key": row["recipient_key"],
+                "display_name": row["destination_display_name"],
+            },
+        },
+    }
 
 
 def _validate_trace_alias(display: Any, stored_key: Any, *, allow_room: bool = False) -> None:
@@ -709,6 +842,31 @@ def _validate_event_family(
     redacted = any(event["is_redacted"] for event in recognized)
     expected_key = "gemini" if family == "google" else "helios"
     config = configurations.get(request[0]["participant_config_id"])
+    if not redacted:
+        try:
+            if family == "google":
+                validate_recorded_google_shared_request_payload(
+                    request[0]["raw_payload"]
+                )
+            else:
+                validate_recorded_openai_shared_request_payload(
+                    request[0]["raw_payload"]
+                )
+        except (TypeError, ValueError) as exception:
+            raise _data_invalid() from exception
+        local = request[0]["raw_payload"]["local_context"]
+        if "handoff_version" in local:
+            _validate_handoff_event_family(
+                connection,
+                turn,
+                messages,
+                request[0],
+                terminal,
+                config,
+                family,
+                expected_key,
+            )
+            return
     peter_messages = [
         message for message in messages
         if message["participant_key"] == "peter" and message["message_type"] == "chat"
@@ -841,7 +999,9 @@ def _validate_event_family(
             config["model"] != model
             or config["system_instructions"]
             != (
-                GEMINI_SYSTEM_INSTRUCTIONS_V2
+                GEMINI_SYSTEM_INSTRUCTIONS_V3
+                if projection_version == PROVIDER_HISTORY_V4
+                else GEMINI_SYSTEM_INSTRUCTIONS_V2
                 if routed
                 else GEMINI_SYSTEM_INSTRUCTIONS_V1
             )
@@ -867,7 +1027,9 @@ def _validate_event_family(
             config["model"] != model
             or config["system_instructions"]
             != (
-                OPENAI_SYSTEM_INSTRUCTIONS_V2
+                OPENAI_SYSTEM_INSTRUCTIONS_V3
+                if projection_version == PROVIDER_HISTORY_V4
+                else OPENAI_SYSTEM_INSTRUCTIONS_V2
                 if routed
                 else OPENAI_SYSTEM_INSTRUCTIONS_V1
             )
@@ -922,6 +1084,185 @@ def _validate_event_family(
             raise _data_invalid()
     elif status != "cancelled":
         raise _data_invalid()
+
+
+def _validate_handoff_event_family(
+    connection: sqlite3.Connection,
+    turn: sqlite3.Row,
+    messages: list[dict[str, Any]],
+    request: dict[str, Any],
+    terminal: list[dict[str, Any]],
+    config: dict[str, Any] | None,
+    family: str,
+    expected_key: str,
+) -> None:
+    """Reconstruct one closed Manual Participant Handoff v1 turn."""
+
+    payload = request["raw_payload"]
+    local = payload["local_context"]
+    try:
+        authorization = validate_handoff_authorization(
+            local["handoff_authorization"]
+        )
+        destination = validate_response_destination_evidence(
+            local["response_destination"]
+        )
+    except (KeyError, TypeError, ValueError) as exception:
+        raise _data_invalid() from exception
+    source = _load_handoff_source_message(
+        connection, turn["room_id"], authorization["source_message_id"]
+    )
+    source_route = source["routing"]
+    if (
+        turn["initiator_key"] != "peter"
+        or local.get("handoff_version") != HANDOFF_PROTOCOL_VERSION
+        or local["history_visibility"]["projection_version"] != PROVIDER_HISTORY_V4
+        or request["participant_key"] != expected_key
+        or request["related_message_id"] != source["id"]
+        or request["related_message_turn_id"] != source["source_turn_id"]
+        or not request["related_message_outside_selected_turn"]
+        or config is None
+        or config["participant_key"] != expected_key
+        or config["provider"] != family
+        or source_route["destination"]
+        .get("participant_key")
+        != expected_key
+        or source_route["sender"] != authorization["source_sender"]
+        or authorization["source_turn_id"] != source["source_turn_id"]
+        or authorization["source_room_sequence"] != source["room_sequence_no"]
+        or authorization["responder"]["participant_key"] != expected_key
+        or authorization["response_destination"]["participant_key"]
+        != source["participant_key"]
+        or destination.get("participant_key") != source["participant_key"]
+        or destination.get("display_name")
+        != authorization["response_destination"]["display_name"]
+        or local["trigger_message_id"] != source["id"]
+        or local["room_sequence_boundary"] != source["room_sequence_no"]
+    ):
+        raise _data_invalid()
+
+    validation_messages = [*messages, source]
+    try:
+        expected_history = load_provider_history(
+            connection,
+            room_id=turn["room_id"],
+            boundary=source["room_sequence_no"],
+            provider_participant_key=expected_key,
+            projection_version=PROVIDER_HISTORY_V4,
+        )
+        retrieval, context = _validate_inherited_memory_payload(
+            payload["request"], local, validation_messages, request
+        )
+        inherited = (
+            INHERITED_MEMORY_HEADER + _canonical_json(context)
+            if retrieval["selected"] and context is not None
+            else None
+        )
+        expected_input = (
+            build_gemini_handoff_contents(
+                expected_history,
+                inherited_memory_context=inherited,
+                authorization=authorization,
+            )
+            if family == "google"
+            else build_openai_handoff_input(
+                expected_history,
+                inherited_memory_context=inherited,
+                authorization=authorization,
+            )
+        )
+    except (ProviderHistoryError, KeyError, TypeError, ValueError) as exception:
+        raise _data_invalid() from exception
+    actual_input = payload["request"][
+        "contents" if family == "google" else "input"
+    ]
+    if actual_input != expected_input:
+        raise _data_invalid()
+
+    model = payload["request"].get("model")
+    if family == "google":
+        slug = (
+            re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+            if isinstance(model, str)
+            else ""
+        ) or "model"
+        prefixes = (
+            f"direct-address-google-{slug}-v",
+            f"manual-handoff-google-{slug}-v",
+        )
+        expected_instructions = GEMINI_SYSTEM_INSTRUCTIONS_V3
+        expected_settings = gemini_recorded_settings()
+        expected_tools: Any = []
+    else:
+        role = model.removeprefix("gpt-5.6-") if isinstance(model, str) else ""
+        role = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "model"
+        prefixes = (
+            f"direct-address-openai-{role}-v",
+            f"manual-handoff-openai-{role}-v",
+        )
+        expected_instructions = OPENAI_SYSTEM_INSTRUCTIONS_V3
+        expected_settings = OPENAI_RESPONSE_SETTINGS
+        expected_tools = OPENAI_RESPONSE_TOOLS
+    label = config["config_label"]
+    label_valid = isinstance(label, str) and any(
+        label.startswith(prefix)
+        and label[len(prefix) :].isdigit()
+        and int(label[len(prefix) :]) > 0
+        for prefix in prefixes
+    )
+    if (
+        config["model"] != model
+        or config["system_instructions"] != expected_instructions
+        or config["settings"] != expected_settings
+        or config["tools"] != expected_tools
+        or not label_valid
+    ):
+        raise _data_invalid()
+
+    status = turn["status"]
+    if status == "open":
+        if terminal or messages:
+            raise _data_invalid()
+        return
+    if status == "completed":
+        if (
+            len(terminal) != 1
+            or terminal[0]["event_type"] not in RESPONSE_EVENTS
+            or len(messages) != 1
+        ):
+            raise _data_invalid()
+        response = messages[0]
+        if (
+            response["participant_key"] != expected_key
+            or response["participant_config_id"] != request["participant_config_id"]
+            or response["turn_sequence_no"] != 1
+            or response["reply_to_id"] != source["id"]
+            or response["reply_to_turn_id"] != source["source_turn_id"]
+            or not response["reply_to_outside_selected_turn"]
+            or response["routing"]["routing_mode"] != "explicit"
+            or not _route_matches_response_destination(
+                response["routing"]["destination"], destination
+            )
+            or terminal[0]["participant_key"] != expected_key
+            or terminal[0]["participant_config_id"]
+            != request["participant_config_id"]
+            or terminal[0]["related_message_id"] != response["id"]
+        ):
+            raise _data_invalid()
+        return
+    if status == "failed":
+        if (
+            len(terminal) != 1
+            or terminal[0]["event_type"] not in ERROR_EVENTS
+            or messages
+            or terminal[0]["participant_key"] != expected_key
+            or terminal[0]["participant_config_id"]
+            != request["participant_config_id"]
+            or terminal[0]["related_message_id"] != source["id"]
+        ):
+            raise _data_invalid()
+        return
+    raise _data_invalid()
 
 
 def _project_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -1479,6 +1820,17 @@ def _validate_inherited_memory_payload(
     triggering_participant_key = (
         triggering[0].get("participant_key") if len(triggering) == 1 else None
     )
+    handoff = "handoff_version" in local_context
+    try:
+        authorization = (
+            validate_handoff_authorization(
+                local_context["handoff_authorization"]
+            )
+            if handoff
+            else None
+        )
+    except (KeyError, TypeError, ValueError) as exception:
+        raise _data_invalid() from exception
     if (
         request_event is None
         or not isinstance(request_participant_key, str)
@@ -1487,7 +1839,12 @@ def _validate_inherited_memory_payload(
         or trigger_id != request_event["related_message_id"]
         or len(triggering) != 1
         or not isinstance(triggering_participant_key, str)
-        or triggering_participant_key.casefold() != "peter"
+        or (
+            triggering_participant_key.casefold() != "peter"
+            if not handoff
+            else triggering_participant_key
+            != authorization["source_sender"]["participant_key"]
+        )
         or tokenize_memory_query(triggering[0]["message_text"])
         != retrieval["query_terms"]
         or local_context.get("trigger_message_id") != trigger_id
@@ -1496,16 +1853,36 @@ def _validate_inherited_memory_payload(
     ):
         raise _data_invalid()
 
-    expected_trigger = (
-        {"role": "user", "parts": [{"text": triggering[0]["message_text"]}]}
-        if is_gemini
-        else {"role": "user", "content": triggering[0]["message_text"]}
-    )
-    if provider_input[-1] != expected_trigger:
-        raise _data_invalid()
+    if handoff:
+        if (
+            authorization["source_message_id"] != triggering[0]["id"]
+            or authorization["source_room_sequence"]
+            != triggering[0]["room_sequence_no"]
+            or provider_input[-1]
+            != (
+                {
+                    "role": "user",
+                    "parts": [{"text": handoff_context_text(authorization)}],
+                }
+                if is_gemini
+                else {
+                    "role": "user",
+                    "content": handoff_context_text(authorization),
+                }
+            )
+        ):
+            raise _data_invalid()
+    else:
+        expected_trigger = (
+            {"role": "user", "parts": [{"text": triggering[0]["message_text"]}]}
+            if is_gemini
+            else {"role": "user", "content": triggering[0]["message_text"]}
+        )
+        if provider_input[-1] != expected_trigger:
+            raise _data_invalid()
 
     routed = "turn_routing_version" in local_context
-    if routed:
+    if routed and not handoff:
         try:
             destination = validate_response_destination_evidence(
                 local_context["response_destination"]
@@ -1546,7 +1923,9 @@ def _validate_inherited_memory_payload(
     ]
     context: dict[str, Any] | None = None
     if selected:
-        expected_position = len(provider_input) - (3 if routed else 2)
+        expected_position = len(provider_input) - (
+            2 if handoff else 3 if routed else 2
+        )
         if (
             len(candidates) != 1
             or candidates[0][0] != expected_position

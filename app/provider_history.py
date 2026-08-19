@@ -11,6 +11,7 @@ from .database import has_exact_room_visibility_policy
 from .gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS_V1,
     GEMINI_SYSTEM_INSTRUCTIONS_V2,
+    GEMINI_SYSTEM_INSTRUCTIONS_V3,
     model_content_from_stored_response,
     recorded_settings,
     validate_recorded_google_shared_request_payload,
@@ -18,12 +19,19 @@ from .gemini_client import (
 from .request_validation import (
     OPENAI_SYSTEM_INSTRUCTIONS_V1,
     OPENAI_SYSTEM_INSTRUCTIONS_V2,
+    OPENAI_SYSTEM_INSTRUCTIONS_V3,
     validate_recorded_openai_shared_request_payload,
 )
 from .seed_memory import INHERITED_MEMORY_HEADER
+from .handoff_contract import (
+    HANDOFF_PROTOCOL_VERSION,
+    build_gemini_handoff_contents,
+    validate_handoff_authorization,
+)
 from .turn_routing import (
     PROVIDER_HISTORY_V2,
     PROVIDER_HISTORY_V3,
+    PROVIDER_HISTORY_V4,
     build_gemini_provider_contents,
     validate_response_destination_evidence,
 )
@@ -89,7 +97,9 @@ def load_provider_history(
 
     if provider_participant_key not in {"helios", "gemini"}:
         raise _participant_error()
-    if projection_version not in {PROVIDER_HISTORY_V2, PROVIDER_HISTORY_V3}:
+    if projection_version not in {
+        PROVIDER_HISTORY_V2, PROVIDER_HISTORY_V3, PROVIDER_HISTORY_V4
+    }:
         raise _policy_error()
     if type(boundary) is not int or boundary <= 0:
         raise _policy_error()
@@ -275,7 +285,7 @@ def _is_native_candidate(
             row["destination_kind"] == "participant"
             and row["recipient_key"] == "peter"
         )
-    return projection_version == PROVIDER_HISTORY_V3
+    return projection_version in {PROVIDER_HISTORY_V3, PROVIDER_HISTORY_V4}
 
 
 def _openai_external_item(row: sqlite3.Row, destination_kind: str) -> dict[str, str]:
@@ -334,6 +344,16 @@ def _validate_native_pair(
            WHERE m.turn_id=? ORDER BY m.turn_sequence_no""",
         (message["turn_id"],),
     ).fetchall()
+    if len(turns) == 1 and len(rows) == 1:
+        return _validate_native_handoff(
+            connection,
+            message,
+            room_id,
+            provider_key,
+            provider_family,
+            turns[0],
+            rows[0],
+        )
     if len(turns) != 1 or len(rows) != 2:
         raise ValueError("invalid native turn cardinality")
     turn = turns[0]
@@ -411,14 +431,18 @@ def _validate_native_pair(
         validate_recorded_openai_shared_request_payload(payload)
         expected_instructions = payload["request"]["instructions"]
         if expected_instructions not in {
-            OPENAI_SYSTEM_INSTRUCTIONS_V1, OPENAI_SYSTEM_INSTRUCTIONS_V2
+            OPENAI_SYSTEM_INSTRUCTIONS_V1,
+            OPENAI_SYSTEM_INSTRUCTIONS_V2,
+            OPENAI_SYSTEM_INSTRUCTIONS_V3,
         }:
             raise ValueError("invalid native OpenAI instructions")
     else:
         validate_recorded_google_shared_request_payload(payload)
         expected_instructions = payload["request"]["config"]["system_instruction"]
         if expected_instructions not in {
-            GEMINI_SYSTEM_INSTRUCTIONS_V1, GEMINI_SYSTEM_INSTRUCTIONS_V2
+            GEMINI_SYSTEM_INSTRUCTIONS_V1,
+            GEMINI_SYSTEM_INSTRUCTIONS_V2,
+            GEMINI_SYSTEM_INSTRUCTIONS_V3,
         }:
             raise ValueError("invalid native Gemini instructions")
     if response["system_instructions"] != expected_instructions:
@@ -454,6 +478,207 @@ def _validate_native_pair(
         if not matches:
             raise ValueError("native response route disagrees with request evidence")
     return trigger, payload
+
+
+def _validate_native_handoff(
+    connection: sqlite3.Connection,
+    message: sqlite3.Row,
+    room_id: int,
+    provider_key: str,
+    provider_family: str,
+    turn: sqlite3.Row,
+    response: sqlite3.Row,
+) -> tuple[sqlite3.Row, dict[str, Any]]:
+    """Validate one-message native history produced by a manual handoff."""
+
+    sources = connection.execute(
+        """SELECT m.id, m.turn_id, m.room_id, m.room_sequence_no,
+                  m.turn_sequence_no, m.participant_id, m.participant_config_id,
+                  m.reply_to_id, m.message_type, m.message_text,
+                  p.participant_key, p.participant_type,
+                  mr.routing_mode, mr.destination_kind,
+                  mr.recipient_participant_id,
+                  recipient.participant_key AS recipient_key,
+                  mr.sender_participant_id,
+                  sa.participant_id AS sender_alias_owner,
+                  sa.display_alias AS sender_display,
+                  da.participant_id AS destination_alias_owner,
+                  da.display_alias AS destination_display,
+                  da.alias_key AS destination_alias_key,
+                  destination_owner.participant_key AS destination_owner_key,
+                  pc.participant_id AS config_owner, pc.provider,
+                  pc.system_instructions
+           FROM messages AS m
+           JOIN participants AS p ON p.id=m.participant_id
+           JOIN message_routes AS mr ON mr.message_id=m.id AND mr.room_id=m.room_id
+           JOIN participant_aliases AS sa ON sa.id=mr.sender_alias_id
+           JOIN participant_aliases AS da ON da.id=mr.destination_alias_id
+           JOIN participants AS destination_owner ON destination_owner.id=da.participant_id
+           LEFT JOIN participants AS recipient ON recipient.id=mr.recipient_participant_id
+           LEFT JOIN participant_configs AS pc ON pc.id=m.participant_config_id
+           WHERE m.id=?""",
+        (response["reply_to_id"],),
+    ).fetchall()
+    events = connection.execute(
+        """SELECT sequence_no, event_type, participant_id,
+                  participant_config_id, related_message_id, payload_json,
+                  is_redacted, tool_invocation_id, room_id
+           FROM api_events WHERE turn_id=? ORDER BY sequence_no""",
+        (message["turn_id"],),
+    ).fetchall()
+    request_type = (
+        "openai.responses.request"
+        if provider_family == "openai"
+        else "google.generate_content.request"
+    )
+    response_type = (
+        "openai.responses.response"
+        if provider_family == "openai"
+        else "google.generate_content.response"
+    )
+    if len(sources) != 1:
+        raise ValueError("invalid handoff source")
+    source = sources[0]
+    if (
+        turn["room_id"] != room_id
+        or turn["initiator_key"] != "peter"
+        or turn["status"] != "completed"
+        or source["room_id"] != room_id
+        or source["room_sequence_no"] >= response["room_sequence_no"]
+        or source["participant_type"] != "ai"
+        or source["message_type"] != "chat"
+        or source["routing_mode"] != "explicit"
+        or source["destination_kind"] != "participant"
+        or source["recipient_key"] != provider_key
+        or source["participant_key"] == provider_key
+        or source["sender_participant_id"] != source["participant_id"]
+        or source["sender_alias_owner"] != source["participant_id"]
+        or source["destination_alias_owner"] != source["recipient_participant_id"]
+        or response["id"] != message["id"]
+        or response["room_id"] != room_id
+        or response["room_sequence_no"] != message["room_sequence_no"]
+        or response["turn_sequence_no"] != 1
+        or response["participant_key"] != provider_key
+        or response["participant_id"] != message["participant_id"]
+        or response["participant_config_id"] != message["participant_config_id"]
+        or response["reply_to_id"] != source["id"]
+        or response["message_type"] != "chat"
+        or response["routing_mode"] != "explicit"
+        or response["destination_kind"] != "participant"
+        or response["recipient_key"] != source["participant_key"]
+        or response["sender_participant_id"] != response["participant_id"]
+        or response["sender_alias_owner"] != response["participant_id"]
+        or response["destination_alias_owner"] != source["participant_id"]
+        or response["config_owner"] != response["participant_id"]
+        or response["provider"] != provider_family
+        or response["message_text"] != message["message_text"]
+        or len(events) != 2
+        or events[0]["sequence_no"] != 1
+        or events[0]["event_type"] != request_type
+        or events[0]["participant_id"] != response["participant_id"]
+        or events[0]["participant_config_id"] != response["participant_config_id"]
+        or events[0]["related_message_id"] != source["id"]
+        or events[0]["room_id"] != room_id
+        or events[0]["is_redacted"]
+        or events[0]["tool_invocation_id"] is not None
+        or events[1]["sequence_no"] != 2
+        or events[1]["event_type"] != response_type
+        or events[1]["participant_id"] != response["participant_id"]
+        or events[1]["participant_config_id"] != response["participant_config_id"]
+        or events[1]["related_message_id"] != response["id"]
+        or events[1]["room_id"] != room_id
+        or events[1]["is_redacted"]
+        or events[1]["tool_invocation_id"] is not None
+    ):
+        raise ValueError("invalid native handoff response")
+    payload = json.loads(events[0]["payload_json"])
+    if provider_family == "openai":
+        validate_recorded_openai_shared_request_payload(payload)
+        instructions = payload["request"]["instructions"]
+        if instructions != OPENAI_SYSTEM_INSTRUCTIONS_V3:
+            raise ValueError("invalid handoff OpenAI instructions")
+    else:
+        validate_recorded_google_shared_request_payload(payload)
+        instructions = payload["request"]["config"]["system_instruction"]
+        if instructions != GEMINI_SYSTEM_INSTRUCTIONS_V3:
+            raise ValueError("invalid handoff Gemini instructions")
+    local = payload["local_context"]
+    authorization = validate_handoff_authorization(
+        local.get("handoff_authorization")
+    )
+    destination = validate_response_destination_evidence(
+        local["response_destination"]
+    )
+    if (
+        local.get("handoff_version") != HANDOFF_PROTOCOL_VERSION
+        or local["history_visibility"]["projection_version"] != PROVIDER_HISTORY_V4
+        or authorization["source_message_id"] != source["id"]
+        or authorization["source_turn_id"] != source["turn_id"]
+        or authorization["source_room_sequence"] != source["room_sequence_no"]
+        or authorization["source_sender"]
+        != {
+            "display_name": source["sender_display"],
+            "participant_key": source["participant_key"],
+        }
+        or authorization["responder"]["participant_key"] != provider_key
+        or authorization["response_destination"]["participant_key"]
+        != source["participant_key"]
+        or destination["participant_key"] != source["participant_key"]
+        or destination["display_name"] != response["destination_display"]
+        or response["system_instructions"] != instructions
+    ):
+        raise ValueError("invalid native handoff authorization")
+    from .trace_service import _validate_inherited_memory_payload
+
+    event_evidence = {
+        "participant_id": events[0]["participant_id"],
+        "participant_key": provider_key,
+        "related_message_id": source["id"],
+    }
+    message_evidence = [{
+        "id": source["id"],
+        "participant_key": source["participant_key"],
+        "message_text": source["message_text"],
+        "room_sequence_no": source["room_sequence_no"],
+    }]
+    try:
+        retrieval, context = _validate_inherited_memory_payload(
+            payload["request"], local, message_evidence, event_evidence
+        )
+    except Exception as exception:
+        raise ValueError("invalid handoff memory evidence") from exception
+    expected_history = load_provider_history(
+        connection,
+        room_id=room_id,
+        boundary=source["room_sequence_no"],
+        provider_participant_key=provider_key,
+        projection_version=PROVIDER_HISTORY_V4,
+    )
+    inherited = (
+        INHERITED_MEMORY_HEADER
+        + json.dumps(context, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if retrieval["selected"] and context is not None
+        else None
+    )
+    if provider_family == "openai":
+        from .handoff_contract import build_openai_handoff_input
+
+        expected_input = build_openai_handoff_input(
+            expected_history,
+            inherited_memory_context=inherited,
+            authorization=authorization,
+        )
+        actual_input = payload["request"]["input"]
+    else:
+        expected_input = build_gemini_handoff_contents(
+            expected_history,
+            inherited_memory_context=inherited,
+            authorization=authorization,
+        )
+        actual_input = payload["request"]["contents"]
+    if actual_input != expected_input:
+        raise ValueError("handoff provider input changed")
+    return source, payload
 
 
 def _external_content(row: sqlite3.Row, *, destination_kind: str) -> dict[str, Any]:
@@ -565,7 +790,12 @@ def _load_gemini_replay(
         config = config_rows[0]
         requested_model = request_payload["request"]["model"]
         slug = re.sub(r"[^a-z0-9]+", "-", requested_model.lower()).strip("-") or "model"
-        routed = "turn_routing_version" in request_payload["local_context"]
+        local_context = request_payload["local_context"]
+        routed = "turn_routing_version" in local_context
+        handoff = "handoff_version" in local_context
+        projection_version = local_context["history_visibility"][
+            "projection_version"
+        ]
         prefix = (
             f"direct-address-google-{slug}-v"
             if routed
@@ -579,7 +809,9 @@ def _load_gemini_replay(
             or config["model"] != requested_model
             or config["system_instructions"]
             != (
-                GEMINI_SYSTEM_INSTRUCTIONS_V2
+                GEMINI_SYSTEM_INSTRUCTIONS_V3
+                if handoff or projection_version == PROVIDER_HISTORY_V4
+                else GEMINI_SYSTEM_INSTRUCTIONS_V2
                 if routed
                 else GEMINI_SYSTEM_INSTRUCTIONS_V1
             )
@@ -615,9 +847,6 @@ def _load_gemini_replay(
             )
         except Exception as exception:
             raise ValueError("invalid Gemini memory evidence") from exception
-        projection_version = request_payload["local_context"]["history_visibility"][
-            "projection_version"
-        ]
         expected_contents = load_provider_history(
             connection,
             room_id=room_id,
@@ -631,7 +860,13 @@ def _load_gemini_replay(
             if retrieval["selected"] and context is not None
             else None
         )
-        if routed:
+        if handoff:
+            expected_recorded_contents = build_gemini_handoff_contents(
+                expected_contents,
+                inherited_memory_context=inherited_context,
+                authorization=local_context["handoff_authorization"],
+            )
+        elif routed:
             expected_recorded_contents = build_gemini_provider_contents(
                 expected_contents,
                 inherited_memory_context=inherited_context,

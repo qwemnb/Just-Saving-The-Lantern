@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from pydantic import ValidationError
 
@@ -25,6 +25,7 @@ class MessageApiTests(unittest.TestCase):
         initialize_database(self.database_path)
         self.original_database_path = main.app.state.database_path
         self.original_client_factory = main.app.state.openai_client_factory
+        self.original_gemini_client_factory = main.app.state.gemini_client_factory
         self.original_dotenv_path = main.app.state.dotenv_path
         main.app.state.database_path = self.database_path
         main.app.state.openai_client_factory = self._provider_must_not_run
@@ -34,6 +35,7 @@ class MessageApiTests(unittest.TestCase):
     def _restore_app_state(self) -> None:
         main.app.state.database_path = self.original_database_path
         main.app.state.openai_client_factory = self.original_client_factory
+        main.app.state.gemini_client_factory = self.original_gemini_client_factory
         main.app.state.dotenv_path = self.original_dotenv_path
 
     @staticmethod
@@ -95,6 +97,27 @@ class MessageApiTests(unittest.TestCase):
         self.assertIn("message_text: messageText", javascript)
         self.assertIn("participant_key: destination.participant_key", javascript)
         self.assertIn("destination: destination.kind", javascript)
+
+    def test_handoff_endpoint_passes_only_source_authority_to_service(self) -> None:
+        expected = {
+            "handoff_message_id": 31,
+            "source_message_id": 25,
+            "status": "completed",
+            "turn_id": 12,
+        }
+        operation = AsyncMock(return_value=expected)
+        with patch("app.main.run_manual_handoff", operation):
+            response = asyncio.run(main.post_handoff(main.HandoffRequest(
+                source_message_id=25
+            )))
+        self.assertEqual(json.loads(response.body), expected)
+        operation.assert_awaited_once_with(
+            25,
+            database_path=self.database_path,
+            openai_client_factory=main.app.state.openai_client_factory,
+            gemini_client_factory=main.app.state.gemini_client_factory,
+            dotenv_path=main.app.state.dotenv_path,
+        )
 
     def test_post_acceptance_error_response_contains_canonical_ids(self) -> None:
         class FailingResponses:

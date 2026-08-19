@@ -11,13 +11,23 @@ const POST_ERROR_FALLBACK = 'Failed to send message. Please try again.';
 const POST_ERROR_LITERALS = Object.freeze({
     participant_destination_unavailable: 'The destination changed. Select a destination and try again.',
     response_destination_unavailable: 'The reply destination changed. Select it again and try again.',
+    provider_timeout: 'Helios timed out. The accepted turn was recorded.',
+    provider_failure: 'Helios could not respond. The accepted turn was recorded.',
+    provider_response_serialization_failed: "Helios's response could not be recorded.",
+    provider_unusable_response: 'Helios returned no usable response.',
     missing_gemini_api_key: 'Gemini is not configured on this server.',
     missing_gemini_model: 'Gemini is not configured on this server.',
     gemini_provider_timeout: 'Gemini timed out. Your message was saved.',
     gemini_provider_failure: 'Gemini could not respond. Your message was saved.',
     gemini_provider_response_serialization_failed: "Gemini's response could not be recorded. Your message was saved.",
     gemini_provider_unusable_response: 'Gemini returned no usable response. Your message was saved.',
-    turn_finalization_failed: 'The provider may have responded, but this turn requires manual reconciliation.'
+    turn_finalization_failed: 'The provider may have responded, but this turn requires manual reconciliation.',
+    handoff_source_not_found: 'The handoff source is no longer available.',
+    handoff_source_invalid: 'The latest message cannot be handed off.',
+    handoff_source_stale: 'A newer Room message has replaced this handoff.',
+    handoff_recipient_unavailable: 'The addressed participant is unavailable.',
+    handoff_not_ai_to_ai: 'The latest message is not eligible for participant handoff.',
+    handoff_in_progress: 'This handoff is already in progress.'
 });
 const READ_ERROR_LITERALS = Object.freeze({
     message_history_invalid: 'The message history data is invalid.',
@@ -161,7 +171,8 @@ function classifyTraceCommand(text) {
 async function loadMessages(
     fetchImpl = fetch,
     doc = document,
-    colors = DEFAULT_PARTICIPANT_COLORS
+    colors = DEFAULT_PARTICIPANT_COLORS,
+    onLoaded = null
 ) {
     const status = doc.getElementById('history-read-status');
     let response;
@@ -189,6 +200,7 @@ async function loadMessages(
         return false;
     }
     displayMessages(messages, doc, colors);
+    if (typeof onLoaded === 'function') onLoaded(messages);
     if (status) status.textContent = '';
     return true;
 }
@@ -338,6 +350,86 @@ async function sendMessage(
     return result;
 }
 
+async function sendHandoff(sourceMessageId, fetchImpl = fetch) {
+    let response;
+    try {
+        response = await fetchImpl(`${API_BASE}/handoffs`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_message_id: sourceMessageId })
+        });
+    } catch (_error) {
+        const error = new Error(POST_ERROR_FALLBACK);
+        error.code = null;
+        error.handoffAccepted = false;
+        throw error;
+    }
+    let result = {};
+    try {
+        result = await response.json();
+    } catch (_error) {
+        // Stable local fallback below.
+    }
+    if (!response.ok) {
+        const code = result && typeof result.error === 'string' ? result.error : null;
+        const message = code !== null
+            && Object.prototype.hasOwnProperty.call(POST_ERROR_LITERALS, code)
+            ? POST_ERROR_LITERALS[code]
+            : POST_ERROR_FALLBACK;
+        const error = new Error(message);
+        error.code = code;
+        error.handoffAccepted = Number.isSafeInteger(result.turn_id) && result.turn_id > 0;
+        throw error;
+    }
+    return result;
+}
+
+function eligibleHandoff(messages, directory) {
+    if (!Array.isArray(messages) || messages.length === 0
+        || !directory || directory.directory_version !== 1
+        || !Array.isArray(directory.destinations)) return null;
+    let latest = null;
+    for (const message of messages) {
+        if (!isPlainObject(message)
+            || !Number.isSafeInteger(message.id) || message.id <= 0
+            || !Number.isSafeInteger(message.room_sequence_no)
+            || message.room_sequence_no <= 0) return null;
+        if (latest === null || message.room_sequence_no > latest.room_sequence_no) {
+            latest = message;
+        } else if (message.room_sequence_no === latest.room_sequence_no) {
+            return null;
+        }
+    }
+    const routing = latest.routing;
+    const sender = isPlainObject(routing) ? routing.sender : null;
+    const destination = isPlainObject(routing) ? routing.destination : null;
+    if (!isPlainObject(sender) || !isPlainObject(destination)
+        || destination.kind !== 'participant'
+        || typeof sender.participant_key !== 'string'
+        || sender.participant_key !== latest.participant_key
+        || typeof destination.participant_key !== 'string'
+        || sender.participant_key === destination.participant_key) return null;
+    const participants = directory.destinations.filter(item => (
+        isPlainObject(item) && item.kind === 'participant'
+    ));
+    const source = participants.find(item => item.participant_key === sender.participant_key);
+    const responder = participants.find(
+        item => item.participant_key === destination.participant_key
+    );
+    if (!source || !responder
+        || source.participant_type !== 'ai'
+        || responder.participant_type !== 'ai'
+        || source.addressable !== true
+        || responder.addressable !== true
+        || typeof responder.primary_name !== 'string'
+        || !responder.primary_name.trim()) return null;
+    return {
+        sourceMessageId: latest.id,
+        responderKey: responder.participant_key,
+        responderName: responder.primary_name
+    };
+}
+
 function appendText(doc, parent, label, value) {
     const row = doc.createElement('div');
     row.className = 'trace-field';
@@ -380,6 +472,16 @@ function renderTrace(trace, doc = document) {
     appendText(doc, turnSection, 'Status', turn.status);
     appendText(doc, turnSection, 'Room', turn.room ? `${turn.room.room_key} — ${turn.room.name}` : null);
     appendText(doc, turnSection, 'Initiator', turn.initiated_by ? `${turn.initiated_by.participant_key} (${turn.initiated_by.participant_type})` : null);
+    const traceLocalContext = trace.recorded_request && trace.recorded_request.local_context;
+    if (traceLocalContext
+        && traceLocalContext.handoff_version === 'manual_participant_handoff_v1') {
+        const authorization = traceLocalContext.handoff_authorization || {};
+        appendText(doc, turnSection, 'Authorization kind', 'Manual Participant Handoff');
+        appendText(doc, turnSection, 'Handoff source message', authorization.source_message_id);
+        appendText(doc, turnSection, 'Handoff source turn', authorization.source_turn_id);
+        appendText(doc, turnSection, 'Invoked responder', authorization.responder && authorization.responder.display_name);
+        appendText(doc, turnSection, 'Response destination', authorization.response_destination && authorization.response_destination.display_name);
+    }
     appendText(doc, turnSection, 'Created', turn.created_at);
     appendText(doc, turnSection, 'Completed', turn.completed_at);
     if (turn.completed_at) {
@@ -547,6 +649,7 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
     const participantStatus = doc.getElementById('participant-read-status');
     const responseDestinationControl = doc.getElementById('response-destination-control');
     const responseDestinationSelect = doc.getElementById('response-destination-select');
+    const handoffButton = doc.getElementById('handoff-button');
     const hasDirectoryUi = Boolean(destinationButton && picker && search && options && participantList);
     let directory = null;
     let selectedDestination = hasDirectoryUi ? null : {
@@ -556,6 +659,8 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         kind: 'participant', participant_key: 'peter', primary_name: 'Peter'
     };
     let inFlight = false;
+    let latestMessages = null;
+    let handoffBusyTarget = null;
     let composing = false;
     let filteredDestinations = [];
     let activeOptionIndex = 0;
@@ -726,6 +831,40 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
                 || !selectedDestination
                 || selectedDestination.kind === 'room';
         }
+        updateHandoffButtonState();
+    }
+
+    function updateHandoffButtonState() {
+        if (!handoffButton) return;
+        const eligible = eligibleHandoff(latestMessages, directory);
+        handoffButton.disabled = inFlight || eligible === null;
+        handoffButton.textContent = handoffBusyTarget !== null
+            ? `Pushing to ${handoffBusyTarget}...`
+            : eligible !== null
+                ? `Push to ${eligible.responderName}`
+                : 'Push to next participant';
+        handoffButton.setAttribute(
+            'aria-label',
+            eligible !== null
+                ? `Push to ${eligible.responderName}`
+                : 'Push to next participant'
+        );
+    }
+
+    async function refreshMessages() {
+        latestMessages = null;
+        updateHandoffButtonState();
+        const loaded = await loadMessages(
+            fetchImpl,
+            doc,
+            colorPreferences.colors,
+            messages => {
+                latestMessages = messages;
+                updateHandoffButtonState();
+            }
+        );
+        if (!loaded) updateHandoffButtonState();
+        return loaded;
     }
 
     function renderParticipantPanel() {
@@ -1004,8 +1143,41 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         }
     });
     updateSendButtonState();
-    loadMessages(fetchImpl, doc, colorPreferences.colors);
+    refreshMessages();
     loadDirectory();
+
+    if (handoffButton) handoffButton.addEventListener('click', async () => {
+        if (inFlight) return;
+        const eligible = eligibleHandoff(latestMessages, directory);
+        if (eligible === null) return;
+        inFlight = true;
+        handoffBusyTarget = eligible.responderName;
+        input.disabled = true;
+        updateSendButtonState();
+        showSystemMessage(`Pushing to ${eligible.responderName}...`, doc);
+        let failed = false;
+        let failureMessage = null;
+        try {
+            await sendHandoff(eligible.sourceMessageId, fetchImpl);
+        } catch (error) {
+            failed = true;
+            console.error('Error handing off message:', error);
+            failureMessage = error.message || POST_ERROR_FALLBACK;
+        } finally {
+            handoffBusyTarget = null;
+            await refreshMessages();
+            if (failureMessage !== null) showSystemMessage(failureMessage, doc);
+            if (failed && (
+                !directory
+                || eligibleHandoff(latestMessages, directory) === null
+            )) await loadDirectory(false);
+            inFlight = false;
+            input.disabled = false;
+            updateSendButtonState();
+            if (failed && !handoffButton.disabled) handoffButton.focus();
+            else input.focus();
+        }
+    });
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -1044,6 +1216,7 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         input.disabled = true;
         if (destinationButton) destinationButton.disabled = true;
         if (responseDestinationSelect) responseDestinationSelect.disabled = true;
+        updateHandoffButtonState();
         const pendingText = selectedDestination.kind === 'room'
             ? 'Saving message to the Room...'
             : `${destinationLabel(selectedDestination)} is responding to ${destinationLabel(selectedResponseDestination)}...`;
@@ -1057,12 +1230,12 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
                 fetchImpl
             );
             input.value = '';
-            await loadMessages(fetchImpl, doc, colorPreferences.colors);
+            await refreshMessages();
         } catch (error) {
             console.error('Error sending message:', error);
             if (error.postAccepted) {
                 input.value = '';
-                await loadMessages(fetchImpl, doc, colorPreferences.colors);
+                await refreshMessages();
             } else {
                 pendingMessage.remove();
             }
@@ -1087,7 +1260,9 @@ function setupApp(doc = document, fetchImpl = fetch, storage = undefined) {
         openPicker,
         participantColors: colorPreferences.colors,
         getSelectedDestination: () => selectedDestination,
-        getSelectedResponseDestination: () => selectedResponseDestination
+        getSelectedResponseDestination: () => selectedResponseDestination,
+        getEligibleHandoff: () => eligibleHandoff(latestMessages, directory),
+        refreshMessages
     };
 }
 
@@ -1112,6 +1287,8 @@ if (typeof module !== 'undefined' && module.exports) {
         POST_ERROR_LITERALS,
         POST_ERROR_FALLBACK,
         sendMessage,
+        sendHandoff,
+        eligibleHandoff,
         PARTICIPANT_COLOR_STORAGE_KEY,
         DEFAULT_PARTICIPANT_COLORS,
         NEUTRAL_PARTICIPANT_COLOR,

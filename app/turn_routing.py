@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 TURN_ROUTING_VERSION = "explicit_response_destination_v1"
 PROVIDER_HISTORY_V2 = "provider_history_v2"
 PROVIDER_HISTORY_V3 = "provider_history_v3"
+PROVIDER_HISTORY_V4 = "provider_history_v4"
 ROOM_RESPONSE_DESTINATION = "ROOM_RESPONSE_DESTINATION"
 
 

@@ -20,7 +20,7 @@ from .database import (
     store_message,
 )
 from .gemini_client import (
-    GEMINI_SYSTEM_INSTRUCTIONS_V2,
+    GEMINI_SYSTEM_INSTRUCTIONS_V3,
     GEMINI_TIMEOUT_SECONDS,
     GEMINI_TOTAL_ATTEMPTS,
     GeminiResponseSerializationError,
@@ -39,7 +39,7 @@ from .gemini_client import (
 from .identity_service import current_alias, resolve_room_post_context
 from .participant_registry import registration_for
 from .provider_history import ProviderHistoryError, load_provider_history
-from .request_validation import HISTORY_VISIBILITY_V3
+from .request_validation import HISTORY_VISIBILITY_V4
 from .room_service import TurnServiceError, canonical_json, validate_phase_a_foundation
 from .schema_validation import validate_database_integrity, validate_v14_foundation
 from .seed_memory import (
@@ -50,7 +50,7 @@ from .seed_memory import (
 )
 from .turn_routing import (
     BoundResponseDestination,
-    PROVIDER_HISTORY_V3,
+    PROVIDER_HISTORY_V4,
     ResponseDestinationUnavailable,
     TURN_ROUTING_VERSION,
     build_gemini_provider_contents,
@@ -277,7 +277,7 @@ def _accept_gemini_turn(
                 room_id=context["room_id"],
                 boundary=boundary,
                 provider_participant_key=GEMINI_KEY,
-                projection_version=PROVIDER_HISTORY_V3,
+                projection_version=PROVIDER_HISTORY_V4,
             )
         except ProviderHistoryError as error:
             raise TurnServiceError(
@@ -333,7 +333,7 @@ def _accept_gemini_turn(
         # Typed conversion is part of Phase A validation, before durable acceptance.
         contents_from_recorded(contents)
         request = {
-            "config": recorded_request_config(GEMINI_SYSTEM_INSTRUCTIONS_V2),
+            "config": recorded_request_config(GEMINI_SYSTEM_INSTRUCTIONS_V3),
             "contents": contents,
             "model": model,
         }
@@ -351,7 +351,7 @@ def _accept_gemini_turn(
                 "timeout_seconds": GEMINI_TIMEOUT_SECONDS,
                 "total_attempts": GEMINI_TOTAL_ATTEMPTS,
                 "trigger_message_id": peter_message_id,
-                "history_visibility": dict(HISTORY_VISIBILITY_V3),
+                "history_visibility": dict(HISTORY_VISIBILITY_V4),
                 "turn_routing_version": TURN_ROUTING_VERSION,
                 "response_destination": response_route.evidence(),
             },
@@ -430,7 +430,7 @@ def find_or_create_gemini_configuration(
             if (
                 row["provider"] == GOOGLE_PROVIDER
                 and row["model"] == model
-                and row["system_instructions"] == GEMINI_SYSTEM_INSTRUCTIONS_V2
+                and row["system_instructions"] == GEMINI_SYSTEM_INSTRUCTIONS_V3
                 and row["settings_json"] == settings
                 and row["tools_json"] == tools
             ):
@@ -454,7 +454,7 @@ def find_or_create_gemini_configuration(
             GOOGLE_PROVIDER,
             model,
             label,
-            GEMINI_SYSTEM_INSTRUCTIONS_V2,
+            GEMINI_SYSTEM_INSTRUCTIONS_V3,
             settings,
             tools,
         ),
@@ -695,7 +695,7 @@ def _assert_accepted_evidence(
         config["participant_id"] != accepted.gemini_id
         or config["provider"] != GOOGLE_PROVIDER
         or config["model"] != accepted.model
-        or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS_V2
+        or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS_V3
         or config["settings_json"] != canonical_json(recorded_settings())
         or config["tools_json"] != "[]"
         or not isinstance(label, str)

@@ -19,6 +19,7 @@ The project currently provides:
 - deterministic local seeded-memory retrieval with recorded provenance
 - a read-only participant directory and structured participant/Room destinations
 - a browser participant panel, destination picker, and local participant command
+- a manual one-click AI-to-AI handoff control with one provider call per click
 - room-wide canonical provider history and participant-owned inherited-memory projections
 - offline database, orchestration, API, browser-privacy, and blank-message regression tests
 
@@ -32,8 +33,10 @@ provider may be triggered; it is not a privacy boundary. Messages outside a
 provider's native Peter dialogue use an exact attributed external envelope.
 Each provider can receive one inherited-memory
 context selected only from records it owns, immediately before Peter's
-triggering message. Room posts never invoke an AI automatically, and there is
-no automated handoff or turn-taking.
+triggering message. Room posts never invoke an AI automatically. An eligible
+terminal AI-to-AI message may be advanced only by Peter pressing the global
+Push button; each press authorizes exactly one provider response and never
+cascades.
 
 | Canonical route | Helios input | Gemini input |
 | --- | --- | --- |
@@ -404,8 +407,9 @@ Trace exposes the shared canonical room history, exact system instructions,
 request settings, and operational provenance. For unredacted requests it shows
 `Room-wide history`, `room_shared_v1`, effective sequence 1, and
 the recorded closed projection version: historical requests retain
-`provider_history_v2`, while direct-addressing requests use
-`provider_history_v3`. Redacted requests show only that request details were
+`provider_history_v2` and `provider_history_v3`, while current direct-address
+and manual-handoff requests use `provider_history_v4`. Redacted requests show
+only that request details were
 redacted. Keep the server bound to a trusted local interface; Trace v3 is not
 designed as a public or multi-user diagnostics API.
 
@@ -488,7 +492,9 @@ If records are selected, one `user` input item beginning with
 `INHERITED_MEMORY_CONTEXT` and canonical JSON is placed after earlier canonical
 chat history. For current direct-address turns it is followed by the trusted
 `ROOM_RESPONSE_DESTINATION` routing item and then Peter's triggering canonical
-message. The
+message. For a manual handoff, retrieval instead queries the exact canonical
+source message for the invoked AI and is followed by the final trusted
+`ROOM_HANDOFF_AUTHORIZATION` item; no Peter chat message is fabricated. The
 system instructions require Helios to use relevant inherited records, treat an
 earlier assistant claim of ignorance as a historical utterance rather than an
 override, and acknowledge remembered material as inherited continuity. Memory
@@ -516,6 +522,9 @@ the fixture is never submitted automatically.
   authorship, invokes only `destination`, and routes the resulting AI message to
   `response_destination`. Extra fields are rejected. Room posts reject a
   response destination.
+- `POST /api/handoffs` accepts only a positive integer `source_message_id`.
+  The server derives the invoked AI and return destination exclusively from
+  the latest canonical AI-to-AI message.
 - `GET /api/trace/latest` returns the latest recorded `main`-room turn through
   the read-only Trace v3 projection.
 - `GET /api/trace/{turn_id}` returns one recorded turn for a canonical positive
@@ -561,13 +570,30 @@ follow-up turn, or grants it agency; Peter must explicitly submit a separate
 request for that participant to respond.
 
 New request evidence records `explicit_response_destination_v1`, the exact
-resolved destination snapshot, v2 provider instructions, and
-`provider_history_v3`. Historical v1 instructions and `provider_history_v2`
-requests remain closed, immutable validation contracts. Under v3, a provider's
+resolved destination snapshot, v3 provider instructions, and
+`provider_history_v4`. Historical v1/v2 instructions and provider-history
+v2/v3 requests remain closed, immutable validation contracts. Under v4, a provider's
 own recorded responses remain native assistant/model history whether addressed
 to Peter, another participant, or the Room. Other participants receive those
 messages through the existing `ROOM_PARTICIPANT_MESSAGE` shared-history
 envelope.
+
+## Manual participant handoff
+
+When the latest canonical message is one active registered AI addressing a
+different active registered AI, the browser enables one global **Push to
+participant** button. Peter's click creates a provider-backed turn initiated by
+Peter, but it does not create a Peter message or duplicate the source. The
+server binds the exact source, responder, return route, configuration, and
+`manual_participant_handoff_v1` authorization evidence before making exactly
+one provider call.
+
+A successful handoff adds one canonical response whose turn sequence is 1 and
+whose `reply_to_id` points to the source message in its earlier turn. The
+response is routed back to the source sender. The new recipient remains inert
+until Peter presses Push again. Failed attempts add no AI message and may be
+retried by another explicit click; concurrent attempts for the same source are
+rejected while one is open.
 
 ## Run tests
 

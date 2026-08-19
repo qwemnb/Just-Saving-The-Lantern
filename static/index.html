@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Helios Room</title>
-    <link rel="stylesheet" href="/static/style.css?v=direct-participant-addressing-v1">
+    <link rel="stylesheet" href="/static/style.css?v=manual-participant-handoff-v1">
 </head>
 <body>
     <main class="container" id="app-shell">
@@ -36,6 +36,11 @@
             <div id="trace-command-status" class="trace-command-status" role="status" aria-live="polite"></div>
 
             <div class="input-area">
+                <div class="handoff-control">
+                    <button id="handoff-button" class="handoff-button" type="button" disabled>
+                        Push to next participant
+                    </button>
+                </div>
                 <form id="message-form" class="message-form">
                     <div class="destination-control" aria-label="Ask participant">
                         <span class="routing-label">Ask:</span>
@@ -82,6 +87,6 @@
         </section>
     </div>
 
-    <script src="/static/app.js?v=direct-participant-addressing-v1"></script>
+    <script src="/static/app.js?v=manual-participant-handoff-v1"></script>
 </body>
 </html>

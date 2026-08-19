@@ -15,6 +15,8 @@ const {
     DIRECTORY_READ_FALLBACK,
     POST_ERROR_FALLBACK,
     sendMessage,
+    sendHandoff,
+    eligibleHandoff,
     PARTICIPANT_COLOR_STORAGE_KEY,
     DEFAULT_PARTICIPANT_COLORS,
     NEUTRAL_PARTICIPANT_COLOR,
@@ -234,6 +236,7 @@ function makeDirectoryDocument() {
     const responseControl = doc.register('response-destination-control', 'label');
     responseControl.hidden = true;
     doc.register('response-destination-select', 'select');
+    doc.register('handoff-button', 'button');
     return doc;
 }
 
@@ -1033,8 +1036,8 @@ test('static read statuses, cache tokens, and focus-visible selectors are presen
     const css = fs.readFileSync(path.join(__dirname, '..', 'static', 'style.css'), 'utf8');
     assert.match(html, /id="history-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
     assert.match(html, /id="participant-read-status"[^>]*role="status"[^>]*aria-live="polite"/);
-    assert.match(html, /style\.css\?v=direct-participant-addressing-v1/);
-    assert.match(html, /app\.js\?v=direct-participant-addressing-v1/);
+    assert.match(html, /style\.css\?v=manual-participant-handoff-v1/);
+    assert.match(html, /app\.js\?v=manual-participant-handoff-v1/);
     assert.doesNotMatch(html, /gemini-participant-v1/);
     assert.match(css, /button:focus-visible/);
     assert.match(css, /input:focus-visible/);
@@ -1168,4 +1171,189 @@ test('canonical direct routes render naturally while bubble color remains author
     assert.match(allText(messages[1]), /Gemini -> Helios/);
     assert.equal(messages[0].style.getPropertyValue('--participant-color'), '#D39A2C');
     assert.equal(messages[1].style.getPropertyValue('--participant-color'), '#4F8FEA');
+});
+
+
+function routedMessage(id, sequence, senderKey, senderName, destinationKey, destinationName) {
+    return {
+        id,
+        room_sequence_no: sequence,
+        participant_key: senderKey,
+        message_text: `${senderName} message`,
+        created_at: '2026-08-17T12:00:00.000Z',
+        routing: {
+            routing_mode: 'explicit',
+            sender: { participant_key: senderKey, display_name: senderName },
+            destination: {
+                kind: 'participant',
+                participant_key: destinationKey,
+                display_name: destinationName
+            }
+        }
+    };
+}
+
+
+test('handoff eligibility is terminal, AI-to-AI, registered, and fail closed', () => {
+    const geminiToHelios = routedMessage(25, 7, 'gemini', 'Gemini', 'helios', 'Helios');
+    assert.deepEqual(eligibleHandoff([geminiToHelios], DIRECTORY), {
+        sourceMessageId: 25,
+        responderKey: 'helios',
+        responderName: 'Helios'
+    });
+    assert.equal(eligibleHandoff([
+        geminiToHelios,
+        routedMessage(26, 8, 'helios', 'Helios', 'gemini', 'Gemini')
+    ], DIRECTORY).responderKey, 'gemini');
+    for (const message of [
+        routedMessage(1, 1, 'peter', 'Peter', 'helios', 'Helios'),
+        routedMessage(1, 1, 'helios', 'Helios', 'peter', 'Peter'),
+        {
+            ...routedMessage(1, 1, 'helios', 'Helios', 'gemini', 'Gemini'),
+            routing: {
+                sender: { participant_key: 'helios', display_name: 'Helios' },
+                destination: { kind: 'room', display_name: 'Room' }
+            }
+        }
+    ]) assert.equal(eligibleHandoff([message], DIRECTORY), null);
+    assert.equal(eligibleHandoff([geminiToHelios], null), null);
+    const inactive = {
+        ...DIRECTORY,
+        destinations: DIRECTORY.destinations.map(item => (
+            item.participant_key === 'helios' ? { ...item, addressable: false } : item
+        ))
+    };
+    assert.equal(eligibleHandoff([geminiToHelios], inactive), null);
+});
+
+
+test('handoff POST contains only source id and ignores Ask and Reply-to state', async () => {
+    let history = [routedMessage(25, 7, 'gemini', 'Gemini', 'helios', 'Helios')];
+    const calls = [];
+    const fetchStub = async (url, options = {}) => {
+        calls.push({ url, options });
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages') return response(true, history);
+        if (url === '/api/handoffs') {
+            history = [...history, routedMessage(26, 8, 'helios', 'Helios', 'gemini', 'Gemini')];
+            return response(true, { status: 'completed', turn_id: 9 });
+        }
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    const doc = makeDirectoryDocument();
+    const controller = setupApp(doc, fetchStub);
+    await settle();
+    const button = doc.getElementById('handoff-button');
+    assert.equal(button.disabled, false);
+    assert.equal(button.textContent, 'Push to Helios');
+    await participantRow(doc, 'Gemini').querySelector('.participant-entry').dispatch('click');
+    const select = doc.getElementById('response-destination-select');
+    select.value = 'participant:peter';
+    await select.dispatch('change');
+    await button.dispatch('click');
+    const posts = calls.filter(call => call.url === '/api/handoffs');
+    assert.equal(posts.length, 1);
+    assert.deepEqual(JSON.parse(posts[0].options.body), { source_message_id: 25 });
+    assert.equal(controller.getSelectedDestination().participant_key, 'gemini');
+    assert.equal(button.textContent, 'Push to Gemini');
+});
+
+
+test('handoff busy state blocks rapid double clicks and disables composer controls', async () => {
+    const history = [routedMessage(25, 7, 'gemini', 'Gemini', 'helios', 'Helios')];
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    let handoffCalls = 0;
+    const fetchStub = async (url, options = {}) => {
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages') return response(true, history);
+        if (url === '/api/handoffs') {
+            handoffCalls += 1;
+            await blocked;
+            return response(true, { status: 'completed' });
+        }
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    const doc = makeDirectoryDocument();
+    setupApp(doc, fetchStub);
+    await settle();
+    const button = doc.getElementById('handoff-button');
+    const first = button.dispatch('click');
+    await settle();
+    const second = button.dispatch('click');
+    await settle();
+    assert.equal(handoffCalls, 1);
+    assert.equal(button.disabled, true);
+    assert.equal(button.textContent, 'Pushing to Helios...');
+    assert.equal(doc.getElementById('message-input').disabled, true);
+    assert.equal(doc.getElementById('destination-button').disabled, true);
+    assert.equal(doc.getElementById('response-destination-select').disabled, true);
+    assert.equal(doc.getElementById('handoff-button').disabled, true);
+    release();
+    await Promise.all([first, second]);
+});
+
+
+test('handoff failure reloads terminal state and safely restores the same action', async () => {
+    const history = [routedMessage(25, 7, 'gemini', 'Gemini', 'helios', 'Helios')];
+    const fetchStub = async (url, options = {}) => {
+        if (url === '/api/participants') return response(true, DIRECTORY);
+        if (url === '/api/messages') return response(true, history);
+        if (url === '/api/handoffs') return response(false, {
+            error: 'gemini_provider_failure',
+            message: '<script>private</script>',
+            turn_id: 12
+        }, 502);
+        throw new Error(`Unexpected URL ${url}`);
+    };
+    const doc = makeDirectoryDocument();
+    setupApp(doc, fetchStub);
+    await settle();
+    const button = doc.getElementById('handoff-button');
+    await button.dispatch('click');
+    assert.equal(button.disabled, false);
+    assert.equal(button.textContent, 'Push to Helios');
+    assert.equal(doc.activeElement, button);
+    assert.doesNotMatch(allText(doc.getElementById('messages')), /private|script/);
+});
+
+
+test('sendHandoff accepts no browser routing fields and uses safe errors', async () => {
+    let posted;
+    await sendHandoff(25, async (_url, options) => {
+        posted = JSON.parse(options.body);
+        return response(true, { status: 'completed' });
+    });
+    assert.deepEqual(posted, { source_message_id: 25 });
+    await assert.rejects(
+        sendHandoff(25, async () => response(false, {
+            error: 'handoff_source_stale', message: '<img PRIVATE>'
+        }, 409)),
+        error => error.message === 'A newer Room message has replaced this handoff.'
+            && !error.message.includes('PRIVATE')
+    );
+});
+
+
+test('Trace labels manual handoff authorization without changing trace version', () => {
+    const doc = makeDocument();
+    renderTrace(minimalTrace({
+        recorded_request: {
+            request: {},
+            local_context: {
+                handoff_version: 'manual_participant_handoff_v1',
+                handoff_authorization: {
+                    source_message_id: 25,
+                    source_turn_id: 8,
+                    responder: { display_name: 'Helios' },
+                    response_destination: { display_name: 'Gemini' }
+                }
+            }
+        }
+    }), doc);
+    const text = allText(doc.getElementById('trace-body'));
+    assert.match(text, /Manual Participant Handoff/);
+    assert.match(text, /Handoff source message:\s*25/);
+    assert.match(text, /Invoked responder:\s*Helios/);
+    assert.match(text, /Response destination:\s*Gemini/);
 });

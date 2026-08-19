@@ -321,7 +321,7 @@ class RoomServiceTests(unittest.TestCase):
             {
                 "active_policy_version": "room_shared_v1",
                 "effective_from_room_sequence_no": 1,
-                "projection_version": "provider_history_v3",
+                "projection_version": "provider_history_v4",
             },
         )
         self.assertEqual(

@@ -32,6 +32,7 @@ from app.database import (
 from app.gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS,
     GEMINI_SYSTEM_INSTRUCTIONS_V2,
+    GEMINI_SYSTEM_INSTRUCTIONS_V3,
     MAX_KEY_LENGTH,
     MAX_SAFE_INTEGER,
     MAX_STRING_LENGTH,
@@ -325,7 +326,7 @@ class GeminiIntegrationTests(unittest.TestCase):
         self.assertTrue(client.aio.closed)
         call = client.aio.models.calls[0]
         self.assertEqual(call["model"], "gemini-test")
-        self.assertEqual(call["config"].system_instruction, GEMINI_SYSTEM_INSTRUCTIONS_V2)
+        self.assertEqual(call["config"].system_instruction, GEMINI_SYSTEM_INSTRUCTIONS_V3)
         self.assertTrue(call["config"].automatic_function_calling.disable)
 
         with closing(connect_database(self.database_path)) as connection:

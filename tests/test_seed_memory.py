@@ -20,6 +20,7 @@ from app.room_service import TurnServiceError, run_helios_turn
 from app.request_validation import (
     OPENAI_SYSTEM_INSTRUCTIONS_V1,
     OPENAI_SYSTEM_INSTRUCTIONS_V2,
+    OPENAI_SYSTEM_INSTRUCTIONS_V3,
 )
 from app.seed_memory import (
     INHERITED_MEMORY_HEADER,
@@ -919,7 +920,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         self.assertEqual(context["records"][0]["memory_text"], synthetic_memory()["memory_text"])
         self.assertEqual(request["input"][-1], {"role": "user", "content": "Do you remember Glass Orchard?"})
         self.assertNotIn(str(synthetic_memory()["memory_text"]), request["instructions"])
-        self.assertEqual(request["instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V2)
+        self.assertEqual(request["instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V3)
         self.assertEqual(OPENAI_SYSTEM_INSTRUCTIONS_V1, EXPECTED_REVISED_SYSTEM_INSTRUCTIONS)
         self.assertEqual(
             request["reasoning"], {"effort": "medium", "context": "current_turn"}
@@ -956,7 +957,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         )
         self.assertNotIn("version_id", audit["selected"][0])
         self.assertTrue(config["config_label"].startswith("direct-address-openai-luna-v"))
-        self.assertEqual(config["system_instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V2)
+        self.assertEqual(config["system_instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V3)
         self.assertEqual(json.loads(config["settings_json"])["reasoning"]["effort"], "medium")
         trace = load_trace(self.database_path, result["turn_id"])
         self.assertEqual(
@@ -1058,7 +1059,7 @@ class SeedMemoryTurnAndTraceTests(SeedMemoryFixture):
         self.assertIsNotNone(new_config)
         self.assertNotEqual(new_config["id"], 3)
         self.assertEqual(used_ids, [new_config["id"], new_config["id"]])
-        self.assertEqual(new_config["system_instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V2)
+        self.assertEqual(new_config["system_instructions"], OPENAI_SYSTEM_INSTRUCTIONS_V3)
         self.assertEqual(
             json.loads(new_config["settings_json"])["reasoning"],
             {"context": "current_turn", "effort": "medium"},

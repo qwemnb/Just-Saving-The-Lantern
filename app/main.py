@@ -43,7 +43,8 @@ from .maintenance_lock import (
     ResetRecoveryRequiredError,
     acquire_database_lease,
 )
-from .models import MessageRequest
+from .models import HandoffRequest, MessageRequest
+from .handoff_service import run_manual_handoff
 from .openai_client import create_openai_client
 from .participant_registry import registration_for
 from .preflight import DatabasePreflightError, preflight_database
@@ -184,6 +185,27 @@ async def post_message(request: MessageRequest):
         )
     except IdentityServiceError as error:
         return _identity_error(error)
+
+
+@app.post("/api/handoffs")
+async def post_handoff(request: HandoffRequest):
+    """Authorize exactly one server-derived participant handoff."""
+
+    try:
+        result = await run_manual_handoff(
+            request.source_message_id,
+            database_path=app.state.database_path,
+            openai_client_factory=app.state.openai_client_factory,
+            gemini_client_factory=app.state.gemini_client_factory,
+            dotenv_path=app.state.dotenv_path,
+        )
+        return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+    except TurnServiceError as error:
+        return JSONResponse(
+            status_code=error.status_code,
+            content=error.as_payload(),
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 def _identity_error(error: IdentityServiceError) -> JSONResponse:

@@ -32,15 +32,15 @@ from .openai_client import (
 from .identity_service import current_alias, resolve_room_post_context
 from .provider_history import ProviderHistoryError, load_provider_history
 from .request_validation import (
-    HISTORY_VISIBILITY_V3,
+    HISTORY_VISIBILITY_V4,
     OPENAI_RESPONSE_SETTINGS as RESPONSE_SETTINGS,
     OPENAI_RESPONSE_TOOLS as RESPONSE_TOOLS,
-    OPENAI_SYSTEM_INSTRUCTIONS_V2 as SYSTEM_INSTRUCTIONS,
+    OPENAI_SYSTEM_INSTRUCTIONS_V3 as SYSTEM_INSTRUCTIONS,
     validate_recorded_openai_shared_request_payload,
 )
 from .turn_routing import (
     BoundResponseDestination,
-    PROVIDER_HISTORY_V3,
+    PROVIDER_HISTORY_V4,
     ResponseDestinationUnavailable,
     TURN_ROUTING_VERSION,
     build_openai_provider_input,
@@ -539,7 +539,7 @@ def _accept_turn(
                 "timeout_seconds": int(OPENAI_TIMEOUT_SECONDS),
                 "max_retries": OPENAI_MAX_RETRIES,
                 "memory_retrieval": memory_retrieval,
-                "history_visibility": dict(HISTORY_VISIBILITY_V3),
+                "history_visibility": dict(HISTORY_VISIBILITY_V4),
                 "turn_routing_version": TURN_ROUTING_VERSION,
                 "response_destination": response_route.evidence(),
             },
@@ -683,7 +683,7 @@ def _load_and_validate_history(
             room_id=room_id,
             boundary=boundary,
             provider_participant_key=HELIOS_KEY,
-            projection_version=PROVIDER_HISTORY_V3,
+            projection_version=PROVIDER_HISTORY_V4,
         )
     except ProviderHistoryError as error:
         raise TurnServiceError(

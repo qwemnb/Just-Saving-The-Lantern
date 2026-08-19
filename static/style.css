@@ -293,6 +293,34 @@ select:focus-visible {
     border-top: 1px solid #e0e0e0;
 }
 
+.handoff-control {
+    display: flex;
+    justify-content: flex-end;
+    padding-bottom: 0.65rem;
+}
+
+.handoff-button {
+    min-height: 40px;
+    padding: 0.55rem 1rem;
+    border: 2px solid #756aae;
+    border-radius: 999px;
+    color: #40366f;
+    background: #f4f1ff;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.handoff-button:hover:not(:disabled) {
+    background: #e8e2ff;
+}
+
+.handoff-button:disabled {
+    border-color: #d5d3dd;
+    color: #777480;
+    background: #efeff2;
+    cursor: not-allowed;
+}
+
 .message-form {
     display: flex;
     gap: 10px;

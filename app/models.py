@@ -39,3 +39,13 @@ class MessageRequest(BaseModel):
     destination: MessageDestination
     response_destination: MessageDestination | None = None
 
+
+class HandoffRequest(BaseModel):
+    """A browser request containing no routing or authorship authority."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_message_id: Annotated[
+        int, Field(strict=True, gt=0, le=9_223_372_036_854_775_807)
+    ]
+
