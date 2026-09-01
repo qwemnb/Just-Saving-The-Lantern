@@ -1005,7 +1005,12 @@ def _validate_event_family(
                 if routed
                 else GEMINI_SYSTEM_INSTRUCTIONS_V1
             )
-            or config["settings"] != gemini_recorded_settings()
+            or config["settings"]
+            != gemini_recorded_settings(
+                max_output_tokens=request_payload["request"]["config"][
+                    "max_output_tokens"
+                ]
+            )
             or config["tools"] != []
             or not isinstance(label, str)
             or not label.startswith(prefix)
@@ -1191,7 +1196,9 @@ def _validate_handoff_event_family(
             f"manual-handoff-google-{slug}-v",
         )
         expected_instructions = GEMINI_SYSTEM_INSTRUCTIONS_V3
-        expected_settings = gemini_recorded_settings()
+        expected_settings = gemini_recorded_settings(
+            max_output_tokens=payload["request"]["config"]["max_output_tokens"]
+        )
         expected_tools: Any = []
     else:
         role = model.removeprefix("gpt-5.6-") if isinstance(model, str) else ""

@@ -44,6 +44,8 @@ MAX_OBJECT_MEMBERS = 1_024
 MAX_ARRAY_ITEMS = 4_096
 MAX_KEY_LENGTH = 256
 MAX_STRING_LENGTH = 262_144
+GEMINI_LEGACY_MAX_OUTPUT_TOKENS = 2_048
+GEMINI_MAX_OUTPUT_TOKENS = 8_192
 TOKEN_COUNT_FIELDS = frozenset(
     {
         "prompt_token_count",
@@ -194,7 +196,7 @@ def generate_content_config() -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=GEMINI_SYSTEM_INSTRUCTIONS_V3,
         candidate_count=1,
-        max_output_tokens=2048,
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         response_modalities=["TEXT"],
         thinking_config=types.ThinkingConfig(
             include_thoughts=False,
@@ -207,10 +209,12 @@ def generate_content_config() -> types.GenerateContentConfig:
 
 def recorded_request_config(
     system_instructions: str = GEMINI_SYSTEM_INSTRUCTIONS_V1,
+    *,
+    max_output_tokens: int = GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any]:
     return {
         "candidate_count": 1,
-        "max_output_tokens": 2048,
+        "max_output_tokens": max_output_tokens,
         "response_modalities": ["TEXT"],
         "system_instruction": system_instructions,
         "thinking_config": {
@@ -221,12 +225,14 @@ def recorded_request_config(
     }
 
 
-def recorded_settings() -> dict[str, Any]:
+def recorded_settings(
+    *, max_output_tokens: int = GEMINI_LEGACY_MAX_OUTPUT_TOKENS
+) -> dict[str, Any]:
     return {
         "api_operation": "models.generate_content",
         "api_version": "v1beta",
         "candidate_count": 1,
-        "max_output_tokens": 2048,
+        "max_output_tokens": max_output_tokens,
         "response_modalities": ["TEXT"],
         "safety_settings": "provider_default",
         "sdk_policy": {"automatic_function_calling": {"disable": True}},
@@ -303,7 +309,10 @@ def content_from_recorded(value: Mapping[str, Any]) -> types.Content:
 
 
 def _validate_recorded_google_request_payload(
-    payload: Any, *, system_instructions: str
+    payload: Any,
+    *,
+    system_instructions: str,
+    max_output_tokens: int = GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any]:
 
     if not isinstance(payload, dict) or set(payload) != {"local_context", "request"}:
@@ -344,7 +353,9 @@ def _validate_recorded_google_request_payload(
         or not request["model"].strip()
     ):
         raise ValueError("invalid recorded Google request metadata")
-    if request["config"] != recorded_request_config(system_instructions):
+    if request["config"] != recorded_request_config(
+        system_instructions, max_output_tokens=max_output_tokens
+    ):
         raise ValueError("invalid recorded Google request configuration")
     contents = request["contents"]
     if not isinstance(contents, list) or not contents:
@@ -357,7 +368,9 @@ def validate_recorded_google_request_payload(payload: Any) -> dict[str, Any]:
     """Validate the exact historical Revision 4 Google request envelope."""
 
     return _validate_recorded_google_request_payload(
-        payload, system_instructions=GEMINI_SYSTEM_INSTRUCTIONS_V1
+        payload,
+        system_instructions=GEMINI_SYSTEM_INSTRUCTIONS_V1,
+        max_output_tokens=GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
     )
 
 
@@ -382,6 +395,26 @@ def validate_recorded_google_shared_request_payload(payload: Any) -> dict[str, A
     routed = set(local) == routed_fields
     handoff = set(local) == handoff_fields
     validate_history_visibility(local["history_visibility"])
+    projection = local["history_visibility"]["projection_version"]
+    raw_request = payload.get("request")
+    request_config = (
+        raw_request.get("config") if isinstance(raw_request, dict) else None
+    )
+    requested_max_output_tokens = (
+        request_config.get("max_output_tokens")
+        if isinstance(request_config, dict)
+        else None
+    )
+    allowed_max_output_tokens = (
+        {GEMINI_LEGACY_MAX_OUTPUT_TOKENS, GEMINI_MAX_OUTPUT_TOKENS}
+        if projection == PROVIDER_HISTORY_V4
+        else {GEMINI_LEGACY_MAX_OUTPUT_TOKENS}
+    )
+    if (
+        type(requested_max_output_tokens) is not int
+        or requested_max_output_tokens not in allowed_max_output_tokens
+    ):
+        raise ValueError("invalid Google output-token contract")
     legacy_local = dict(local)
     del legacy_local["history_visibility"]
     if routed or handoff:
@@ -404,9 +437,9 @@ def validate_recorded_google_shared_request_payload(payload: Any) -> dict[str, A
             if routed
             else GEMINI_SYSTEM_INSTRUCTIONS_V1
         ),
+        max_output_tokens=requested_max_output_tokens,
     )
     validate_memory_retrieval_evidence(local["memory_retrieval"])
-    projection = local["history_visibility"]["projection_version"]
     if handoff:
         authorization = validate_handoff_authorization(
             local["handoff_authorization"]

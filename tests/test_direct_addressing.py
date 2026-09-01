@@ -438,6 +438,7 @@ class DirectParticipantAddressingTests(unittest.TestCase):
         google_historical = json.loads(json.dumps(google_payload))
         google_historical["local_context"]["history_visibility"]["projection_version"] = "provider_history_v3"
         google_historical["request"]["config"]["system_instruction"] = GEMINI_SYSTEM_INSTRUCTIONS_V2
+        google_historical["request"]["config"]["max_output_tokens"] = 2_048
         validate_recorded_google_shared_request_payload(google_historical)
 
     def test_google_request_contract_rejects_every_legacy_routing_hybrid(self) -> None:

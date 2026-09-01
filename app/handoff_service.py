@@ -17,6 +17,7 @@ from .database import (
     store_message,
 )
 from .gemini_client import (
+    GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
     GEMINI_TIMEOUT_SECONDS,
     GEMINI_TOTAL_ATTEMPTS,
@@ -377,7 +378,10 @@ def _accept_handoff(
                 model=model,
             )
             request = {
-                "config": recorded_request_config(GEMINI_SYSTEM_INSTRUCTIONS_V3),
+                "config": recorded_request_config(
+                    GEMINI_SYSTEM_INSTRUCTIONS_V3,
+                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                ),
                 "contents": provider_input,
                 "model": model,
             }
@@ -840,7 +844,9 @@ def _assert_accepted(
     expected_settings = (
         canonical_json(OPENAI_RESPONSE_SETTINGS)
         if accepted.provider == "openai"
-        else canonical_json(recorded_settings())
+        else canonical_json(
+            recorded_settings(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS)
+        )
     )
     if (
         config is None

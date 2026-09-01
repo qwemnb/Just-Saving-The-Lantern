@@ -30,6 +30,8 @@ from app.database import (
     store_message,
 )
 from app.gemini_client import (
+    GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
+    GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_SYSTEM_INSTRUCTIONS,
     GEMINI_SYSTEM_INSTRUCTIONS_V2,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
@@ -274,6 +276,7 @@ class GeminiIntegrationTests(unittest.TestCase):
     def test_sdk_local_afc_is_disabled_and_absent_from_wire(self) -> None:
         config = generate_content_config()
         self.assertTrue(config.automatic_function_calling.disable)
+        self.assertEqual(config.max_output_tokens, GEMINI_MAX_OUTPUT_TOKENS)
         self.assertNotIn("automatic_function_calling", recorded_request_config())
         client = genai.Client(api_key="synthetic-only", vertexai=False, enterprise=False)
         self.addCleanup(client.close)
@@ -291,6 +294,95 @@ class GeminiIntegrationTests(unittest.TestCase):
         wire_keys = keys({"generationConfig": converted, **parent})
         self.assertNotIn("automatic_function_calling", wire_keys)
         self.assertNotIn("automaticFunctionCalling", wire_keys)
+
+    def test_output_limit_versions_new_requests_and_preserves_historical_v4(self) -> None:
+        with (
+            patch(
+                "app.gemini_client.GEMINI_MAX_OUTPUT_TOKENS",
+                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
+            ),
+            patch(
+                "app.gemini_service.GEMINI_MAX_OUTPUT_TOKENS",
+                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
+            ),
+        ):
+            historical_result, _client = self.run_turn(
+                success_response("historical output limit")
+            )
+
+        with closing(connect_database(self.database_path)) as connection:
+            historical_event = connection.execute(
+                """SELECT participant_config_id, payload_json
+                   FROM api_events WHERE turn_id=? AND sequence_no=1""",
+                (historical_result["turn_id"],),
+            ).fetchone()
+            historical_payload = json.loads(historical_event["payload_json"])
+            self.assertEqual(
+                historical_payload["request"]["config"]["max_output_tokens"],
+                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
+            )
+            historical_settings = json.loads(connection.execute(
+                "SELECT settings_json FROM participant_configs WHERE id=?",
+                (historical_event["participant_config_id"],),
+            ).fetchone()[0])
+            self.assertEqual(
+                historical_settings["max_output_tokens"],
+                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
+            )
+            self.assertIs(
+                validate_recorded_google_shared_request_payload(historical_payload),
+                historical_payload,
+            )
+            unsupported_payload = json.loads(json.dumps(historical_payload))
+            unsupported_payload["request"]["config"]["max_output_tokens"] = 4_096
+            with self.assertRaises(ValueError):
+                validate_recorded_google_shared_request_payload(unsupported_payload)
+
+        trace = load_trace(self.database_path, historical_result["turn_id"])
+        self.assertEqual(trace["turn"]["id"], historical_result["turn_id"])
+        with closing(connect_database(self.database_path)) as connection:
+            boundary = connection.execute(
+                "SELECT room_sequence_no FROM messages WHERE id=?",
+                (historical_result["gemini_message_id"],),
+            ).fetchone()[0]
+            history = load_provider_history(
+                connection,
+                room_id=1,
+                boundary=boundary,
+                provider_participant_key="gemini",
+                projection_version="provider_history_v4",
+            )
+            self.assertTrue(history)
+
+        current_result, _client = self.run_turn(success_response("current output limit"))
+        current_trace = load_trace(self.database_path, current_result["turn_id"])
+        self.assertEqual(current_trace["turn"]["id"], current_result["turn_id"])
+        with closing(connect_database(self.database_path)) as connection:
+            current_event = connection.execute(
+                """SELECT participant_config_id, payload_json
+                   FROM api_events WHERE turn_id=? AND sequence_no=1""",
+                (current_result["turn_id"],),
+            ).fetchone()
+            current_payload = json.loads(current_event["payload_json"])
+            self.assertEqual(
+                current_payload["request"]["config"]["max_output_tokens"],
+                GEMINI_MAX_OUTPUT_TOKENS,
+            )
+            self.assertNotEqual(
+                current_event["participant_config_id"],
+                historical_event["participant_config_id"],
+            )
+            settings_rows = connection.execute(
+                """SELECT config_label, settings_json FROM participant_configs
+                   WHERE model='gemini-test' ORDER BY id"""
+            ).fetchall()
+            self.assertEqual(
+                [
+                    json.loads(row["settings_json"])["max_output_tokens"]
+                    for row in settings_rows
+                ],
+                [GEMINI_LEGACY_MAX_OUTPUT_TOKENS, GEMINI_MAX_OUTPUT_TOKENS],
+            )
 
     def test_client_uses_explicit_developer_backend_under_hostile_environment(self) -> None:
         captured: dict[str, Any] = {}

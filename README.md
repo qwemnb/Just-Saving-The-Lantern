@@ -297,7 +297,7 @@ The current OpenAI provider settings are:
 
 - `store=False`
 - `reasoning={"effort": "medium", "context": "current_turn"}`
-- `max_output_tokens=2048`
+- `max_output_tokens=8192` for new Gemini requests; historical 2048-token request evidence remains valid
 - no tools
 - 120-second client timeout
 - zero SDK or application retries

@@ -20,6 +20,7 @@ from .database import (
     store_message,
 )
 from .gemini_client import (
+    GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
     GEMINI_TIMEOUT_SECONDS,
     GEMINI_TOTAL_ATTEMPTS,
@@ -333,7 +334,10 @@ def _accept_gemini_turn(
         # Typed conversion is part of Phase A validation, before durable acceptance.
         contents_from_recorded(contents)
         request = {
-            "config": recorded_request_config(GEMINI_SYSTEM_INSTRUCTIONS_V3),
+            "config": recorded_request_config(
+                GEMINI_SYSTEM_INSTRUCTIONS_V3,
+                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+            ),
             "contents": contents,
             "model": model,
         }
@@ -404,7 +408,9 @@ def find_or_create_gemini_configuration(
     gemini_id: int,
     model: str,
 ) -> int:
-    settings = canonical_json(recorded_settings())
+    settings = canonical_json(
+        recorded_settings(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS)
+    )
     tools = canonical_json([])
     slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-") or "model"
     prefix = f"direct-address-google-{slug}-v"
@@ -696,7 +702,10 @@ def _assert_accepted_evidence(
         or config["provider"] != GOOGLE_PROVIDER
         or config["model"] != accepted.model
         or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS_V3
-        or config["settings_json"] != canonical_json(recorded_settings())
+        or config["settings_json"]
+        != canonical_json(
+            recorded_settings(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS)
+        )
         or config["tools_json"] != "[]"
         or not isinstance(label, str)
         or not label.startswith(prefix)

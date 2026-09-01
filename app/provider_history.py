@@ -955,7 +955,12 @@ def _load_gemini_replay_uncached(
                 if routed
                 else GEMINI_SYSTEM_INSTRUCTIONS_V1
             )
-            or json.loads(config["settings_json"]) != recorded_settings()
+            or json.loads(config["settings_json"])
+            != recorded_settings(
+                max_output_tokens=request_payload["request"]["config"][
+                    "max_output_tokens"
+                ]
+            )
             or json.loads(config["tools_json"]) != []
             or not isinstance(label, str)
             or not label.startswith(prefix)
