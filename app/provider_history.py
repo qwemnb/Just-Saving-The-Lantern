@@ -15,7 +15,7 @@ from .gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS_V2,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
     model_content_from_stored_response,
-    recorded_settings,
+    recorded_settings_from_request_config,
     validate_recorded_google_shared_request_payload,
 )
 from .request_validation import (
@@ -956,10 +956,8 @@ def _load_gemini_replay_uncached(
                 else GEMINI_SYSTEM_INSTRUCTIONS_V1
             )
             or json.loads(config["settings_json"])
-            != recorded_settings(
-                max_output_tokens=request_payload["request"]["config"][
-                    "max_output_tokens"
-                ]
+            != recorded_settings_from_request_config(
+                request_payload["request"]["config"]
             )
             or json.loads(config["tools_json"]) != []
             or not isinstance(label, str)

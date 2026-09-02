@@ -20,8 +20,8 @@ from .database import (
     store_message,
 )
 from .gemini_client import (
-    GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
+    GEMINI_THINKING_POLICY_VERSION,
     GEMINI_TIMEOUT_SECONDS,
     GEMINI_TOTAL_ATTEMPTS,
     GeminiResponseSerializationError,
@@ -29,10 +29,11 @@ from .gemini_client import (
     contents_from_recorded,
     create_gemini_client,
     create_gemini_response,
+    generate_content_config,
     is_timeout_exception,
     load_gemini_environment,
-    recorded_request_config,
-    recorded_settings,
+    model_aware_request_contract,
+    recorded_settings_from_request_config,
     safe_gemini_exception_diagnostics,
     serialize_and_evaluate_response,
     validate_recorded_google_shared_request_payload,
@@ -124,11 +125,13 @@ async def run_gemini_turn(
     provider_exception: Exception | None = None
     response: Any | None = None
     try:
+        accepted_payload = json.loads(accepted.request_payload_json)
         client = factory(accepted.api_key)
         response = await create_gemini_response(
             client,
-            model=accepted.model,
-            contents=contents_from_recorded(accepted.recorded_contents),
+            model=accepted_payload["request"]["model"],
+            contents=contents_from_recorded(accepted_payload["request"]["contents"]),
+            recorded_config=accepted_payload["request"]["config"],
         )
     except asyncio.CancelledError as exception:
         raise _stranded_error(accepted) from exception
@@ -328,16 +331,20 @@ def _accept_gemini_turn(
                 message="HELIOS_GEMINI_MODEL is missing or blank.",
             )
         model = environment.model
-        config_id = find_or_create_gemini_configuration(
-            connection, gemini_id=destination["id"], model=model
+        _thinking_policy, request_config, configuration_settings = (
+            model_aware_request_contract(model, GEMINI_SYSTEM_INSTRUCTIONS_V3)
         )
-        # Typed conversion is part of Phase A validation, before durable acceptance.
+        generate_content_config(request_config)
+        config_id = find_or_create_gemini_configuration(
+            connection,
+            gemini_id=destination["id"],
+            model=model,
+            settings=configuration_settings,
+        )
+        # Typed content conversion is part of Phase A validation before acceptance.
         contents_from_recorded(contents)
         request = {
-            "config": recorded_request_config(
-                GEMINI_SYSTEM_INSTRUCTIONS_V3,
-                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-            ),
+            "config": request_config,
             "contents": contents,
             "model": model,
         }
@@ -356,12 +363,17 @@ def _accept_gemini_turn(
                 "total_attempts": GEMINI_TOTAL_ATTEMPTS,
                 "trigger_message_id": peter_message_id,
                 "history_visibility": dict(HISTORY_VISIBILITY_V4),
+                "gemini_thinking_policy_version": GEMINI_THINKING_POLICY_VERSION,
                 "turn_routing_version": TURN_ROUTING_VERSION,
                 "response_destination": response_route.evidence(),
             },
             "request": request,
         }
-        validate_recorded_google_shared_request_payload(request_payload)
+        validate_recorded_google_shared_request_payload(
+            request_payload,
+            _accepted_model=model,
+            _accepted_config=request_config,
+        )
         request_event_id = _insert_event(
             connection,
             accepted_ids=(turn_id, context["room_id"], destination["id"], config_id),
@@ -407,10 +419,13 @@ def find_or_create_gemini_configuration(
     *,
     gemini_id: int,
     model: str,
+    settings: Mapping[str, Any] | None = None,
 ) -> int:
-    settings = canonical_json(
-        recorded_settings(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS)
-    )
+    if settings is None:
+        _policy, _request_config, settings = model_aware_request_contract(
+            model, GEMINI_SYSTEM_INSTRUCTIONS_V3
+        )
+    settings_json = canonical_json(settings)
     tools = canonical_json([])
     slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-") or "model"
     prefix = f"direct-address-google-{slug}-v"
@@ -437,7 +452,7 @@ def find_or_create_gemini_configuration(
                 row["provider"] == GOOGLE_PROVIDER
                 and row["model"] == model
                 and row["system_instructions"] == GEMINI_SYSTEM_INSTRUCTIONS_V3
-                and row["settings_json"] == settings
+                and row["settings_json"] == settings_json
                 and row["tools_json"] == tools
             ):
                 matches.append(row["id"])
@@ -461,7 +476,7 @@ def find_or_create_gemini_configuration(
             model,
             label,
             GEMINI_SYSTEM_INSTRUCTIONS_V3,
-            settings,
+            settings_json,
             tools,
         ),
     ).lastrowid
@@ -704,7 +719,9 @@ def _assert_accepted_evidence(
         or config["system_instructions"] != GEMINI_SYSTEM_INSTRUCTIONS_V3
         or config["settings_json"]
         != canonical_json(
-            recorded_settings(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS)
+            recorded_settings_from_request_config(
+                request_payload["request"]["config"]
+            )
         )
         or config["tools_json"] != "[]"
         or not isinstance(label, str)

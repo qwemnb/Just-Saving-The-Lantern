@@ -99,14 +99,20 @@ HELIOS_GEMINI_MODEL=gemini-3.6-flash
 ```
 
 The Google client is forced onto the Developer API with `v1beta`, a 120-second
-timeout, one total attempt, no tools, one text candidate, 2,048 output tokens,
-medium thinking with thoughts excluded, provider-default safety, and SDK
-automatic function calling explicitly disabled. Hostile ambient Vertex,
-Enterprise, project, location, and alternate-key variables cannot select its
-backend or credential. Changing the model creates or reuses a new immutable
-Gemini configuration; it never rewrites earlier provenance. Provider keys
-stay server-side and are never stored in messages, events, Trace, or browser
-responses.
+timeout, one total attempt, no tools, one text candidate, provider-default
+safety, and SDK automatic function calling explicitly disabled. Helios Room
+selects the thinking mechanism from a closed model-family policy: Gemini 3
+uses `thinking_level=medium` with an 8,192-token output limit; Gemini 2.5
+Flash-Lite uses `thinking_budget=0` with an 8,192-token limit; and supported
+thinking-enabled Gemini 2.5 models use `thinking_budget=8192` with a
+16,384-token limit. Unknown model IDs receive no explicit thinking control and
+record `provider_default`, rather than receiving a guessed parameter.
+Historical 2,048- and 8,192-token request evidence remains valid exactly as
+recorded. Hostile ambient Vertex, Enterprise, project, location, and
+alternate-key variables cannot select the backend or credential. Each distinct
+effective model policy creates or reuses an immutable Gemini configuration; it
+never rewrites earlier provenance. Provider keys stay server-side and are never
+stored in messages, events, Trace, or browser responses.
 
 ## Initialize the database
 
@@ -297,7 +303,7 @@ The current OpenAI provider settings are:
 
 - `store=False`
 - `reasoning={"effort": "medium", "context": "current_turn"}`
-- `max_output_tokens=8192` for new Gemini requests; historical 2048-token request evidence remains valid
+- `max_output_tokens=8192`
 - no tools
 - 120-second client timeout
 - zero SDK or application retries
@@ -401,7 +407,10 @@ Trace applies a display-only privacy projection without changing stored JSON.
 Secret-like fields and raw or encrypted provider reasoning are omitted. An
 explicitly recorded provider-generated reasoning summary may be displayed and
 is labelled as a summary, while usage totals can still include aggregate
-reasoning-token counts. Omission locations are reported as JSON Pointers.
+reasoning-token counts. Omission locations are reported as JSON Pointers. For
+Gemini SDK `APIError` failures, Trace may show only bounded, validated HTTP
+status, provider status, and provider message fields; headers, bodies, details,
+response objects, exception representations, and credentials are never stored.
 
 Trace exposes the shared canonical room history, exact system instructions,
 request settings, and operational provenance. For unredacted requests it shows

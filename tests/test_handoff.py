@@ -89,7 +89,10 @@ class ManualParticipantHandoffTests(unittest.TestCase):
         openai_factory = Mock(side_effect=AssertionError("OpenAI must remain inert"))
         with patch.dict(
             os.environ,
-            {"GEMINI_API_KEY": SYNTHETIC_KEY, "HELIOS_GEMINI_MODEL": "gemini-test"},
+            {
+                "GEMINI_API_KEY": SYNTHETIC_KEY,
+                "HELIOS_GEMINI_MODEL": "gemini-2.5-flash-lite",
+            },
             clear=True,
         ):
             result = asyncio.run(run_manual_handoff(
@@ -104,6 +107,10 @@ class ManualParticipantHandoffTests(unittest.TestCase):
         self.assertEqual(
             gemini_client.aio.models.calls[0]["config"].max_output_tokens, 8_192
         )
+        thinking = gemini_client.aio.models.calls[0]["config"].thinking_config
+        self.assertEqual(thinking.thinking_budget, 0)
+        self.assertIsNone(thinking.thinking_level)
+        self.assertIs(thinking.include_thoughts, False)
         call_contents = gemini_client.aio.models.calls[0]["contents"]
         self.assertTrue(call_contents[-1].parts[0].text.startswith(ROOM_HANDOFF_AUTHORIZATION + "\n"))
         self.assertFalse(any(item.parts[0].text == "Peter authorizes this response." for item in call_contents))
@@ -129,7 +136,15 @@ class ManualParticipantHandoffTests(unittest.TestCase):
             self.assertEqual(payload["local_context"]["handoff_version"], HANDOFF_PROTOCOL_VERSION)
             self.assertEqual(payload["local_context"]["history_visibility"]["projection_version"], "provider_history_v4")
             self.assertEqual(payload["local_context"]["handoff_authorization"]["source_message_id"], source_id)
+            self.assertEqual(
+                payload["local_context"]["gemini_thinking_policy_version"],
+                "model_aware_v1",
+            )
             self.assertEqual(payload["request"]["config"]["max_output_tokens"], 8_192)
+            self.assertEqual(
+                payload["request"]["config"]["thinking_config"],
+                {"include_thoughts": False, "thinking_budget": 0},
+            )
         trace = load_trace(self.database, result["turn_id"])
         self.assertEqual(trace["trace_version"], 3)
         self.assertEqual(trace["turn"]["initiated_by"]["participant_key"], "peter")

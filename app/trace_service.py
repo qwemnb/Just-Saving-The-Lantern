@@ -18,10 +18,12 @@ from .gemini_client import (
     GEMINI_SYSTEM_INSTRUCTIONS_V1,
     GEMINI_SYSTEM_INSTRUCTIONS_V2,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
+    GEMINI_PROVIDER_STATUS_PATTERN,
     MAX_SAFE_INTEGER,
     TOKEN_COUNT_FIELDS as GEMINI_TOKEN_COUNT_FIELDS,
     content_from_recorded,
-    recorded_settings as gemini_recorded_settings,
+    is_safe_gemini_provider_message,
+    recorded_settings_from_request_config,
     validate_bounded_stored_response,
     validate_recorded_google_shared_request_payload,
     validate_stored_success_response,
@@ -1006,10 +1008,8 @@ def _validate_event_family(
                 else GEMINI_SYSTEM_INSTRUCTIONS_V1
             )
             or config["settings"]
-            != gemini_recorded_settings(
-                max_output_tokens=request_payload["request"]["config"][
-                    "max_output_tokens"
-                ]
+            != recorded_settings_from_request_config(
+                request_payload["request"]["config"]
             )
             or config["tools"] != []
             or not isinstance(label, str)
@@ -1196,8 +1196,8 @@ def _validate_handoff_event_family(
             f"manual-handoff-google-{slug}-v",
         )
         expected_instructions = GEMINI_SYSTEM_INSTRUCTIONS_V3
-        expected_settings = gemini_recorded_settings(
-            max_output_tokens=payload["request"]["config"]["max_output_tokens"]
+        expected_settings = recorded_settings_from_request_config(
+            payload["request"]["config"]
         )
         expected_tools: Any = []
     else:
@@ -1364,7 +1364,13 @@ def _validate_google_error_payload(payload: Any) -> None:
                 "reason": reason,
                 "summary": "The Gemini provider request failed.",
             }
-            optional = {"http_status", "provider_error_code", "provider_request_id"}
+            optional = {
+                "http_status",
+                "provider_error_code",
+                "provider_request_id",
+                "provider_status",
+                "provider_message",
+            }
         elif reason == "gemini_provider_timeout":
             required = {
                 "error_class": "TimeoutError",
@@ -1395,6 +1401,16 @@ def _validate_google_error_payload(payload: Any) -> None:
                 or re.fullmatch(rf"[A-Za-z0-9_.:-]{{1,{limit}}}", error[key]) is None
             ):
                 raise _data_invalid()
+        if "provider_status" in error and (
+            not isinstance(error["provider_status"], str)
+            or GEMINI_PROVIDER_STATUS_PATTERN.fullmatch(error["provider_status"])
+            is None
+        ):
+            raise _data_invalid()
+        if "provider_message" in error and not is_safe_gemini_provider_message(
+            error["provider_message"]
+        ):
+            raise _data_invalid()
         return
     if set(payload) != {"error", "response"}:
         raise _data_invalid()
@@ -1566,8 +1582,16 @@ def _project_error_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], lis
     if isinstance(payload.get("error"), dict):
         projected, omissions = _allowlisted_mapping(
             payload["error"],
-            ("reason", "error_class", "http_status", "provider_error_code",
-             "provider_request_id", "summary"),
+            (
+                "reason",
+                "error_class",
+                "http_status",
+                "provider_error_code",
+                "provider_request_id",
+                "provider_status",
+                "provider_message",
+                "summary",
+            ),
             ("error",),
         )
         for key in payload:

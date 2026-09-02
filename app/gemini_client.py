@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import Enum
@@ -18,6 +19,7 @@ from typing import Any, Callable
 import httpx
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from .request_validation import (
@@ -46,6 +48,30 @@ MAX_KEY_LENGTH = 256
 MAX_STRING_LENGTH = 262_144
 GEMINI_LEGACY_MAX_OUTPUT_TOKENS = 2_048
 GEMINI_MAX_OUTPUT_TOKENS = 8_192
+GEMINI_25_THINKING_MAX_OUTPUT_TOKENS = 16_384
+GEMINI_THINKING_POLICY_VERSION = "model_aware_v1"
+GEMINI_PROVIDER_MESSAGE_MAX_CHARS = 512
+GEMINI_PROVIDER_MESSAGE_MAX_BYTES = 2_048
+GEMINI_PROVIDER_STATUS_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_SENSITIVE_PROVIDER_MESSAGE_PATTERN = re.compile(
+    r"(?i)(?:authorization\s*[:=]|bearer\s+\S|x-goog-api-key\s*[:=]|"
+    r"(?:api[-_ ]?key|client_secret|access_token)\s*[:=]\s*\S|"
+    r"AIza[0-9A-Za-z_-]{16,}|\.env(?:\W|$))"
+)
+GEMINI_3_LEVEL_MODELS = frozenset(
+    {
+        "gemini-3-flash-preview",
+        "gemini-3-pro-preview",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+    }
+)
+GEMINI_25_FLASH_LITE_MODELS = frozenset({"gemini-2.5-flash-lite"})
+GEMINI_25_BUDGET_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-pro"})
 TOKEN_COUNT_FIELDS = frozenset(
     {
         "prompt_token_count",
@@ -72,6 +98,77 @@ FAILURE_KINDS = frozenset(
     }
 )
 PART_FIELDS = frozenset({"text", "thought", "thought_signature_b64"})
+
+
+@dataclasses.dataclass(frozen=True)
+class GeminiThinkingPolicy:
+    mode: str
+    include_thoughts: bool | None
+    level: str | None
+    budget: int | None
+    max_output_tokens: int
+
+    def request_thinking_config(self) -> dict[str, Any] | None:
+        if self.mode == "provider_default":
+            return None
+        if self.mode == "thinking_level":
+            return {
+                "include_thoughts": self.include_thoughts,
+                "thinking_level": self.level,
+            }
+        if self.mode == "thinking_budget":
+            return {
+                "include_thoughts": self.include_thoughts,
+                "thinking_budget": self.budget,
+            }
+        raise ValueError("invalid Gemini thinking policy")
+
+    def settings_evidence(self) -> dict[str, Any]:
+        if self.mode == "provider_default":
+            return {"mode": "provider_default"}
+        if self.mode == "thinking_level":
+            return {"include_thoughts": self.include_thoughts, "level": self.level}
+        if self.mode == "thinking_budget":
+            return {"include_thoughts": self.include_thoughts, "budget": self.budget}
+        raise ValueError("invalid Gemini thinking policy")
+
+
+def resolve_gemini_thinking_policy(model: str) -> GeminiThinkingPolicy:
+    """Resolve one closed thinking policy from an exact configured model ID."""
+
+    if not isinstance(model, str) or not model or model != model.strip():
+        raise ValueError("invalid Gemini model")
+    if model in GEMINI_3_LEVEL_MODELS:
+        return GeminiThinkingPolicy(
+            mode="thinking_level",
+            include_thoughts=False,
+            level="medium",
+            budget=None,
+            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+        )
+    if model in GEMINI_25_FLASH_LITE_MODELS:
+        return GeminiThinkingPolicy(
+            mode="thinking_budget",
+            include_thoughts=False,
+            level=None,
+            budget=0,
+            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+        )
+    if model in GEMINI_25_BUDGET_MODELS:
+        return GeminiThinkingPolicy(
+            mode="thinking_budget",
+            include_thoughts=False,
+            level=None,
+            budget=8_192,
+            max_output_tokens=GEMINI_25_THINKING_MAX_OUTPUT_TOKENS,
+        )
+    return GeminiThinkingPolicy(
+        mode="provider_default",
+        include_thoughts=None,
+        level=None,
+        budget=None,
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+    )
 
 
 GEMINI_SYSTEM_INSTRUCTIONS_V1 = (
@@ -192,21 +289,6 @@ def create_gemini_client(
     )
 
 
-def generate_content_config() -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
-        system_instruction=GEMINI_SYSTEM_INSTRUCTIONS_V3,
-        candidate_count=1,
-        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-        response_modalities=["TEXT"],
-        thinking_config=types.ThinkingConfig(
-            include_thoughts=False,
-            thinking_level="medium",
-        ),
-        tools=[],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-    )
-
-
 def recorded_request_config(
     system_instructions: str = GEMINI_SYSTEM_INSTRUCTIONS_V1,
     *,
@@ -223,6 +305,26 @@ def recorded_request_config(
         },
         "tools": [],
     }
+
+
+def model_aware_request_contract(
+    model: str,
+    system_instructions: str = GEMINI_SYSTEM_INSTRUCTIONS_V3,
+) -> tuple[GeminiThinkingPolicy, dict[str, Any], dict[str, Any]]:
+    """Resolve once and return the exact request/configuration evidence."""
+
+    policy = resolve_gemini_thinking_policy(model)
+    request_config: dict[str, Any] = {
+        "candidate_count": 1,
+        "max_output_tokens": policy.max_output_tokens,
+        "response_modalities": ["TEXT"],
+        "system_instruction": system_instructions,
+        "tools": [],
+    }
+    thinking_config = policy.request_thinking_config()
+    if thinking_config is not None:
+        request_config["thinking_config"] = thinking_config
+    return policy, request_config, recorded_settings_for_policy(policy)
 
 
 def recorded_settings(
@@ -242,16 +344,121 @@ def recorded_settings(
     }
 
 
+def recorded_settings_for_policy(policy: GeminiThinkingPolicy) -> dict[str, Any]:
+    return {
+        "api_operation": "models.generate_content",
+        "api_version": "v1beta",
+        "candidate_count": 1,
+        "max_output_tokens": policy.max_output_tokens,
+        "response_modalities": ["TEXT"],
+        "safety_settings": "provider_default",
+        "sdk_policy": {"automatic_function_calling": {"disable": True}},
+        "thinking": policy.settings_evidence(),
+        "timeout_seconds": GEMINI_TIMEOUT_SECONDS,
+        "total_attempts": GEMINI_TOTAL_ATTEMPTS,
+    }
+
+
+def _policy_from_recorded_request_config(
+    config: Mapping[str, Any],
+) -> GeminiThinkingPolicy:
+    base_fields = {
+        "candidate_count",
+        "max_output_tokens",
+        "response_modalities",
+        "system_instruction",
+        "tools",
+    }
+    fields = set(config) if isinstance(config, Mapping) else set()
+    if (
+        not isinstance(config, Mapping)
+        or (fields != base_fields and fields != base_fields | {"thinking_config"})
+        or config.get("candidate_count") != 1
+        or type(config.get("max_output_tokens")) is not int
+        or config["max_output_tokens"] <= 0
+        or config.get("response_modalities") != ["TEXT"]
+        or not isinstance(config.get("system_instruction"), str)
+        or not config["system_instruction"]
+        or config.get("tools") != []
+    ):
+        raise ValueError("invalid recorded Gemini request configuration")
+    max_output_tokens = config["max_output_tokens"]
+    if "thinking_config" not in config:
+        return GeminiThinkingPolicy(
+            mode="provider_default",
+            include_thoughts=None,
+            level=None,
+            budget=None,
+            max_output_tokens=max_output_tokens,
+        )
+    thinking = config["thinking_config"]
+    if not isinstance(thinking, Mapping):
+        raise ValueError("invalid recorded Gemini thinking configuration")
+    if set(thinking) == {"include_thoughts", "thinking_level"}:
+        if thinking.get("include_thoughts") is not False or thinking.get(
+            "thinking_level"
+        ) != "medium":
+            raise ValueError("invalid recorded Gemini thinking level")
+        return GeminiThinkingPolicy(
+            mode="thinking_level",
+            include_thoughts=False,
+            level="medium",
+            budget=None,
+            max_output_tokens=max_output_tokens,
+        )
+    if set(thinking) == {"include_thoughts", "thinking_budget"}:
+        budget = thinking.get("thinking_budget")
+        if thinking.get("include_thoughts") is not False or type(budget) is not int:
+            raise ValueError("invalid recorded Gemini thinking budget")
+        return GeminiThinkingPolicy(
+            mode="thinking_budget",
+            include_thoughts=False,
+            level=None,
+            budget=budget,
+            max_output_tokens=max_output_tokens,
+        )
+    raise ValueError("invalid recorded Gemini thinking configuration")
+
+
+def recorded_settings_from_request_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    return recorded_settings_for_policy(_policy_from_recorded_request_config(config))
+
+
+def generate_content_config(
+    recorded_config: Mapping[str, Any] | None = None,
+) -> types.GenerateContentConfig:
+    if recorded_config is None:
+        _policy, recorded_config, _settings = model_aware_request_contract(
+            "gemini-3.6-flash"
+        )
+    policy = _policy_from_recorded_request_config(recorded_config)
+    thinking = policy.request_thinking_config()
+    return types.GenerateContentConfig(
+        system_instruction=recorded_config["system_instruction"],
+        candidate_count=recorded_config["candidate_count"],
+        max_output_tokens=recorded_config["max_output_tokens"],
+        response_modalities=list(recorded_config["response_modalities"]),
+        thinking_config=(
+            types.ThinkingConfig(**thinking) if thinking is not None else None
+        ),
+        tools=[],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+
 async def create_gemini_response(
     client: Any,
     *,
     model: str,
     contents: list[types.Content],
+    recorded_config: Mapping[str, Any],
 ) -> Any:
     return await client.aio.models.generate_content(
         model=model,
         contents=contents,
-        config=generate_content_config(),
+        config=generate_content_config(recorded_config),
     )
 
 
@@ -313,6 +520,7 @@ def _validate_recorded_google_request_payload(
     *,
     system_instructions: str,
     max_output_tokens: int = GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
+    expected_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
 
     if not isinstance(payload, dict) or set(payload) != {"local_context", "request"}:
@@ -353,9 +561,10 @@ def _validate_recorded_google_request_payload(
         or not request["model"].strip()
     ):
         raise ValueError("invalid recorded Google request metadata")
-    if request["config"] != recorded_request_config(
+    expected = expected_config or recorded_request_config(
         system_instructions, max_output_tokens=max_output_tokens
-    ):
+    )
+    if request["config"] != expected:
         raise ValueError("invalid recorded Google request configuration")
     contents = request["contents"]
     if not isinstance(contents, list) or not contents:
@@ -374,8 +583,16 @@ def validate_recorded_google_request_payload(payload: Any) -> dict[str, Any]:
     )
 
 
-def validate_recorded_google_shared_request_payload(payload: Any) -> dict[str, Any]:
+def validate_recorded_google_shared_request_payload(
+    payload: Any,
+    *,
+    _accepted_model: str | None = None,
+    _accepted_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate the closed room-shared Google request envelope."""
+
+    if (_accepted_model is None) != (_accepted_config is None):
+        raise ValueError("incomplete accepted Gemini request contract")
 
     if not isinstance(payload, dict) or set(payload) != {"local_context", "request"}:
         raise ValueError("invalid recorded Google shared request envelope")
@@ -388,12 +605,24 @@ def validate_recorded_google_shared_request_payload(payload: Any) -> dict[str, A
     }
     routed_fields = legacy_fields | {"turn_routing_version", "response_destination"}
     handoff_fields = routed_fields | {"handoff_version", "handoff_authorization"}
+    model_aware_routed_fields = routed_fields | {
+        "gemini_thinking_policy_version"
+    }
+    model_aware_handoff_fields = handoff_fields | {
+        "gemini_thinking_policy_version"
+    }
     if not isinstance(local, dict) or frozenset(local) not in {
-        frozenset(legacy_fields), frozenset(routed_fields), frozenset(handoff_fields)
+        frozenset(legacy_fields),
+        frozenset(routed_fields),
+        frozenset(handoff_fields),
+        frozenset(model_aware_routed_fields),
+        frozenset(model_aware_handoff_fields),
     }:
         raise ValueError("missing Google history visibility evidence")
-    routed = set(local) == routed_fields
-    handoff = set(local) == handoff_fields
+    local_fields = set(local)
+    routed = local_fields == routed_fields or local_fields == model_aware_routed_fields
+    handoff = local_fields == handoff_fields or local_fields == model_aware_handoff_fields
+    model_aware = "gemini_thinking_policy_version" in local
     validate_history_visibility(local["history_visibility"])
     projection = local["history_visibility"]["projection_version"]
     raw_request = payload.get("request")
@@ -405,18 +634,51 @@ def validate_recorded_google_shared_request_payload(payload: Any) -> dict[str, A
         if isinstance(request_config, dict)
         else None
     )
-    allowed_max_output_tokens = (
-        {GEMINI_LEGACY_MAX_OUTPUT_TOKENS, GEMINI_MAX_OUTPUT_TOKENS}
-        if projection == PROVIDER_HISTORY_V4
-        else {GEMINI_LEGACY_MAX_OUTPUT_TOKENS}
-    )
-    if (
-        type(requested_max_output_tokens) is not int
-        or requested_max_output_tokens not in allowed_max_output_tokens
-    ):
-        raise ValueError("invalid Google output-token contract")
+    if model_aware:
+        if (
+            local.get("gemini_thinking_policy_version")
+            != GEMINI_THINKING_POLICY_VERSION
+            or projection != PROVIDER_HISTORY_V4
+            or not (routed or handoff)
+            or not isinstance(raw_request, dict)
+        ):
+            raise ValueError("invalid Google model-aware thinking contract")
+        if _accepted_config is not None:
+            if (
+                raw_request.get("model") != _accepted_model
+                or raw_request.get("config") != _accepted_config
+            ):
+                raise ValueError("accepted Google thinking contract changed")
+            expected_config = dict(_accepted_config)
+        else:
+            _policy, expected_config, _settings = model_aware_request_contract(
+                raw_request.get("model"), GEMINI_SYSTEM_INSTRUCTIONS_V3
+            )
+    else:
+        if _accepted_config is not None:
+            raise ValueError("accepted Google thinking marker is missing")
+        allowed_max_output_tokens = (
+            {GEMINI_LEGACY_MAX_OUTPUT_TOKENS, GEMINI_MAX_OUTPUT_TOKENS}
+            if projection == PROVIDER_HISTORY_V4
+            else {GEMINI_LEGACY_MAX_OUTPUT_TOKENS}
+        )
+        if (
+            type(requested_max_output_tokens) is not int
+            or requested_max_output_tokens not in allowed_max_output_tokens
+        ):
+            raise ValueError("invalid Google output-token contract")
+        expected_config = recorded_request_config(
+            GEMINI_SYSTEM_INSTRUCTIONS_V3
+            if handoff or (routed and projection == PROVIDER_HISTORY_V4)
+            else GEMINI_SYSTEM_INSTRUCTIONS_V2
+            if routed
+            else GEMINI_SYSTEM_INSTRUCTIONS_V1,
+            max_output_tokens=requested_max_output_tokens,
+        )
     legacy_local = dict(local)
     del legacy_local["history_visibility"]
+    if model_aware:
+        del legacy_local["gemini_thinking_policy_version"]
     if routed or handoff:
         del legacy_local["turn_routing_version"]
         del legacy_local["response_destination"]
@@ -425,19 +687,8 @@ def validate_recorded_google_shared_request_payload(payload: Any) -> dict[str, A
         del legacy_local["handoff_authorization"]
     _validate_recorded_google_request_payload(
         {"local_context": legacy_local, "request": payload["request"]},
-        system_instructions=(
-            GEMINI_SYSTEM_INSTRUCTIONS_V3
-            if handoff
-            or (
-                routed
-                and local["history_visibility"]["projection_version"]
-                == PROVIDER_HISTORY_V4
-            )
-            else GEMINI_SYSTEM_INSTRUCTIONS_V2
-            if routed
-            else GEMINI_SYSTEM_INSTRUCTIONS_V1
-        ),
-        max_output_tokens=requested_max_output_tokens,
+        system_instructions=expected_config["system_instruction"],
+        expected_config=expected_config,
     )
     validate_memory_retrieval_evidence(local["memory_retrieval"])
     if handoff:
@@ -776,6 +1027,10 @@ def _valid_usage(value: Any) -> bool:
     return True
 
 
+def is_timeout_exception(exception: BaseException) -> bool:
+    return isinstance(exception, (TimeoutError, httpx.TimeoutException))
+
+
 def safe_gemini_exception_diagnostics(
     exception: BaseException,
     *,
@@ -791,32 +1046,47 @@ def safe_gemini_exception_diagnostics(
             else "The Gemini provider request failed."
         ),
     }
-    status = _safe_exception_attribute(exception, "status_code")
-    if type(status) is int and 100 <= status <= 599:
-        diagnostics["http_status"] = status
-    code = _safe_exception_attribute(exception, "code")
+    if timeout or not isinstance(exception, genai_errors.APIError):
+        return diagnostics
+    try:
+        http_status = getattr(exception, "code")
+        provider_status = getattr(exception, "status")
+        provider_message = getattr(exception, "message")
+    except Exception:
+        return diagnostics
+    if type(http_status) is int and 400 <= http_status <= 599:
+        diagnostics["http_status"] = http_status
     if (
-        isinstance(code, str)
-        and (not api_key or api_key not in code)
-        and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", code)
+        isinstance(provider_status, str)
+        and (not api_key or api_key not in provider_status)
+        and GEMINI_PROVIDER_STATUS_PATTERN.fullmatch(provider_status) is not None
     ):
-        diagnostics["provider_error_code"] = code
-    request_id = _safe_exception_attribute(exception, "request_id")
-    if (
-        isinstance(request_id, str)
-        and (not api_key or api_key not in request_id)
-        and re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", request_id)
-    ):
-        diagnostics["provider_request_id"] = request_id
+        diagnostics["provider_status"] = provider_status
+    if is_safe_gemini_provider_message(provider_message, api_key=api_key):
+        diagnostics["provider_message"] = provider_message
     return diagnostics
 
 
-def is_timeout_exception(exception: BaseException) -> bool:
-    return isinstance(exception, (TimeoutError, httpx.TimeoutException))
-
-
-def _safe_exception_attribute(exception: BaseException, name: str) -> Any:
+def is_safe_gemini_provider_message(value: Any, *, api_key: str = "") -> bool:
+    if not isinstance(value, str):
+        return False
     try:
-        return getattr(exception, name, None)
+        if (
+            not value
+            or value != value.strip()
+            or value != unicodedata.normalize("NFC", value)
+            or len(value) > GEMINI_PROVIDER_MESSAGE_MAX_CHARS
+            or len(value.encode("utf-8")) > GEMINI_PROVIDER_MESSAGE_MAX_BYTES
+            or "<" in value
+            or ">" in value
+            or (api_key and api_key in value)
+            or _SENSITIVE_PROVIDER_MESSAGE_PATTERN.search(value) is not None
+        ):
+            return False
+        return all(
+            not unicodedata.category(character).startswith("C")
+            and unicodedata.category(character) not in {"Zl", "Zp"}
+            for character in value
+        )
     except Exception:
-        return None
+        return False

@@ -17,8 +17,8 @@ from .database import (
     store_message,
 )
 from .gemini_client import (
-    GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
+    GEMINI_THINKING_POLICY_VERSION,
     GEMINI_TIMEOUT_SECONDS,
     GEMINI_TOTAL_ATTEMPTS,
     GeminiResponseSerializationError,
@@ -26,10 +26,11 @@ from .gemini_client import (
     contents_from_recorded,
     create_gemini_client,
     create_gemini_response,
+    generate_content_config,
     is_timeout_exception as is_gemini_timeout,
     load_gemini_environment,
-    recorded_request_config,
-    recorded_settings,
+    model_aware_request_contract,
+    recorded_settings_from_request_config,
     safe_gemini_exception_diagnostics,
     serialize_and_evaluate_response,
     validate_recorded_google_shared_request_payload,
@@ -366,6 +367,10 @@ def _accept_handoff(
                     message="HELIOS_GEMINI_MODEL is missing or blank.",
                 )
             model = environment.model
+            _thinking_policy, request_config, configuration_settings = (
+                model_aware_request_contract(model, GEMINI_SYSTEM_INSTRUCTIONS_V3)
+            )
+            generate_content_config(request_config)
             provider_input = build_gemini_handoff_contents(
                 history,
                 inherited_memory_context=inherited,
@@ -376,12 +381,10 @@ def _accept_handoff(
                 connection,
                 gemini_id=source["recipient_participant_id"],
                 model=model,
+                settings=configuration_settings,
             )
             request = {
-                "config": recorded_request_config(
-                    GEMINI_SYSTEM_INSTRUCTIONS_V3,
-                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                ),
+                "config": request_config,
                 "contents": provider_input,
                 "model": model,
             }
@@ -397,13 +400,18 @@ def _accept_handoff(
                 "total_attempts": GEMINI_TOTAL_ATTEMPTS,
                 "trigger_message_id": source["id"],
                 "history_visibility": dict(HISTORY_VISIBILITY_V4),
+                "gemini_thinking_policy_version": GEMINI_THINKING_POLICY_VERSION,
                 "turn_routing_version": TURN_ROUTING_VERSION,
                 "response_destination": response_route.evidence(),
                 "handoff_version": HANDOFF_PROTOCOL_VERSION,
                 "handoff_authorization": authorization,
             }
             payload = {"local_context": local, "request": request}
-            validate_recorded_google_shared_request_payload(payload)
+            validate_recorded_google_shared_request_payload(
+                payload,
+                _accepted_model=model,
+                _accepted_config=request_config,
+            )
             request_type = GOOGLE_REQUEST_EVENT
             api_key = environment.api_key
         else:
@@ -656,11 +664,13 @@ async def _run_gemini(
     response: Any | None = None
     failure: Exception | None = None
     try:
+        accepted_payload = json.loads(accepted.request_payload_json)
         client = factory(accepted.api_key)
         response = await create_gemini_response(
             client,
-            model=accepted.model,
-            contents=contents_from_recorded(accepted.provider_input),
+            model=accepted_payload["request"]["model"],
+            contents=contents_from_recorded(accepted_payload["request"]["contents"]),
+            recorded_config=accepted_payload["request"]["config"],
         )
     except asyncio.CancelledError as exception:
         raise _stranded(accepted) from exception
@@ -845,7 +855,7 @@ def _assert_accepted(
         canonical_json(OPENAI_RESPONSE_SETTINGS)
         if accepted.provider == "openai"
         else canonical_json(
-            recorded_settings(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS)
+            recorded_settings_from_request_config(payload["request"]["config"])
         )
     )
     if (

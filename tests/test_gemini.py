@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import models as genai_models
 from google.genai import types
 
@@ -32,9 +33,11 @@ from app.database import (
 from app.gemini_client import (
     GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
     GEMINI_MAX_OUTPUT_TOKENS,
+    GEMINI_25_THINKING_MAX_OUTPUT_TOKENS,
     GEMINI_SYSTEM_INSTRUCTIONS,
     GEMINI_SYSTEM_INSTRUCTIONS_V2,
     GEMINI_SYSTEM_INSTRUCTIONS_V3,
+    GEMINI_THINKING_POLICY_VERSION,
     MAX_KEY_LENGTH,
     MAX_SAFE_INTEGER,
     MAX_STRING_LENGTH,
@@ -43,8 +46,12 @@ from app.gemini_client import (
     generate_content_config,
     is_timeout_exception,
     load_gemini_environment,
+    model_aware_request_contract,
     model_content_from_stored_response,
     recorded_request_config,
+    recorded_settings,
+    recorded_settings_from_request_config,
+    resolve_gemini_thinking_policy,
     safe_gemini_exception_diagnostics,
     serialize_and_evaluate_response,
     validate_recorded_google_request_payload,
@@ -248,13 +255,19 @@ class GeminiIntegrationTests(unittest.TestCase):
         self.dotenv_path = Path(self.temp.name) / "missing.env"
         initialize_database(self.database_path)
 
-    def run_turn(self, effect: Any, message: str = "Hello Gemini") -> tuple[Any, FakeClient]:
+    def run_turn(
+        self,
+        effect: Any,
+        message: str = "Hello Gemini",
+        *,
+        model: str = "gemini-test",
+    ) -> tuple[Any, FakeClient]:
         client = FakeClient(effect)
         with patch.dict(
             os.environ,
             {
                 "GEMINI_API_KEY": SYNTHETIC_KEY,
-                "HELIOS_GEMINI_MODEL": "gemini-test",
+                "HELIOS_GEMINI_MODEL": model,
                 "GOOGLE_API_KEY": "hostile-google-key",
                 "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 "GOOGLE_GENAI_USE_ENTERPRISE": "true",
@@ -274,16 +287,25 @@ class GeminiIntegrationTests(unittest.TestCase):
         return result, client
 
     def test_sdk_local_afc_is_disabled_and_absent_from_wire(self) -> None:
-        config = generate_content_config()
-        self.assertTrue(config.automatic_function_calling.disable)
-        self.assertEqual(config.max_output_tokens, GEMINI_MAX_OUTPUT_TOKENS)
         self.assertNotIn("automatic_function_calling", recorded_request_config())
         client = genai.Client(api_key="synthetic-only", vertexai=False, enterprise=False)
         self.addCleanup(client.close)
-        parent: dict[str, Any] = {}
-        converted = genai_models._GenerateContentConfig_to_mldev(
-            client._api_client, config, parent, config
-        )
+        expected = {
+            "gemini-3.6-flash": (
+                {"includeThoughts": False, "thinkingLevel": "MEDIUM"},
+                GEMINI_MAX_OUTPUT_TOKENS,
+            ),
+            "gemini-2.5-flash-lite": (
+                {"includeThoughts": False, "thinkingBudget": 0},
+                GEMINI_MAX_OUTPUT_TOKENS,
+            ),
+            "gemini-2.5-flash": (
+                {"includeThoughts": False, "thinkingBudget": 8_192},
+                GEMINI_25_THINKING_MAX_OUTPUT_TOKENS,
+            ),
+            "unknown-future-model": (None, GEMINI_MAX_OUTPUT_TOKENS),
+        }
+
         def keys(value: Any) -> set[str]:
             if isinstance(value, dict):
                 return set(value) | set().union(*(keys(item) for item in value.values()))
@@ -291,98 +313,348 @@ class GeminiIntegrationTests(unittest.TestCase):
                 return set().union(*(keys(item) for item in value))
             return set()
 
-        wire_keys = keys({"generationConfig": converted, **parent})
-        self.assertNotIn("automatic_function_calling", wire_keys)
-        self.assertNotIn("automaticFunctionCalling", wire_keys)
+        for model, (expected_thinking, expected_limit) in expected.items():
+            with self.subTest(model=model):
+                _policy, recorded_config, settings = model_aware_request_contract(model)
+                config = generate_content_config(recorded_config)
+                self.assertTrue(config.automatic_function_calling.disable)
+                self.assertEqual(config.max_output_tokens, expected_limit)
+                parent: dict[str, Any] = {}
+                converted = genai_models._GenerateContentConfig_to_mldev(
+                    client._api_client, config, parent, config
+                )
+                wire_keys = keys({"generationConfig": converted, **parent})
+                self.assertNotIn("automatic_function_calling", wire_keys)
+                self.assertNotIn("automaticFunctionCalling", wire_keys)
+                wire_thinking = converted.get("thinkingConfig")
+                if expected_thinking is None:
+                    self.assertIsNone(wire_thinking)
+                    self.assertNotIn("thinking_config", recorded_config)
+                    self.assertEqual(settings["thinking"], {"mode": "provider_default"})
+                else:
+                    self.assertEqual(
+                        wire_thinking.model_dump(
+                            mode="json", by_alias=True, exclude_none=True
+                        ),
+                        expected_thinking,
+                    )
 
     def test_output_limit_versions_new_requests_and_preserves_historical_v4(self) -> None:
-        with (
-            patch(
-                "app.gemini_client.GEMINI_MAX_OUTPUT_TOKENS",
-                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
-            ),
-            patch(
-                "app.gemini_service.GEMINI_MAX_OUTPUT_TOKENS",
-                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
-            ),
-        ):
-            historical_result, _client = self.run_turn(
-                success_response("historical output limit")
-            )
-
+        historical_settings_json = json.dumps(
+            recorded_settings(max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         with closing(connect_database(self.database_path)) as connection:
-            historical_event = connection.execute(
-                """SELECT participant_config_id, payload_json
-                   FROM api_events WHERE turn_id=? AND sequence_no=1""",
-                (historical_result["turn_id"],),
-            ).fetchone()
-            historical_payload = json.loads(historical_event["payload_json"])
-            self.assertEqual(
-                historical_payload["request"]["config"]["max_output_tokens"],
-                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
-            )
-            historical_settings = json.loads(connection.execute(
-                "SELECT settings_json FROM participant_configs WHERE id=?",
-                (historical_event["participant_config_id"],),
-            ).fetchone()[0])
-            self.assertEqual(
-                historical_settings["max_output_tokens"],
-                GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
-            )
-            self.assertIs(
-                validate_recorded_google_shared_request_payload(historical_payload),
-                historical_payload,
-            )
-            unsupported_payload = json.loads(json.dumps(historical_payload))
-            unsupported_payload["request"]["config"]["max_output_tokens"] = 4_096
-            with self.assertRaises(ValueError):
-                validate_recorded_google_shared_request_payload(unsupported_payload)
-
-        trace = load_trace(self.database_path, historical_result["turn_id"])
-        self.assertEqual(trace["turn"]["id"], historical_result["turn_id"])
-        with closing(connect_database(self.database_path)) as connection:
-            boundary = connection.execute(
-                "SELECT room_sequence_no FROM messages WHERE id=?",
-                (historical_result["gemini_message_id"],),
+            gemini_id = connection.execute(
+                "SELECT id FROM participants WHERE participant_key='gemini'"
             ).fetchone()[0]
-            history = load_provider_history(
-                connection,
-                room_id=1,
-                boundary=boundary,
-                provider_participant_key="gemini",
-                projection_version="provider_history_v4",
+            connection.execute(
+                """INSERT INTO participant_configs (
+                       participant_id,provider,model,config_label,
+                       system_instructions,settings_json,tools_json
+                   ) VALUES (?, 'google', 'gemini-2.5-flash-lite',
+                       'direct-address-google-gemini-2-5-flash-lite-v1', ?, ?, '[]')""",
+                (gemini_id, GEMINI_SYSTEM_INSTRUCTIONS_V3, historical_settings_json),
             )
-            self.assertTrue(history)
-
-        current_result, _client = self.run_turn(success_response("current output limit"))
-        current_trace = load_trace(self.database_path, current_result["turn_id"])
-        self.assertEqual(current_trace["turn"]["id"], current_result["turn_id"])
-        with closing(connect_database(self.database_path)) as connection:
-            current_event = connection.execute(
-                """SELECT participant_config_id, payload_json
-                   FROM api_events WHERE turn_id=? AND sequence_no=1""",
-                (current_result["turn_id"],),
-            ).fetchone()
-            current_payload = json.loads(current_event["payload_json"])
+            connection.commit()
+        cases = (
+            ("gemini-3.6-flash", GEMINI_MAX_OUTPUT_TOKENS, {"include_thoughts": False, "thinking_level": "medium"}),
+            ("gemini-2.5-flash-lite", GEMINI_MAX_OUTPUT_TOKENS, {"include_thoughts": False, "thinking_budget": 0}),
+            ("gemini-2.5-flash", GEMINI_25_THINKING_MAX_OUTPUT_TOKENS, {"include_thoughts": False, "thinking_budget": 8_192}),
+            ("unknown-future-model", GEMINI_MAX_OUTPUT_TOKENS, None),
+        )
+        recorded_payloads: dict[str, dict[str, Any]] = {}
+        for model, output_limit, thinking in cases:
+            result, client = self.run_turn(
+                success_response(f"response from {model}"), model=model
+            )
+            self.assertEqual(len(client.aio.models.calls), 1)
+            with closing(connect_database(self.database_path)) as connection:
+                event = connection.execute(
+                    "SELECT participant_config_id,payload_json FROM api_events WHERE turn_id=? AND sequence_no=1",
+                    (result["turn_id"],),
+                ).fetchone()
+                payload = json.loads(event["payload_json"])
+                recorded_payloads[model] = payload
+                settings = json.loads(
+                    connection.execute(
+                        "SELECT settings_json FROM participant_configs WHERE id=?",
+                        (event["participant_config_id"],),
+                    ).fetchone()[0]
+                )
             self.assertEqual(
-                current_payload["request"]["config"]["max_output_tokens"],
-                GEMINI_MAX_OUTPUT_TOKENS,
+                payload["local_context"]["gemini_thinking_policy_version"],
+                GEMINI_THINKING_POLICY_VERSION,
             )
-            self.assertNotEqual(
-                current_event["participant_config_id"],
-                historical_event["participant_config_id"],
-            )
-            settings_rows = connection.execute(
-                """SELECT config_label, settings_json FROM participant_configs
-                   WHERE model='gemini-test' ORDER BY id"""
-            ).fetchall()
             self.assertEqual(
-                [
-                    json.loads(row["settings_json"])["max_output_tokens"]
-                    for row in settings_rows
+                payload["local_context"]["history_visibility"][
+                    "projection_version"
                 ],
-                [GEMINI_LEGACY_MAX_OUTPUT_TOKENS, GEMINI_MAX_OUTPUT_TOKENS],
+                "provider_history_v4",
             )
+            self.assertEqual(payload["request"]["config"]["max_output_tokens"], output_limit)
+            self.assertEqual(payload["request"]["config"].get("thinking_config"), thinking)
+            self.assertEqual(
+                settings,
+                recorded_settings_from_request_config(payload["request"]["config"]),
+            )
+            trace = load_trace(self.database_path, result["turn_id"])
+            self.assertEqual(trace["turn"]["id"], result["turn_id"])
+            self.assertEqual(
+                trace["recorded_request"]["request"]["config"].get(
+                    "thinking_config"
+                ),
+                thinking,
+            )
+            self.assertEqual(trace["configurations"][0]["settings"], settings)
+
+        historical = json.loads(json.dumps(recorded_payloads["gemini-2.5-flash-lite"]))
+        del historical["local_context"]["gemini_thinking_policy_version"]
+        historical["request"]["config"] = recorded_request_config(
+            GEMINI_SYSTEM_INSTRUCTIONS_V3,
+            max_output_tokens=GEMINI_LEGACY_MAX_OUTPUT_TOKENS,
+        )
+        self.assertIs(validate_recorded_google_shared_request_payload(historical), historical)
+        turn_37_shape = json.loads(json.dumps(historical))
+        turn_37_shape["request"]["config"] = recorded_request_config(
+            GEMINI_SYSTEM_INSTRUCTIONS_V3,
+            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+        )
+        self.assertEqual(
+            turn_37_shape["request"]["model"], "gemini-2.5-flash-lite"
+        )
+        self.assertNotIn(
+            "gemini_thinking_policy_version", turn_37_shape["local_context"]
+        )
+        self.assertIs(
+            validate_recorded_google_shared_request_payload(turn_37_shape),
+            turn_37_shape,
+        )
+        current_hybrid = json.loads(json.dumps(historical))
+        current_hybrid["local_context"]["gemini_thinking_policy_version"] = (
+            GEMINI_THINKING_POLICY_VERSION
+        )
+        with self.assertRaises(ValueError):
+            validate_recorded_google_shared_request_payload(current_hybrid)
+
+        historical_8192 = json.loads(json.dumps(recorded_payloads["gemini-3.6-flash"]))
+        del historical_8192["local_context"]["gemini_thinking_policy_version"]
+        self.assertIs(
+            validate_recorded_google_shared_request_payload(historical_8192),
+            historical_8192,
+        )
+        unsupported_payload = json.loads(json.dumps(historical_8192))
+        unsupported_payload["request"]["config"]["max_output_tokens"] = 4_096
+        with self.assertRaises(ValueError):
+            validate_recorded_google_shared_request_payload(unsupported_payload)
+        with closing(connect_database(self.database_path)) as connection:
+            flash_lite_rows = connection.execute(
+                """SELECT config_label,settings_json FROM participant_configs
+                   WHERE model='gemini-2.5-flash-lite' ORDER BY id"""
+            ).fetchall()
+        self.assertEqual(
+            [row["config_label"] for row in flash_lite_rows],
+            [
+                "direct-address-google-gemini-2-5-flash-lite-v1",
+                "direct-address-google-gemini-2-5-flash-lite-v2",
+            ],
+        )
+        self.assertEqual(flash_lite_rows[0]["settings_json"], historical_settings_json)
+        self.assertEqual(
+            json.loads(flash_lite_rows[1]["settings_json"])["thinking"],
+            {"include_thoughts": False, "budget": 0},
+        )
+
+    def test_model_classification_is_closed_and_rejects_current_hybrids(self) -> None:
+        self.assertEqual(
+            resolve_gemini_thinking_policy("gemini-3.6-flash").mode,
+            "thinking_level",
+        )
+        self.assertEqual(
+            resolve_gemini_thinking_policy("gemini-2.5-flash-lite").budget,
+            0,
+        )
+        self.assertEqual(
+            resolve_gemini_thinking_policy("gemini-2.5-flash").budget,
+            8_192,
+        )
+        for model in (
+            "gemini-2.5-flash-lite-preview",
+            "Gemini-2.5-Flash-Lite",
+            "gemini-4-flash",
+            "contains-gemini-3.6-flash",
+        ):
+            with self.subTest(model=model):
+                policy, request, settings = model_aware_request_contract(model)
+                self.assertEqual(policy.mode, "provider_default")
+                self.assertNotIn("thinking_config", request)
+                self.assertEqual(settings["thinking"], {"mode": "provider_default"})
+        for invalid in ("", " gemini-3.6-flash", "gemini-3.6-flash "):
+            with self.assertRaises(ValueError):
+                resolve_gemini_thinking_policy(invalid)
+
+        result, _client = self.run_turn(
+            success_response("hybrid source"), model="gemini-3.6-flash"
+        )
+        with closing(connect_database(self.database_path)) as connection:
+            payload = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM api_events WHERE turn_id=? AND sequence_no=1",
+                    (result["turn_id"],),
+                ).fetchone()[0]
+            )
+        both = json.loads(json.dumps(payload))
+        both["request"]["config"]["thinking_config"]["thinking_budget"] = 8_192
+        with self.assertRaises(ValueError):
+            validate_recorded_google_shared_request_payload(both)
+        wrong_family = json.loads(json.dumps(payload))
+        wrong_family["request"]["model"] = "gemini-2.5-flash-lite"
+        with self.assertRaises(ValueError):
+            validate_recorded_google_shared_request_payload(wrong_family)
+        unknown_marker = json.loads(json.dumps(payload))
+        unknown_marker["local_context"]["gemini_thinking_policy_version"] = "future"
+        with self.assertRaises(ValueError):
+            validate_recorded_google_shared_request_payload(unknown_marker)
+
+    def test_safe_api_error_evidence_and_turn_37_regression(self) -> None:
+        provider_error = genai_errors.ClientError(
+            400,
+            {
+                "error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
+                    "message": "Thinking level is not supported for this model.",
+                    "details": [{"headers": {"Authorization": SYNTHETIC_KEY}}],
+                }
+            },
+        )
+        expected = {
+            "error_class": "ProviderError",
+            "reason": "gemini_provider_failure",
+            "summary": "The Gemini provider request failed.",
+            "http_status": 400,
+            "provider_status": "INVALID_ARGUMENT",
+            "provider_message": "Thinking level is not supported for this model.",
+        }
+        self.assertEqual(
+            safe_gemini_exception_diagnostics(
+                provider_error, timeout=False, api_key=SYNTHETIC_KEY
+            ),
+            expected,
+        )
+        with self.assertRaises(TurnServiceError) as caught:
+            self.run_turn(provider_error, model="gemini-2.5-flash-lite")
+        self.assertEqual(caught.exception.code, "gemini_provider_failure")
+        with closing(connect_database(self.database_path)) as connection:
+            terminal = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM api_events WHERE sequence_no=2"
+                ).fetchone()[0]
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM messages WHERE participant_config_id IS NOT NULL"
+                ).fetchone()[0],
+                0,
+            )
+        self.assertEqual(terminal, {"error": expected})
+        serialized = json.dumps(terminal)
+        self.assertNotIn(SYNTHETIC_KEY, serialized)
+        self.assertNotIn("Authorization", serialized)
+        trace = load_trace(self.database_path, caught.exception.turn_id)
+        self.assertEqual(
+            trace["api_events"][-1]["payload"]["error"]["provider_status"],
+            "INVALID_ARGUMENT",
+        )
+
+        generic = {
+            "error_class": "ProviderError",
+            "reason": "gemini_provider_failure",
+            "summary": "The Gemini provider request failed.",
+        }
+        for message in (
+            f"Authorization: Bearer {SYNTHETIC_KEY}",
+            f"api_key={SYNTHETIC_KEY}",
+            "unsafe\ncontrol",
+            "<script>alert(1)</script>",
+            "x" * 513,
+            "\u200bhidden-format",
+            "\ud800",
+        ):
+            hostile = genai_errors.ClientError(
+                400,
+                {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": message}},
+            )
+            diagnostics = safe_gemini_exception_diagnostics(
+                hostile, timeout=False, api_key=SYNTHETIC_KEY
+            )
+            self.assertNotIn("provider_message", diagnostics)
+            self.assertNotIn(SYNTHETIC_KEY, json.dumps(diagnostics))
+
+        class ExtractionFailure(genai_errors.APIError):
+            @property
+            def code(self) -> int:
+                raise RuntimeError("must be swallowed")
+
+        extraction_failure = Exception.__new__(ExtractionFailure)
+        Exception.__init__(extraction_failure, "unsafe repr")
+        self.assertEqual(
+            safe_gemini_exception_diagnostics(
+                extraction_failure, timeout=False, api_key=SYNTHETIC_KEY
+            ),
+            generic,
+        )
+        self.assertEqual(
+            safe_gemini_exception_diagnostics(
+                RuntimeError("status=400"), timeout=False, api_key=SYNTHETIC_KEY
+            ),
+            generic,
+        )
+
+        accessed: list[str] = []
+
+        class ExactBoundary(genai_errors.APIError):
+            @property
+            def code(self) -> int:
+                accessed.append("code")
+                return 400
+
+            @property
+            def status(self) -> str:
+                accessed.append("status")
+                return "INVALID_ARGUMENT"
+
+            @property
+            def message(self) -> str:
+                accessed.append("message")
+                return "Safe provider message."
+
+            @property
+            def details(self) -> Any:
+                raise AssertionError("details must not be accessed")
+
+            @property
+            def response(self) -> Any:
+                raise AssertionError("response must not be accessed")
+
+        boundary_error = Exception.__new__(ExactBoundary)
+        Exception.__init__(boundary_error, "repr must not be used")
+        boundary_diagnostics = safe_gemini_exception_diagnostics(
+            boundary_error, timeout=False, api_key=SYNTHETIC_KEY
+        )
+        self.assertEqual(accessed, ["code", "status", "message"])
+        self.assertEqual(
+            {
+                key: boundary_diagnostics[key]
+                for key in ("http_status", "provider_status", "provider_message")
+            },
+            {
+                "http_status": 400,
+                "provider_status": "INVALID_ARGUMENT",
+                "provider_message": "Safe provider message.",
+            },
+        )
 
     def test_client_uses_explicit_developer_backend_under_hostile_environment(self) -> None:
         captured: dict[str, Any] = {}
@@ -502,7 +774,6 @@ class GeminiIntegrationTests(unittest.TestCase):
                 "terminal": {
                     "error": {
                         "error_class": "ProviderError",
-                        "http_status": 429,
                         "reason": "gemini_provider_failure",
                         "summary": "The Gemini provider request failed.",
                     }
