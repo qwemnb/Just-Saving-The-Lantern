@@ -101,12 +101,13 @@ HELIOS_GEMINI_MODEL=gemini-3.6-flash
 The Google client is forced onto the Developer API with `v1beta`, a 120-second
 timeout, one total attempt, no tools, one text candidate, provider-default
 safety, and SDK automatic function calling explicitly disabled. Helios Room
-selects the thinking mechanism from a closed model-family policy: Gemini 3
-uses `thinking_level=medium` with an 8,192-token output limit; Gemini 2.5
-Flash-Lite uses `thinking_budget=0` with an 8,192-token limit; and supported
-thinking-enabled Gemini 2.5 models use `thinking_budget=8192` with a
-16,384-token limit. Unknown model IDs receive no explicit thinking control and
-record `provider_default`, rather than receiving a guessed parameter.
+selects the thinking mechanism from a closed model-family policy: explicitly
+recognized Gemini 3 level-policy models use `thinking_level=medium` with an
+8,192-token output limit; Gemini 2.5 Flash-Lite uses `thinking_budget=0` with
+an 8,192-token limit; and supported thinking-enabled Gemini 2.5 models use
+`thinking_budget=8192` with a 16,384-token limit. Other model IDs, including
+Gemini 3 Pro Preview, receive no explicit thinking control and record
+`provider_default`, rather than receiving a guessed parameter.
 Historical 2,048- and 8,192-token request evidence remains valid exactly as
 recorded. Hostile ambient Vertex, Enterprise, project, location, and
 alternate-key variables cannot select the backend or credential. Each distinct

@@ -49,7 +49,8 @@ MAX_STRING_LENGTH = 262_144
 GEMINI_LEGACY_MAX_OUTPUT_TOKENS = 2_048
 GEMINI_MAX_OUTPUT_TOKENS = 8_192
 GEMINI_25_THINKING_MAX_OUTPUT_TOKENS = 16_384
-GEMINI_THINKING_POLICY_VERSION = "model_aware_v1"
+GEMINI_THINKING_POLICY_V1 = "model_aware_v1"
+GEMINI_THINKING_POLICY_VERSION = GEMINI_THINKING_POLICY_V1
 GEMINI_PROVIDER_MESSAGE_MAX_CHARS = 512
 GEMINI_PROVIDER_MESSAGE_MAX_BYTES = 2_048
 GEMINI_PROVIDER_STATUS_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
@@ -58,10 +59,9 @@ _SENSITIVE_PROVIDER_MESSAGE_PATTERN = re.compile(
     r"(?:api[-_ ]?key|client_secret|access_token)\s*[:=]\s*\S|"
     r"AIza[0-9A-Za-z_-]{16,}|\.env(?:\W|$))"
 )
-GEMINI_3_LEVEL_MODELS = frozenset(
+GEMINI_3_LEVEL_MODELS_V1 = frozenset(
     {
         "gemini-3-flash-preview",
-        "gemini-3-pro-preview",
         "gemini-3.1-pro-preview",
         "gemini-3.1-flash-lite",
         "gemini-3.5-flash",
@@ -70,8 +70,8 @@ GEMINI_3_LEVEL_MODELS = frozenset(
         "gemini-3.7-flash",
     }
 )
-GEMINI_25_FLASH_LITE_MODELS = frozenset({"gemini-2.5-flash-lite"})
-GEMINI_25_BUDGET_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-pro"})
+GEMINI_25_FLASH_LITE_MODELS_V1 = frozenset({"gemini-2.5-flash-lite"})
+GEMINI_25_BUDGET_MODELS_V1 = frozenset({"gemini-2.5-flash", "gemini-2.5-pro"})
 TOKEN_COUNT_FIELDS = frozenset(
     {
         "prompt_token_count",
@@ -133,12 +133,12 @@ class GeminiThinkingPolicy:
         raise ValueError("invalid Gemini thinking policy")
 
 
-def resolve_gemini_thinking_policy(model: str) -> GeminiThinkingPolicy:
-    """Resolve one closed thinking policy from an exact configured model ID."""
+def resolve_gemini_thinking_policy_v1(model: str) -> GeminiThinkingPolicy:
+    """Resolve the frozen model_aware_v1 policy for an exact model ID."""
 
     if not isinstance(model, str) or not model or model != model.strip():
         raise ValueError("invalid Gemini model")
-    if model in GEMINI_3_LEVEL_MODELS:
+    if model in GEMINI_3_LEVEL_MODELS_V1:
         return GeminiThinkingPolicy(
             mode="thinking_level",
             include_thoughts=False,
@@ -146,7 +146,7 @@ def resolve_gemini_thinking_policy(model: str) -> GeminiThinkingPolicy:
             budget=None,
             max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         )
-    if model in GEMINI_25_FLASH_LITE_MODELS:
+    if model in GEMINI_25_FLASH_LITE_MODELS_V1:
         return GeminiThinkingPolicy(
             mode="thinking_budget",
             include_thoughts=False,
@@ -154,7 +154,7 @@ def resolve_gemini_thinking_policy(model: str) -> GeminiThinkingPolicy:
             budget=0,
             max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         )
-    if model in GEMINI_25_BUDGET_MODELS:
+    if model in GEMINI_25_BUDGET_MODELS_V1:
         return GeminiThinkingPolicy(
             mode="thinking_budget",
             include_thoughts=False,
@@ -169,6 +169,12 @@ def resolve_gemini_thinking_policy(model: str) -> GeminiThinkingPolicy:
         budget=None,
         max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
     )
+
+
+def resolve_gemini_thinking_policy(model: str) -> GeminiThinkingPolicy:
+    """Resolve the current policy without changing frozen historical versions."""
+
+    return resolve_gemini_thinking_policy_v1(model)
 
 
 GEMINI_SYSTEM_INSTRUCTIONS_V1 = (
@@ -307,13 +313,12 @@ def recorded_request_config(
     }
 
 
-def model_aware_request_contract(
-    model: str,
-    system_instructions: str = GEMINI_SYSTEM_INSTRUCTIONS_V3,
+def _request_contract_for_policy(
+    policy: GeminiThinkingPolicy,
+    system_instructions: str,
 ) -> tuple[GeminiThinkingPolicy, dict[str, Any], dict[str, Any]]:
-    """Resolve once and return the exact request/configuration evidence."""
+    """Build exact request/configuration evidence from one resolved policy."""
 
-    policy = resolve_gemini_thinking_policy(model)
     request_config: dict[str, Any] = {
         "candidate_count": 1,
         "max_output_tokens": policy.max_output_tokens,
@@ -325,6 +330,38 @@ def model_aware_request_contract(
     if thinking_config is not None:
         request_config["thinking_config"] = thinking_config
     return policy, request_config, recorded_settings_for_policy(policy)
+
+
+def model_aware_request_contract_v1(
+    model: str,
+    system_instructions: str = GEMINI_SYSTEM_INSTRUCTIONS_V3,
+) -> tuple[GeminiThinkingPolicy, dict[str, Any], dict[str, Any]]:
+    """Build the frozen model_aware_v1 request contract."""
+
+    return _request_contract_for_policy(
+        resolve_gemini_thinking_policy_v1(model), system_instructions
+    )
+
+
+def model_aware_request_contract(
+    model: str,
+    system_instructions: str = GEMINI_SYSTEM_INSTRUCTIONS_V3,
+) -> tuple[GeminiThinkingPolicy, dict[str, Any], dict[str, Any]]:
+    """Build the current versioned request/configuration evidence."""
+
+    return model_aware_request_contract_v1(model, system_instructions)
+
+
+def _recorded_model_aware_request_contract(
+    version: str,
+    model: str,
+    system_instructions: str,
+) -> tuple[GeminiThinkingPolicy, dict[str, Any], dict[str, Any]]:
+    """Dispatch immutable recorded evidence through its frozen policy version."""
+
+    if version == GEMINI_THINKING_POLICY_V1:
+        return model_aware_request_contract_v1(model, system_instructions)
+    raise ValueError("unknown Gemini thinking policy version")
 
 
 def recorded_settings(
@@ -637,7 +674,7 @@ def validate_recorded_google_shared_request_payload(
     if model_aware:
         if (
             local.get("gemini_thinking_policy_version")
-            != GEMINI_THINKING_POLICY_VERSION
+            not in {GEMINI_THINKING_POLICY_V1}
             or projection != PROVIDER_HISTORY_V4
             or not (routed or handoff)
             or not isinstance(raw_request, dict)
@@ -651,8 +688,12 @@ def validate_recorded_google_shared_request_payload(
                 raise ValueError("accepted Google thinking contract changed")
             expected_config = dict(_accepted_config)
         else:
-            _policy, expected_config, _settings = model_aware_request_contract(
-                raw_request.get("model"), GEMINI_SYSTEM_INSTRUCTIONS_V3
+            _policy, expected_config, _settings = (
+                _recorded_model_aware_request_contract(
+                    local["gemini_thinking_policy_version"],
+                    raw_request.get("model"),
+                    GEMINI_SYSTEM_INSTRUCTIONS_V3,
+                )
             )
     else:
         if _accepted_config is not None:

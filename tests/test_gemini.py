@@ -303,6 +303,7 @@ class GeminiIntegrationTests(unittest.TestCase):
                 {"includeThoughts": False, "thinkingBudget": 8_192},
                 GEMINI_25_THINKING_MAX_OUTPUT_TOKENS,
             ),
+            "gemini-3-pro-preview": (None, GEMINI_MAX_OUTPUT_TOKENS),
             "unknown-future-model": (None, GEMINI_MAX_OUTPUT_TOKENS),
         }
 
@@ -480,6 +481,7 @@ class GeminiIntegrationTests(unittest.TestCase):
             8_192,
         )
         for model in (
+            "gemini-3-pro-preview",
             "gemini-2.5-flash-lite-preview",
             "Gemini-2.5-Flash-Lite",
             "gemini-4-flash",
@@ -516,6 +518,49 @@ class GeminiIntegrationTests(unittest.TestCase):
         unknown_marker["local_context"]["gemini_thinking_policy_version"] = "future"
         with self.assertRaises(ValueError):
             validate_recorded_google_shared_request_payload(unknown_marker)
+
+    def test_model_aware_v1_unknown_trace_uses_frozen_policy(self) -> None:
+        model = "gemini-4-flash"
+        result, _client = self.run_turn(
+            success_response("future model response"), model=model
+        )
+        with closing(connect_database(self.database_path)) as connection:
+            payload = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM api_events WHERE turn_id=? AND sequence_no=1",
+                    (result["turn_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(
+            payload["local_context"]["gemini_thinking_policy_version"],
+            "model_aware_v1",
+        )
+        self.assertNotIn("thinking_config", payload["request"]["config"])
+
+        future_medium_contract = model_aware_request_contract("gemini-3.6-flash")
+        with (
+            patch(
+                "app.gemini_client.GEMINI_THINKING_POLICY_VERSION",
+                "model_aware_v2",
+            ),
+            patch(
+                "app.gemini_client.model_aware_request_contract",
+                return_value=future_medium_contract,
+            ) as future_current_contract,
+        ):
+            trace = load_trace(self.database_path, result["turn_id"])
+
+        future_current_contract.assert_not_called()
+        self.assertEqual(trace["turn"]["id"], result["turn_id"])
+        self.assertEqual(
+            trace["recorded_request"]["local_context"][
+                "gemini_thinking_policy_version"
+            ],
+            "model_aware_v1",
+        )
+        self.assertNotIn(
+            "thinking_config", trace["recorded_request"]["request"]["config"]
+        )
 
     def test_safe_api_error_evidence_and_turn_37_regression(self) -> None:
         provider_error = genai_errors.ClientError(
