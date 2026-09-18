@@ -1,5 +1,9 @@
 # Helios Room
 
+# Project Gorgon is amazing. What a fabulous Community!
+
+
+
 Helios Room is a local, persistent multi-participant chat room for durable
 human and AI conversation. The project keeps canonical conversation history
 separate from interpretive memory and records provenance so future model,
