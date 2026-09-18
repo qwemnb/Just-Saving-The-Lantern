@@ -1,8 +1,0 @@
-anyio>=4.8.0,<5.0.0
-fastapi==0.110.1
-google-genai==2.18.0
-httpx>=0.28.1,<1.0.0
-openai==2.54.0
-python-dotenv==1.2.2
-starlette==0.37.2
-uvicorn[standard]==0.24.0

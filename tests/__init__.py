@@ -1,2 +1,0 @@
-"""Helios Room test package."""
-
