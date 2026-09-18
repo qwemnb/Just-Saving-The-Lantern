@@ -15,7 +15,7 @@ Find the newest version of:
 
 **The Lantern Guide**
 
-in this repository's "The Lantern Guide" folder, and download the '.docx' file 
+in this repository's "The Lantern Guide" folder, and download the `.docx` file 
 
 If you have never used GitHub before, you do not need to clone the repository or install anything. Just open the document from the file list and download it to your computer.
 
