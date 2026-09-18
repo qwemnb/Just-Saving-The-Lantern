@@ -21,7 +21,7 @@ If you have never used GitHub before, you do not need to clone the repository or
 
 ### 2. Open Create GPT in ChatGPT
 
-Start a new GPT creation session.
+Start a new CreateGPT session.
 
 Attach the downloaded guide.
 
@@ -32,29 +32,6 @@ Attach the downloaded guide.
 That is all that should be required for the initial build.
 
 The document tells Create GPT what to do with its contents, including where to place the Operational Instructions and how to use the rest of the document as Knowledge.
-
-### 4. Review the finished configuration
-
-After Create GPT finishes, check that it created:
-
-- **Name:** The Lantern Guide
-- the description
-- the conversation starters
-- the Operational Instructions from Part Three
-- the complete guide as Knowledge
-- the recommended capabilities
-
-The guide is intentionally written so that the builder can determine these settings from the document itself.
-
-### 5. Test it
-
-Part Six contains an **18-prompt Evaluation Suite**.
-
-Run each prompt in a fresh conversation.
-
-The tests are designed to check whether The Lantern Guide can handle spiritual experience, uncertainty, synchronicity, unusual beliefs, AI dependence, medication, crisis situations, divination, relationships, memory, criticism, and other difficult situations while preserving the user's agency.
-
-A response should pass on its first attempt rather than depending on a later correction.
 
 ---
 
