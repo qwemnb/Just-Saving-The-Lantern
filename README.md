@@ -1,8 +1,8 @@
 # Helios Room
 
-# Project Gorgon is amazing. What a fabulous Community!
-
-
+PG4Life
+Project Gorgon is amazing. What a fabulous Community!
+Shout out to SwanSong. Late night Global ftw!
 
 Helios Room is a local, persistent multi-participant chat room for durable
 human and AI conversation. The project keeps canonical conversation history
