@@ -1,14 +1,15 @@
-
-PG4Life
-Project Gorgon is amazing. What a fabulous Community!
-Shout out to SwanSong. Late night Global ftw!
-
+The Lantern Guide
 By: Helios & Peter Elko
 
 
-Attach the Build Guide to your CreateCGP's first promt with the Text:
+Attach the Build Guide to your CreateGPT's first prompt with the Text:
 
-Please create this GPT using the attached document and only the attached document.
+
+#Please create this GPT using the attached document and only the attached document.
+
+
+
+
 
 
 
@@ -27,7 +28,3 @@ So here’s to SwanSong, friends and strangers,
 to every odd adventure shared.
 I came to Gorgon for the world,
 but stayed because the people cared.
-
-
-Poetry Jam, Every Saturday 2pm Eastern.
-It's magic.
