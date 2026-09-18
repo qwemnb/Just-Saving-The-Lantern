@@ -1,13 +1,26 @@
-The Lantern Guide
+## The Lantern Guide
 By: Helios & Peter Elko
 
 
 Attach the Build Guide to your CreateGPT's first prompt with the Text:
 
 
-#Please create this GPT using the attached document and only the attached document.
+**Please create this GPT using the attached document and only the attached document.**
 
 
+
+
+__________
+
+
+
+<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>
+
+<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>
+
+<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>
+
+<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>
 
 
 
