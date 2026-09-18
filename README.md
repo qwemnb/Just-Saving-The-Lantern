@@ -13,9 +13,9 @@ The Lantern Guide is designed to be created from one document.
 
 Find the newest version of:
 
-**Grounded Spiritual Reflection GPT Builder Guide**
+**The Lantern Guide**
 
-in this repository and download the `.docx` file.
+in this repository's "The Lantern Guide" folder, and download the '.docx' file 
 
 If you have never used GitHub before, you do not need to clone the repository or install anything. Just open the document from the file list and download it to your computer.
 
